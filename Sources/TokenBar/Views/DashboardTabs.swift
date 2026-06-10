@@ -9,15 +9,19 @@ import TokenBarCore
 struct DashboardTabs: View {
     let clients: [String]
     @Binding var active: String
+    /// Show ⌘1…⌘9 pins while Cmd is held (the discoverability overlay).
+    var kbdHints = false
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
-                    tab(id: "overview", label: "Overview", color: nil)
-                    ForEach(clients, id: \.self) { id in
+                    tab(id: "overview", label: "Overview", color: nil, index: 1)
+                    ForEach(Array(clients.enumerated()), id: \.element) { i, id in
                         let style = ClientRegistry.style(id)
-                        tab(id: id, label: ClientRegistry.shortName(id), color: style.color)
+                        tab(
+                            id: id, label: ClientRegistry.shortName(id),
+                            color: style.color, index: i + 2)
                     }
                 }
             }
@@ -29,7 +33,7 @@ struct DashboardTabs: View {
         }
     }
 
-    private func tab(id: String, label: String, color: String?) -> some View {
+    private func tab(id: String, label: String, color: String?, index: Int) -> some View {
         Button {
             active = id
         } label: {
@@ -45,6 +49,14 @@ struct DashboardTabs: View {
                     .font(.caption.weight(active == id ? .semibold : .regular))
                     .lineLimit(1)
                     .fixedSize()
+                if kbdHints && index <= 9 {
+                    Text("⌘\(index)")
+                        .font(.system(size: 8, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 3)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                }
             }
             .foregroundStyle(active == id ? .primary : .secondary)
             .padding(.horizontal, 8)
