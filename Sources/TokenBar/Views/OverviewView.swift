@@ -31,7 +31,9 @@ struct OverviewView: View {
                     title: "\(name) models")
             } else {
                 chart
-                AgentLimitsCard(clients: clientIds, trace: trace, agentUsage: agentUsage)
+                AgentLimitsCard(
+                    clients: clientIds, trace: trace, agentUsage: agentUsage,
+                    reorderable: true)
                 ModelBreakdownCard(
                     report: modelReport, clientIds: clientIds, colors: colors)
             }

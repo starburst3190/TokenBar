@@ -104,6 +104,16 @@ enum SelfTest {
         expect(UsagePace.durationText(130 * 60) == "2h 10m", "duration text h m")
         expect(UsagePace.durationText(26 * 3600) == "1d 2h", "duration text d h")
 
+        // Limits-card drag reorder: direction-aware insert (down → after the
+        // target, up → before it) so single-step moves both work.
+        let order = ["a", "b", "c", "d"]
+        expect(AgentLimitsCard.reorder(order, from: "a", to: "b") == ["b", "a", "c", "d"], "reorder one step down")
+        expect(AgentLimitsCard.reorder(order, from: "d", to: "c") == ["a", "b", "d", "c"], "reorder one step up")
+        expect(AgentLimitsCard.reorder(order, from: "a", to: "d") == ["b", "c", "d", "a"], "reorder to the end")
+        expect(AgentLimitsCard.reorder(order, from: "d", to: "a") == ["d", "a", "b", "c"], "reorder to the front")
+        expect(AgentLimitsCard.reorder(order, from: "a", to: "a") == order, "reorder onto itself is a no-op")
+        expect(AgentLimitsCard.reorder(order, from: "x", to: "b") == order, "reorder unknown id is a no-op")
+
         if failures > 0 {
             print("\(failures) selftest check(s) failed")
             exit(1)

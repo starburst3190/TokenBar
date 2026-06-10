@@ -1,10 +1,16 @@
 import SwiftUI
 import TokenBarCore
 
+/// Card density: 'full' (with pace line) or 'classic' (compact), mirroring
+/// LimitsLayout in settings.ts.
+enum LimitsLayout: String, CaseIterable {
+    case full, classic
+}
+
 /// OAuth quota cards per agent: usage-window bars with gauge colors, reset
-/// text and a pace marker. Port of AgentLimitsCard.tsx (basic version —
-/// pace-mode/layout settings, drag reorder and the opencode subscription view
-/// arrive in a later phase).
+/// text and a pace marker. Port of AgentLimitsCard.tsx. The pace mode, fill
+/// direction and layout density read the same defaults the settings panel
+/// (later phase) will edit.
 struct AgentLimitsCard: View {
     /// Clients requested by the active tab.
     let clients: [String]
@@ -15,6 +21,23 @@ struct AgentLimitsCard: View {
     /// When true, show only the passed `clients` (single-client view) instead
     /// of unioning in every agent that has a quota snapshot.
     var restrict = false
+    /// When true, cards can be reordered by dragging their grip handle; the
+    /// order persists to UserDefaults. Only the multi-agent overview opts in.
+    var reorderable = false
+
+    /// Bar fills by used (true) or remaining (false).
+    @AppStorage("tokenbar.limits.asUsed") private var asUsed = false
+    @AppStorage("tokenbar.limits.paceMode") private var paceModeRaw = PaceMode.historical.rawValue
+    @AppStorage("tokenbar.limits.layout") private var layoutRaw = LimitsLayout.full.rawValue
+    /// Saved drag order, comma-joined client ids (ids never contain commas).
+    @AppStorage("tokenbar.limits.order") private var orderRaw = ""
+
+    @State private var dragId: String?
+    @State private var overId: String?
+    @State private var cardFrames: [String: CGRect] = [:]
+
+    private var paceMode: PaceMode { PaceMode(rawValue: paceModeRaw) ?? .historical }
+    private var classic: Bool { LimitsLayout(rawValue: layoutRaw) ?? .full == .classic }
 
     /// Placeholder window labels for agents we know carry quotas but have no
     /// snapshot yet (LIMIT_ROWS in the web card).
@@ -22,6 +45,13 @@ struct AgentLimitsCard: View {
         "codex": ["Session", "Weekly"],
         "claude": ["Session", "Weekly"],
         "gemini": ["Pro", "Flash"],
+    ]
+
+    /// Maps opencode subscription labels (from the backend) to the agent
+    /// client ids whose quota cards represent them.
+    private static let subLabelToId: [String: String] = [
+        "Codex": "codex", "Claude": "claude", "Copilot": "copilot",
+        "Gemini": "antigravity",
     ]
 
     private var snapshots: [String: AgentUsageSnapshot] {
@@ -37,8 +67,19 @@ struct AgentLimitsCard: View {
                 .map { Self.normalizeTraceClient($0.client) })
     }
 
-    private var visibleClients: [String] {
+    private var opencodeSubs: [String] { agentUsage?.opencodeSubscriptions ?? [] }
+
+    /// opencode is a router with no quota of its own; its client view instead
+    /// shows the cards of the subscriptions it's authed against.
+    private var opencodeView: Bool { restrict && clients.contains("opencode") }
+
+    private var baseClients: [String] {
         let snapshots = self.snapshots
+        if opencodeView {
+            return opencodeSubs
+                .map { Self.subLabelToId[$0] ?? $0.lowercased() }
+                .filter { snapshots[$0] != nil }
+        }
         func known(_ id: String) -> Bool {
             Self.placeholderRows[id] != nil || snapshots[id] != nil
         }
@@ -48,21 +89,45 @@ struct AgentLimitsCard: View {
             .filter { seen.insert($0).inserted }
     }
 
+    /// Saved drag order applied; ids without a saved position keep their
+    /// natural order at the end. Disabled in non-reorderable views.
+    private var visibleClients: [String] {
+        let base = baseClients
+        let order = orderRaw.isEmpty ? [] : orderRaw.split(separator: ",").map(String.init)
+        guard reorderable, !order.isEmpty else { return base }
+        return base.sorted { a, b in
+            let ia = order.firstIndex(of: a) ?? Int.max
+            let ib = order.firstIndex(of: b) ?? Int.max
+            return ia == ib ? base.firstIndex(of: a)! < base.firstIndex(of: b)! : ia < ib
+        }
+    }
+
     var body: some View {
         DashCard(title, trailing: { noteLabel }) {
+            if opencodeView {
+                integrationLine("↔ Routes through opencode")
+            } else if !restrict && !opencodeSubs.isEmpty {
+                integrationLine("opencode also taps: \(opencodeSubs.joined(separator: " · "))")
+            }
             let visible = visibleClients
             if visible.isEmpty {
-                Text("No supported agents yet")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 8)
+                Text(
+                    opencodeView && !opencodeSubs.isEmpty
+                        ? "Subscriptions: \(opencodeSubs.joined(separator: " · "))"
+                        : "No supported agents yet"
+                )
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 8)
             } else {
                 VStack(spacing: 12) {
                     ForEach(visible, id: \.self) { id in
-                        agentSection(id)
+                        agentSection(id, visible: visible)
                     }
                 }
+                .coordinateSpace(name: Self.dragSpace)
+                .onPreferenceChange(CardFramesKey.self) { cardFrames = $0 }
             }
         }
     }
@@ -73,14 +138,78 @@ struct AgentLimitsCard: View {
             .foregroundStyle(.tertiary)
     }
 
+    private func integrationLine(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+    }
+
+    // MARK: - Drag reorder
+
+    private static let dragSpace = "limits-cards"
+
+    private struct CardFramesKey: PreferenceKey {
+        static let defaultValue: [String: CGRect] = [:]
+        static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+            value.merge(nextValue(), uniquingKeysWith: { $1 })
+        }
+    }
+
+    /// Move `from` to the `to` card's slot, direction-aware: dragging downward
+    /// drops it just after `to`, dragging upward just before it. (Plain
+    /// "insert before" makes single-step downward moves a no-op.)
+    static func reorder(_ list: [String], from: String, to: String) -> [String] {
+        guard let fromI = list.firstIndex(of: from), let toI = list.firstIndex(of: to),
+              fromI != toI
+        else { return list }
+        var out = list.filter { $0 != from }
+        let anchor = out.firstIndex(of: to)!
+        out.insert(from, at: fromI < toI ? anchor + 1 : anchor)
+        return out
+    }
+
+    /// Which edge of a card the drop line sits on, matching the
+    /// direction-aware insert.
+    private func dropEdge(_ id: String, in visible: [String]) -> VerticalEdge? {
+        guard let dragId, overId == id, dragId != id,
+              let fromI = visible.firstIndex(of: dragId), let toI = visible.firstIndex(of: id)
+        else { return nil }
+        return fromI < toI ? .bottom : .top
+    }
+
+    private func dragGesture(for id: String, visible: [String]) -> some Gesture {
+        DragGesture(minimumDistance: 2, coordinateSpace: .named(Self.dragSpace))
+            .onChanged { value in
+                dragId = id
+                let over = cardFrames.first { $0.value.contains(value.location) }?.key
+                overId = (over != nil && over != id) ? over : nil
+            }
+            .onEnded { _ in
+                if let over = overId, over != id {
+                    let next = Self.reorder(visible, from: id, to: over)
+                    orderRaw = next.joined(separator: ",")
+                }
+                dragId = nil
+                overId = nil
+            }
+    }
+
     // MARK: - Per-agent section
 
-    @ViewBuilder private func agentSection(_ id: String) -> some View {
+    @ViewBuilder private func agentSection(_ id: String, visible: [String]) -> some View {
         let style = ClientRegistry.style(id)
         let snapshot = snapshots[id]
         let isLive = liveClients.contains(id)
+        let edge = dropEdge(id, in: visible)
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
+                if reorderable {
+                    Text("⠿")
+                        .font(.caption)
+                        .foregroundStyle(dragId == id ? .primary : .tertiary)
+                        .help("Drag to reorder")
+                        .gesture(dragGesture(for: id, visible: visible))
+                }
                 Circle()
                     .fill(Color(hex: style.color))
                     .frame(width: 14, height: 14)
@@ -112,6 +241,21 @@ struct AgentLimitsCard: View {
                 }
             }
         }
+        .opacity(dragId == id ? 0.5 : 1)
+        .overlay(alignment: edge == .top ? .top : .bottom) {
+            if edge != nil {
+                Rectangle()
+                    .fill(Color.accentColor)
+                    .frame(height: 2)
+                    .offset(y: edge == .top ? -6 : 6)
+            }
+        }
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: CardFramesKey.self,
+                    value: [id: geo.frame(in: .named(Self.dragSpace))])
+            })
     }
 
     private func statusBadge(snapshot: AgentUsageSnapshot?, isLive: Bool) -> some View {
@@ -153,39 +297,71 @@ struct AgentLimitsCard: View {
 
     @ViewBuilder private func windowRow(_ window: UsageWindow, brand: String) -> some View {
         let remaining = min(100, max(0, window.remainingPercent))
-        let pace = UsagePace.compute(window: window, mode: .historical)
-        VStack(alignment: .leading, spacing: 3) {
-            HStack {
-                Text(window.label)
-                    .font(.caption2.weight(.medium))
-                Spacer()
-                if let reset = window.resetText {
-                    Text(reset)
+        let used = min(100, max(0, window.usedPercent))
+        // Pace is suppressed entirely in the classic layout and when the user
+        // turns it off; otherwise it follows the chosen mode.
+        let pace = classic ? nil : UsagePace.compute(window: window, mode: paceMode)
+        // The bar fills by used (counting up) or remaining (counting down)
+        // per the setting; the pace marker sits on the same axis so it lines
+        // up with the fill either way.
+        let fill = asUsed ? used : remaining
+        let leftLabel = asUsed
+            ? "\(Int(used.rounded()))% used"
+            : "\(Int(remaining.rounded()))% left"
+        let gauge = gaugeColor(remaining: remaining, brand: brand)
+
+        if classic {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(window.label)
+                        .font(.caption2.weight(.medium))
+                    Spacer()
+                    Text(window.resetText ?? leftLabel)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
+                bar(fillPercent: fill, color: gauge, paceLeft: nil, paceIsDeficit: false)
+                if window.resetText != nil {
+                    Text(leftLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
-            bar(
-                fillPercent: remaining,
-                color: gaugeColor(remaining: remaining, brand: brand),
-                // The bar fills by remaining (counting down); the pace marker
-                // sits on the same axis so it lines up with the fill.
-                paceLeft: pace.map { min(100, max(0, 100 - $0.expectedUsedPercent)) },
-                paceIsDeficit: pace?.stage.isDeficit ?? false)
-            HStack {
-                Text("\(Int(remaining.rounded()))% left")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let pace {
-                    let risk = runOutRiskLabel(window: window)
-                    Text(
-                        [pace.label, pace.etaText, risk]
-                            .compactMap(\.self).joined(separator: " · ")
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(pace.stage.isDeficit ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
-                    .lineLimit(1)
+        } else {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(window.label)
+                        .font(.caption2.weight(.medium))
+                    Spacer()
+                    if let reset = window.resetText {
+                        Text(reset)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                bar(
+                    fillPercent: fill, color: gauge,
+                    paceLeft: pace.map {
+                        let left = asUsed ? $0.expectedUsedPercent : 100 - $0.expectedUsedPercent
+                        return min(100, max(0, left))
+                    },
+                    paceIsDeficit: pace?.stage.isDeficit ?? false)
+                HStack {
+                    Text(leftLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if let pace {
+                        // Historical run-out risk only pairs with the historical pace.
+                        let risk = paceMode == .historical ? runOutRiskLabel(window: window) : nil
+                        Text(
+                            [pace.label, pace.etaText, risk]
+                                .compactMap(\.self).joined(separator: " · ")
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(pace.stage.isDeficit ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
+                        .lineLimit(1)
+                    }
                 }
             }
         }
@@ -197,11 +373,18 @@ struct AgentLimitsCard: View {
                 Text(label)
                     .font(.caption2.weight(.medium))
                 Spacer()
+                if classic {
+                    Text("No data")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
             bar(fillPercent: 0, color: Color(hex: brand), paceLeft: nil, paceIsDeficit: false)
-            Text("No data")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            if !classic {
+                Text("No data")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
     }
 
@@ -219,7 +402,7 @@ struct AgentLimitsCard: View {
                         .fill(paceIsDeficit ? Color.orange : Color.secondary)
                         .frame(width: 1.5, height: geo.size.height + 4)
                         .offset(x: geo.size.width * paceLeft / 100 - 0.75)
-                        .help("Expected \(Int((100 - paceLeft).rounded()))% used by now")
+                        .help("Expected \(Int((asUsed ? paceLeft : 100 - paceLeft).rounded()))% used by now")
                 }
             }
         }
