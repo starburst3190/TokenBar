@@ -43,4 +43,28 @@ enum Format {
         // Contributions are date-sorted; today, if present, is at the tail.
         return graph.contributions.last(where: { $0.date == today })?.totals.tokens ?? 0
     }
+
+    private static let monthsShort = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+
+    /// "2026-06-10" → "Jun 10".
+    static func monthDay(_ iso: String) -> String {
+        let parts = iso.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3, (1...12).contains(parts[1]) else { return iso }
+        return "\(monthsShort[parts[1] - 1]) \(parts[2])"
+    }
+
+    /// "2026-06-10" → "06/10".
+    static func mmdd(_ iso: String) -> String {
+        let parts = iso.split(separator: "-")
+        guard parts.count == 3 else { return iso }
+        return "\(parts[1])/\(parts[2])"
+    }
+
+    /// Exact token count with thousands separators ("1,234,567").
+    static func exactTokens(_ count: Int64) -> String {
+        count.formatted(.number.grouping(.automatic).locale(Locale(identifier: "en_US")))
+    }
 }

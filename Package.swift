@@ -17,14 +17,20 @@ let package = Package(
             name: "TokenBar",
             dependencies: ["TokenBarCore"],
             path: "Sources/TokenBar",
-            linkerSettings: [
-                .unsafeFlags(["-L", "target/release", "-ltb_core_ffi"]),
-                .linkedFramework("Security"),
-                .linkedFramework("SystemConfiguration"),
-                .linkedFramework("CoreFoundation"),
-                .linkedLibrary("c++"),
-                .linkedLibrary("resolv"),
-            ]
+            linkerSettings: rustLinkerSettings
         ),
     ]
 )
+
+// The Rust staticlib must already exist (cargo build --release) and the link
+// must run from the repo root for the relative -L path to resolve.
+var rustLinkerSettings: [LinkerSetting] {
+    [
+        .unsafeFlags(["-L", "target/release", "-ltb_core_ffi"]),
+        .linkedFramework("Security"),
+        .linkedFramework("SystemConfiguration"),
+        .linkedFramework("CoreFoundation"),
+        .linkedLibrary("c++"),
+        .linkedLibrary("resolv"),
+    ]
+}

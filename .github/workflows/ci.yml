@@ -21,5 +21,8 @@ jobs:
       - name: Build Swift package
         run: swift build
 
+      - name: Core logic selftest
+        run: swift run TokenBar --selftest
+
       - name: FFI smoke test
         run: swift run TokenBar --smoke
