@@ -92,7 +92,9 @@ struct PopoverView: View {
                 OverviewView(
                     payload: payload, stats: stats,
                     modelReport: model.modelReport, colors: model.colors)
-            case .models, .daily, .hourly, .stats, .agents:
+            case .models:
+                ModelsView(report: model.modelReport, colors: model.colors)
+            case .daily, .hourly, .stats, .agents:
                 placeholder(activeView.wrappedValue)
             }
         }
