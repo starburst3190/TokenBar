@@ -61,6 +61,49 @@ enum SelfTest {
         let s3 = Streaks.compute(perDayMap: [:], rangeStart: "2026-06-10", rangeEnd: "2026-06-01")
         expect(s3.longest == 0 && s3.current == 0, "inverted range is empty")
 
+        // UsagePace: expected-vs-actual classification, ETA projection, modes.
+        // Fixture: 60-minute window, 30 minutes elapsed (linear expected 50%).
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        func window(
+            used: Double, minutes: Int64 = 60, untilReset: TimeInterval = 1800,
+            historical: Double? = nil, runOut: Double? = nil
+        ) -> UsageWindow {
+            UsageWindow(
+                label: "Session", usedPercent: used, remainingPercent: 100 - used,
+                resetsAt: ISO8601DateFormatter().string(from: now.addingTimeInterval(untilReset)),
+                windowMinutes: minutes, historicalExpectedPercent: historical,
+                runOutProbability: runOut)
+        }
+        let onPace = UsagePace.compute(window: window(used: 50), now: now)
+        expect(onPace?.stage == .onTrack && onPace?.label == "On pace", "pace on track at 50%/50%")
+        let ahead = UsagePace.compute(window: window(used: 80), now: now)
+        expect(ahead?.stage == .farAhead && ahead?.label == "30% in deficit", "pace far ahead label")
+        // 80% in 30min → 100% in 37.5min, before the 30min reset → ETA 7.5min.
+        expect(ahead?.willLastToReset == false && abs((ahead?.etaSeconds ?? 0) - 450) < 1, "pace eta 450s")
+        expect(ahead?.etaText == "Projected empty in 8m", "pace eta text")
+        let reserve = UsagePace.compute(window: window(used: 40), now: now)
+        expect(reserve?.stage == .behind && reserve?.label == "10% in reserve", "pace reserve label")
+        expect(reserve?.willLastToReset == true && reserve?.etaText == "Lasts until reset", "slow burn lasts")
+        expect(UsagePace.compute(window: window(used: 50, minutes: 0), now: now) == nil, "no window length, no pace")
+        expect(UsagePace.compute(window: window(used: 50, untilReset: -10), now: now) == nil, "past reset, no pace")
+        // Modes: off → nil; historical override replaces expected; run-out
+        // probability drives the lasts/empty projection in historical mode.
+        expect(UsagePace.compute(window: window(used: 50), mode: .off, now: now) == nil, "pace mode off")
+        let hist = UsagePace.compute(
+            window: window(used: 50, historical: 80, runOut: 0.2), mode: .historical, now: now)
+        expect(hist?.expectedUsedPercent == 80 && hist?.stage == .farBehind, "historical expected override")
+        expect(hist?.willLastToReset == true, "low run-out risk lasts to reset")
+        let risky = UsagePace.compute(
+            window: window(used: 90, historical: 50, runOut: 0.8), mode: .historical, now: now)
+        expect(risky?.willLastToReset == false && risky?.etaSeconds != nil, "high run-out risk projects empty")
+        let linear = UsagePace.compute(
+            window: window(used: 50, historical: 80), mode: .linear, now: now)
+        expect(linear?.expectedUsedPercent == 50, "linear mode ignores historical")
+        expect(runOutRiskLabel(window: window(used: 50, runOut: 0.3)) == "≈ 30% run-out risk", "run-out risk label")
+        expect(runOutRiskLabel(window: window(used: 50)) == nil, "no probability, no risk label")
+        expect(UsagePace.durationText(130 * 60) == "2h 10m", "duration text h m")
+        expect(UsagePace.durationText(26 * 3600) == "1d 2h", "duration text d h")
+
         if failures > 0 {
             print("\(failures) selftest check(s) failed")
             exit(1)

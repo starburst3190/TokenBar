@@ -21,6 +21,23 @@ public struct UsageWindow: Decodable, Sendable {
     public let historicalExpectedPercent: Double?
     /// 0..1 chance the window empties before reset at the historical burn rate.
     public let runOutProbability: Double?
+
+    // Memberwise init so --selftest can build fixture windows.
+    public init(
+        label: String, usedPercent: Double, remainingPercent: Double,
+        resetsAt: String? = nil, resetText: String? = nil,
+        windowMinutes: Int64? = nil, historicalExpectedPercent: Double? = nil,
+        runOutProbability: Double? = nil
+    ) {
+        self.label = label
+        self.usedPercent = usedPercent
+        self.remainingPercent = remainingPercent
+        self.resetsAt = resetsAt
+        self.resetText = resetText
+        self.windowMinutes = windowMinutes
+        self.historicalExpectedPercent = historicalExpectedPercent
+        self.runOutProbability = runOutProbability
+    }
 }
 
 public struct CreditsSnapshot: Decodable, Sendable {

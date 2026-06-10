@@ -6,7 +6,7 @@ Liquid Glass on macOS 26+.
 
 > **Status: work in progress.** The shipping app is still the Tauri-based
 > [TokenBar](https://github.com/Nanako0129/TokenBar); this repo takes over at
-> feature parity (target: v0.4.2 feature set).
+> feature parity (target: v0.4.4 feature set).
 
 ## Progress
 
