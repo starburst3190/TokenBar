@@ -44,6 +44,11 @@ enum Format {
         return graph.contributions.last(where: { $0.date == today })?.totals.tokens ?? 0
     }
 
+    /// Today's cost in `graph` (0 when today has no entry).
+    static func todayCost(in graph: UsagePayload) -> Double {
+        graph.contributions.last(where: { $0.date == todayKey() })?.totals.cost ?? 0
+    }
+
     private static let monthsShort = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",

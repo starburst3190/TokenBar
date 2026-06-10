@@ -7,6 +7,8 @@ import TokenBarCore
 struct PopoverView: View {
     @State private var model = DashboardModel()
     @State private var tokensPerMin: Double?
+    /// `--settings` opens straight onto the settings panel (debug/screenshot aid).
+    @State private var showSettings = CommandLine.arguments.contains("--settings")
     @AppStorage("tokenbar.view") private var activeViewRaw = AppView.overview.rawValue
     /// "overview" or a client id. Not persisted, matching the Tauri app.
     /// `--tab=<id>` preselects a client tab (debug/screenshot aid).
@@ -24,19 +26,27 @@ struct PopoverView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            if let stats = model.stats, stats.presentClients.count > 1 {
-                DashboardTabs(clients: stats.presentClients, active: $activeTab)
+            if !showSettings {
+                if let stats = model.stats, stats.presentClients.count > 1 {
+                    DashboardTabs(clients: stats.presentClients, active: $activeTab)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+                }
+                ViewSwitch(active: activeView)
                     .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
+                    .padding(.bottom, 10)
             }
-            ViewSwitch(active: activeView)
-                .padding(.horizontal, 12)
-                .padding(.bottom, 10)
             Divider()
             ScrollView {
-                content
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                Group {
+                    if showSettings {
+                        SettingsPanel()
+                    } else {
+                        content
+                    }
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             Divider()
             footer
@@ -134,10 +144,17 @@ struct PopoverView: View {
 
     private var footer: some View {
         HStack {
-            Text(activeView.wrappedValue.label)
+            Text(showSettings ? "Settings" : activeView.wrappedValue.label)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
             Spacer()
+            Button {
+                showSettings.toggle()
+            } label: {
+                Image(systemName: showSettings ? "chevron.backward" : "gearshape")
+            }
+            .controlSize(.small)
+            .help(showSettings ? "Back to dashboard" : "Settings")
             Button("Quit") {
                 NSApp.terminate(nil)
             }

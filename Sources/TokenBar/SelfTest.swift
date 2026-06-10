@@ -104,6 +104,26 @@ enum SelfTest {
         expect(UsagePace.durationText(130 * 60) == "2h 10m", "duration text h m")
         expect(UsagePace.durationText(26 * 3600) == "1d 2h", "duration text d h")
 
+        // Trace collapse: one row per client, agents/models joined sorted,
+        // "unknown" dropped when named models exist, rows sorted by tokens.
+        func bucket(_ client: String, _ agent: String, _ model: String, _ tokens: Int64) -> TraceBucket {
+            TraceBucket(
+                client: client, agent: agent, model: model, tokens: tokens,
+                messages: 1, tokensPerMin: Double(tokens))
+        }
+        let collapsed = TraceBucket.collapseByClient([
+            bucket("claude-code", "Main", "claude-opus-4-8", 100),
+            bucket("claude-code", "Subagent", "unknown", 50),
+            bucket("codex-cli", "Main", "gpt-5.5", 400),
+        ])
+        expect(collapsed.count == 2 && collapsed[0].client == "codex-cli", "collapse groups and sorts by tokens")
+        expect(collapsed[1].tokens == 150 && collapsed[1].tokensPerMin == 150, "collapse sums tokens and rate")
+        expect(collapsed[1].agent == "Main, Subagent", "collapse joins agents sorted")
+        expect(collapsed[1].model == "claude-opus-4-8", "collapse drops unknown among named models")
+        expect(
+            TraceBucket.collapseByClient([bucket("amp", "Main", "unknown", 5)]).first?.model == "unknown",
+            "collapse keeps a lone unknown model")
+
         // Limits-card drag reorder: direction-aware insert (down → after the
         // target, up → before it) so single-step moves both work.
         let order = ["a", "b", "c", "d"]

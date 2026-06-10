@@ -30,20 +30,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         titleRefreshTask?.cancel()
     }
 
-    /// Refreshes the tray title with today's token total every 60s. Cheap:
-    /// tb_graph serves a <=30s staticlib cache on top of tokscale's own cache.
-    /// Placeholder for the full title-mode system in a later phase.
+    /// Refreshes the tray title every 60s in the user's chosen mode. Reads
+    /// usually hit the <=30s staticlib cache; a full log re-read
+    /// (tb_refresh_graph) is forced every "Data refresh" interval from
+    /// settings. Tray animation joins in a later phase.
     private func startTitleRefresh() {
         titleRefreshTask = Task { [weak self] in
+            var lastFullRefresh = Date.distantPast
             while !Task.isCancelled {
+                let mode = TrayMode.current
+                let intervalMin = max(1, UserDefaults.standard.object(forKey: "tokenbar.refresh.intervalMin")
+                    .flatMap { $0 as? Int } ?? 30)
+                let forceRefresh = Date().timeIntervalSince(lastFullRefresh) >= Double(intervalMin) * 60
                 let graph = try? await Task.detached(priority: .utility) {
-                    try TBCore.graph()
+                    forceRefresh ? try TBCore.refreshGraph() : try TBCore.graph()
                 }.value
+                if forceRefresh && graph != nil { lastFullRefresh = Date() }
+                let rate: Double? = mode == .tokensPerMin
+                    ? try? await Task.detached(priority: .utility) {
+                        try TBCore.tokensPerMin()
+                    }.value
+                    : nil
                 guard !Task.isCancelled else { break }
-                if let graph {
-                    self?.statusController?.updateTitle(
-                        Format.compactTokens(Format.todayTokens(in: graph)))
-                }
+                self?.statusController?.updateTitle(
+                    mode.title(graph: graph, tokensPerMin: rate))
                 try? await Task.sleep(for: .seconds(Double(Self.titleRefreshSecs)))
             }
         }
