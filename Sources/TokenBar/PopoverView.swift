@@ -95,9 +95,31 @@ struct PopoverView: View {
                 .font(.headline)
             Spacer()
             liveRateBadge
+            refreshButton
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+    }
+
+    /// Manual refresh (also ⌘R): forces a full log re-read.
+    private var refreshButton: some View {
+        Button {
+            Task { await model.refresh() }
+        } label: {
+            if model.refreshing {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 16, height: 16)
+            } else {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(model.refreshing)
+        .help("Refresh usage data (⌘R)")
     }
 
     private var liveRateBadge: some View {
@@ -257,7 +279,7 @@ struct PopoverView: View {
         case "q":
             NSApp.terminate(nil)
         case "r":
-            Task { await model.load() }
+            Task { await model.refresh() }
         case "g":
             chartViewRaw = chartViewRaw == "2d" ? "3d" : "2d"
         default:

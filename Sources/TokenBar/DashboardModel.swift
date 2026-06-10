@@ -57,6 +57,40 @@ enum AppView: String, CaseIterable {
         }
     }
 
+    private(set) var refreshing = false
+
+    /// Manual refresh: force a full log re-read (bypassing the staticlib's
+    /// 30s cache) and drop the lazy per-lens reports so they re-fetch.
+    func refresh() async {
+        guard !refreshing else { return }
+        refreshing = true
+        defer { refreshing = false }
+        async let payloadTask = Task.detached(priority: .userInitiated) {
+            try TBCore.refreshGraph()
+        }.value
+        async let reportTask = Task.detached(priority: .userInitiated) {
+            try? TBCore.modelReport()
+        }.value
+        guard let payload = try? await payloadTask else { return }
+        let report = await reportTask
+        self.payload = payload
+        stats = UsageStats(payload: payload, selectedClients: Set(payload.summary.clients))
+        modelReport = report
+        colors = ModelColorMap(report: report)
+        phase = .ready
+        // Re-fetch the lazy lenses that were already loaded.
+        if hourly != nil {
+            hourly = await Task.detached(priority: .userInitiated) {
+                try? TBCore.hourlyReport()
+            }.value
+        }
+        if agents != nil {
+            agents = await Task.detached(priority: .userInitiated) {
+                try? TBCore.agentsReport()
+            }.value
+        }
+    }
+
     /// Poll the OAuth quota snapshots while the popover is open. The fetch is
     /// network-bound (up to ~30s when a provider hangs), so failures keep the
     /// previous payload; per-provider errors live inside each snapshot.
