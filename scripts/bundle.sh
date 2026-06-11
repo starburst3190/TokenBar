@@ -24,6 +24,10 @@ swift build -c release
 
 echo "==> assembling $APP ($VERSION, build $BUILD_NUMBER, $BUNDLE_ID)"
 rm -rf "$APP"
+mkdir -p "$OUT_DIR"
+# Keep Spotlight from indexing local builds — otherwise every dist/ app
+# shows up beside the installed one in search results.
+touch "$OUT_DIR/.metadata_never_index"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 
 cp .build/release/TokenBar "$APP/Contents/MacOS/TokenBar"
