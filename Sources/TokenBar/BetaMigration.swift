@@ -65,16 +65,29 @@ enum BridgeBuild {
             NSApp.terminate(nil)
             return
         }
+        // Write a .command script and open it: Terminal runs a double-clicked
+        // .command without the Automation permission that an ad-hoc app needs
+        // to script Terminal directly (which macOS silently denies — the old
+        // AppleScript path just no-op'd for everyone).
         let script = """
-        tell application "Terminal"
-            activate
-            do script "\(installCommand) && osascript -e 'quit app \\"TokenBar Beta\\"'"
-        end tell
+        #!/bin/bash
+        echo "Installing TokenBar 1.0…"
+        \(installCommand)
+        open -a TokenBar 2>/dev/null
+        pkill -f "TokenBar Beta.app/Contents/MacOS" 2>/dev/null
+        echo
+        echo "Done — TokenBar 1.0 is installed and launched."
+        echo "You can close this window and drag TokenBar Beta to the Trash."
         """
-        if let apple = NSAppleScript(source: script) {
-            var err: NSDictionary?
-            apple.executeAndReturnError(&err)
-            if let err { NSLog("TokenBar bridge: AppleScript failed: \(err)") }
+        let path = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("tokenbar-switch.command")
+        do {
+            try script.write(toFile: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: path)
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        } catch {
+            NSLog("TokenBar bridge: could not write switch script: \(error)")
         }
     }
 }
