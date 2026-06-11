@@ -1,0 +1,31 @@
+name: Update install count
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute download count
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COUNT=$(gh api repos/Nanako0129/TokenBar/releases \
+            --jq '[.[].assets[] | select(.name | test("\\.(tar\\.gz|dmg|zip|pkg)$")) | .download_count] | add // 0')
+          echo "{\"schemaVersion\":1,\"label\":\"installs\",\"message\":\"${COUNT}\",\"color\":\"brightgreen\"}" \
+            > docs/install-count.json
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/install-count.json
+          git diff --staged --quiet || git commit -m "chore: update install count" && git push
