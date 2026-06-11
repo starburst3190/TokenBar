@@ -1,29 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
-    <title>TokenBar (native) updates</title>
+    <title>TokenBar updates</title>
     <item>
-      <title>1.0.0-beta.4</title>
-      <pubDate>Thu, 11 Jun 2026 06:27:39 +0000</pubDate>
-      <sparkle:version>60</sparkle:version>
-      <sparkle:shortVersionString>1.0.0-beta.4</sparkle:shortVersionString>
+      <title>1.0.0</title>
+      <pubDate>Thu, 11 Jun 2026 14:36:51 +0000</pubDate>
+      <sparkle:version>68</sparkle:version>
+      <sparkle:shortVersionString>1.0.0</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-      <link>https://github.com/Nanako0129/TokenBar-Native/releases/tag/v1.0.0-beta.4</link>
+
+      <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.0.0</link>
       <description><![CDATA[
-<b>Fixes:</b>
-<ul>
-<li>Usage-chart tooltip dodges the cursor</li>
-</ul>
 <b>New:</b>
 <ul>
-<li>One-click update button in the popover footer</li>
-<li>AI release notes feeding GitHub and the Sparkle dialog</li>
+<li>Stable identity, beta migration, Sparkle beta channel</li>
+<li>Bridge build for beta→release graduation</li>
+<li>Tauri migration manifest (latest.json) on stable releases</li>
+<li>Vendor tokscale LICENSE, RunCat credit, public-facing README</li>
+<li>Glass-over-wallpaper screenshots for the public README</li>
+<li>Wider hero + 3D screenshots with more wallpaper breathing room</li>
+<li>Visual rewrite — image-forward, less prose</li>
 </ul>
       ]]></description>
       <enclosure
-        url="https://github.com/Nanako0129/TokenBar-Native/releases/download/v1.0.0-beta.4/TokenBar-Beta.app.tar.gz"
-        sparkle:edSignature="wOtm7/tGoMm4L4Nyt1eQQ1bKR9YILWwf4JLQ8yFte91OJUzqN080yVZ8ceJfRRiH0yYPe++YZ9q0iW63lNp0Dg=="
-        length="6585033"
+        url="https://github.com/Nanako0129/TokenBar/releases/download/v1.0.0/TokenBar.app.tar.gz"
+        sparkle:edSignature="1p4CEG8O/7WazburE85WogvjL9+icbhZPgS2XzXo+FAwnI2m6pl6orzeaa8NIxLei7SdUF51/C8DWCf4xFKQBw=="
+        length="6596609"
         type="application/octet-stream"/>
     </item>
   </channel>
