@@ -3,16 +3,16 @@
   <channel>
     <title>TokenBar (native) updates</title>
     <item>
-      <title>1.0.0-beta.2</title>
-      <pubDate>Thu, 11 Jun 2026 04:27:19 +0000</pubDate>
-      <sparkle:version>47</sparkle:version>
-      <sparkle:shortVersionString>1.0.0-beta.2</sparkle:shortVersionString>
+      <title>1.0.0-beta.3</title>
+      <pubDate>Thu, 11 Jun 2026 05:47:46 +0000</pubDate>
+      <sparkle:version>56</sparkle:version>
+      <sparkle:shortVersionString>1.0.0-beta.3</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-      <link>https://github.com/Nanako0129/TokenBar-Native/releases/tag/v1.0.0-beta.2</link>
+      <link>https://github.com/Nanako0129/TokenBar-Native/releases/tag/v1.0.0-beta.3</link>
       <enclosure
-        url="https://github.com/Nanako0129/TokenBar-Native/releases/download/v1.0.0-beta.2/TokenBar-Beta.app.tar.gz"
-        sparkle:edSignature="85dMTNzC2ha7vQQLM4jkKMfq/JxRufHBv6woSxrESGRPH1bxUr9IDd7uR2DUXi1AOKnilvFTY761S4K8NAbxAA=="
-        length="7793358"
+        url="https://github.com/Nanako0129/TokenBar-Native/releases/download/v1.0.0-beta.3/TokenBar-Beta.app.tar.gz"
+        sparkle:edSignature="3uO7n4uUqWIxZ6smqhySCGR+2xAYSgxeo0peN+fwd9H2xoFmUERHARp+wuBYk8brJCCd77Bg4MWs07nounpXDA=="
+        length="6569616"
         type="application/octet-stream"/>
     </item>
   </channel>
