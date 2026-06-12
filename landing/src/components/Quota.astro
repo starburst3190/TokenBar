@@ -6,6 +6,10 @@
 // for SVG), then CSS `d: path()` morphs between them. One 14s loop: hold →
 // melt through battery colors → puddle → the window resets and it refreezes.
 
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).quota
+
 type Geom = {
   d: string
   gXL: number; gXR: number; gY: number; gH: number; gOp: number
@@ -114,16 +118,10 @@ const g0 = popGeom(1)
 <section class="section quota" id="quota">
   <div class="container quota-grid">
     <div class="section-head quota-copy reveal">
-      <p class="eyebrow">The menu bar is the dashboard</p>
-      <h2>Your quota,<br />melting in real time.</h2>
-      <p>
-        The status item can gauge what's left of your subscription window —
-        as signal bars, a ring, or a popsicle that melts as your five-hour
-        window drains. Battery-style colors kick in when it matters:
-        amber under 25%, red under 10%. Right-click picks which
-        subscription it tracks.
-      </p>
-      <p class="quota-note mono">drawn live on a 16px grid · same geometry as the app</p>
+      <p class="eyebrow">{c.eyebrow}</p>
+      <h2 set:html={c.h2} />
+      <p>{c.body}</p>
+      <p class="quota-note mono">{c.note}</p>
     </div>
 
     <div class="quota-stage glass qstage reveal" style="--rd:.12s">
@@ -144,7 +142,7 @@ const g0 = popGeom(1)
               <rect x="12" y="1" width="3" height="14" rx="1.2" />
             </g>
           </svg>
-          <figcaption class="mono">signal bars</figcaption>
+          <figcaption class="mono">{c.gaugeBars}</figcaption>
         </figure>
 
         <figure class="gauge big">
@@ -164,7 +162,7 @@ const g0 = popGeom(1)
             <ellipse class="qp-anim qp-drip" cx="9" cy={g0.dripCy} rx="0.5" ry="0.75" style={`fill: ${g0.fill}; opacity: 0;`} />
             <ellipse class="qp-anim qp-drop" cx="7.125" cy="12.65" rx="0.425" ry="0.55" style={`fill: ${g0.fill}; opacity: 0;`} />
           </svg>
-          <figcaption class="mono">melting popsicle</figcaption>
+          <figcaption class="mono">{c.gaugePop}</figcaption>
         </figure>
 
         <figure class="gauge">
@@ -178,13 +176,13 @@ const g0 = popGeom(1)
               />
             </g>
           </svg>
-          <figcaption class="mono">ring gauge</figcaption>
+          <figcaption class="mono">{c.gaugeRing}</figcaption>
         </figure>
       </div>
       <p class="legend mono" aria-hidden="true">
-        <span class="sw ok"></span>on pace
-        <span class="sw warn"></span>&lt; 25% left
-        <span class="sw low"></span>&lt; 10% left
+        <span class="sw ok"></span>{c.legendOk}
+        <span class="sw warn"></span>{c.legendWarn}
+        <span class="sw low"></span>{c.legendLow}
       </p>
     </div>
   </div>

@@ -1,47 +1,28 @@
 ---
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).native
 const base = import.meta.env.BASE_URL
-const points = [
-  {
-    title: '100% native Swift shell',
-    body: 'SwiftUI + AppKit around a Rust core — no webview. The popover opens instantly and feels like part of the OS, because it is.',
-  },
-  {
-    title: 'Liquid Glass, for real',
-    body: 'On macOS 26 the dashboard renders as clear glass cards floating over your wallpaper — the Control Center look. Earlier systems get a vibrancy fallback.',
-  },
-  {
-    title: 'SceneKit 3D at 160 fps',
-    body: 'The year-at-a-glance contribution terrain is a real 3D scene you orbit and zoom — camera position remembered across opens.',
-  },
-  {
-    title: 'Sparkle updates, AI-written notes',
-    body: 'In-app updates arrive over a signed Sparkle feed, with release notes summarized from the actual commits. Beta channel is one Settings toggle away.',
-  },
-]
 ---
 
 <section class="section native" id="native">
   <div class="container">
     <div class="section-head reveal">
-      <p class="eyebrow">Native Swift · Liquid Glass</p>
-      <h2>Rebuilt in Swift.<br />Dressed in Liquid Glass.</h2>
-      <p>
-        This <em>is</em> TokenBar — since v1.0.0 the app is a ground-up native
-        rewrite. Same dashboard, same numbers as the original, now with the
-        system's own glass, springs, and speed.
-      </p>
+      <p class="eyebrow">{c.eyebrow}</p>
+      <h2 set:html={c.h2} />
+      <p set:html={c.intro} />
     </div>
 
     <div class="native-grid">
       <figure class="shot reveal">
         <img
           src={`${base}screenshots/native/hero-wide.png`}
-          alt="The native TokenBar popover rendered in Liquid Glass over the desktop wallpaper"
+          alt={c.shotAlt}
           loading="lazy"
         />
       </figure>
       <ul class="points glass reveal" style="--rd:.12s">
-        {points.map((p) => (
+        {c.points.map((p) => (
           <li>
             <h3>{p.title}</h3>
             <p>{p.body}</p>

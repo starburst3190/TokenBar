@@ -1,46 +1,16 @@
 ---
-const faqs = [
-  {
-    q: 'What exactly is TokenBar?',
-    a: 'A free, open-source native macOS menu-bar app that reads your local AI coding session logs and shows what you’re spending — across a contribution graph, per-model and per-agent breakdowns, daily and hourly views, and live throughput. No CLI to run, no account.',
-  },
-  {
-    q: 'Which AI coding tools does it track?',
-    a: '25+ agents from their local logs — Claude Code, Codex CLI, Cursor, OpenCode, Gemini CLI, Copilot CLI, Amp, Droid, Hermes, Goose, Kilo/KiloCode, Roo Code, Qwen, Kimi, Crush, Zed, Kiro, Trae, Warp and more. Parsing is handled by the vendored tokscale-core, so coverage tracks tokscale.',
-  },
-  {
-    q: 'Does it cost anything?',
-    a: 'No. TokenBar is MIT-licensed and free — no subscription, no paid tier, no telemetry.',
-  },
-  {
-    q: 'What happened to the original (Tauri) app?',
-    a: 'TokenBar began as a Tauri fork of tokcat. With v1.0.0 (June 2026) it was replaced by a ground-up Swift rewrite around the same Rust parsing core — the `tokenbar` cask now installs the native app, and the Tauri repository is archived. A `tokenbar@legacy` cask pins the final Tauri build (v0.4.5) for macOS 11+.',
-  },
-  {
-    q: 'How do updates work?',
-    a: 'In-app, over a signed Sparkle feed — each release is signature-verified before install, with release notes summarized from the actual commits. Want beta builds? It’s a toggle in Settings, not a separate install.',
-  },
-  {
-    q: 'Where does my data go?',
-    a: 'Nowhere. Usage history is read locally from disk. Network requests are limited to the signed updater feed, public model-pricing data, and optional Codex/Claude quota lookups using the OAuth credentials already on your machine — that’s what powers the menu-bar quota gauge and the agent limit cards.',
-  },
-  {
-    q: 'Intel Mac or Windows?',
-    a: 'TokenBar targets Apple Silicon (arm64) on macOS 14+; Liquid Glass needs macOS 26, earlier systems get a vibrancy fallback. The legacy Tauri build covers macOS 11+. There’s no Intel, Windows, or Linux build.',
-  },
-  {
-    q: 'How do I uninstall it?',
-    a: 'brew uninstall --cask tokenbar.',
-  },
-]
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).faq
+const faqs = c.items
 ---
 
 <section class="section faq">
   <div class="container faq-grid">
     <div class="section-head faq-head reveal">
-      <p class="eyebrow">Questions</p>
-      <h2>Good to know.</h2>
-      <p>The short answers most people want before installing.</p>
+      <p class="eyebrow">{c.eyebrow}</p>
+      <h2>{c.h2}</h2>
+      <p>{c.intro}</p>
     </div>
     <div class="faq-list glass reveal" style="--rd:.1s">
       {faqs.map((f, i) => (

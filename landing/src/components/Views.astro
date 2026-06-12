@@ -1,32 +1,32 @@
 ---
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).views
 const base = import.meta.env.BASE_URL
-const views = [
-  { img: 'native/overview', name: 'Overview', accent: '--p-anthropic', desc: 'The whole picture — contribution chart, agent limits with pace, live session, model breakdown, streaks.' },
-  { img: 'native/models', name: 'Models', accent: '--p-openai', desc: 'Every model ranked by cost, with its share and a dim In · Out · CR · CW split.' },
-  { img: 'native/daily', name: 'Daily', accent: '--p-google', desc: 'Active days newest-first — select one to drill into that day’s per-model spend.' },
-  { img: 'native/hourly', name: 'Hourly', accent: '--p-cursor', desc: 'A 24-hour-of-day rhythm: when in the day your tokens actually get spent.' },
-  { img: 'native/stats', name: 'Stats', accent: '--p-deepseek', desc: 'Headline summary — total spend, active days, streaks, favorite model, best day.' },
-  { img: 'native/agents', name: 'Agents', accent: '--p-mistral', desc: 'Sub-agents ranked by cost, with their source apps, message count, and tokens.' },
+const slots = [
+  { img: 'native/overview', accent: '--p-anthropic' },
+  { img: 'native/models', accent: '--p-openai' },
+  { img: 'native/daily', accent: '--p-google' },
+  { img: 'native/hourly', accent: '--p-cursor' },
+  { img: 'native/stats', accent: '--p-deepseek' },
+  { img: 'native/agents', accent: '--p-mistral' },
 ]
+const views = slots.map((s, i) => ({ ...s, ...c.items[i] }))
 ---
 
 <section class="section" id="views">
   <div class="container">
     <div class="section-head reveal">
-      <p class="eyebrow">One popover, six lenses</p>
-      <h2>App tabs filter who. The view switch picks how.</h2>
-      <p>
-        Pick which agents you’re looking at, then choose how to break them down —
-        a multi-view dashboard inspired by
-        <a class="ilink" href="https://github.com/junhoyeo/tokscale">tokscale</a>’s TUI.
-      </p>
+      <p class="eyebrow">{c.eyebrow}</p>
+      <h2>{c.h2}</h2>
+      <p set:html={c.intro} />
     </div>
 
     <div class="grid">
       {views.map((v, i) => (
         <article class="card glass reveal" style={`--ac: var(${v.accent}); --rd: ${(i % 3) * 0.08}s;`}>
           <div class="frame">
-            <img src={`${base}screenshots/${v.img}.png`} alt={`TokenBar ${v.name} view`} loading="lazy" />
+            <img src={`${base}screenshots/${v.img}.png`} alt={c.altPrefix(v.name)} loading="lazy" />
           </div>
           <div class="meta">
             <h3><span class="tag" aria-hidden="true"></span>{v.name}</h3>
@@ -37,23 +37,18 @@ const views = [
 
       <article class="card glass wide reveal" style="--ac: var(--p-google);">
         <div class="frame">
-          <img src={`${base}screenshots/native/contribution-3d.png`} alt="TokenBar interactive 3D contribution graph" loading="lazy" />
+          <img src={`${base}screenshots/native/contribution-3d.png`} alt={c.wideAlt} loading="lazy" />
         </div>
         <div class="meta">
-          <h3><span class="tag" aria-hidden="true"></span>3D contribution graph</h3>
-          <p>
-            The same year of usage as an interactive GitHub-style tile terrain —
-            orbit it, and the stacked 2D bars are one toggle away. Tokens stack by
-            <strong>model</strong> (provider shades) or by <strong>agent</strong> (brand colors),
-            in tokens or dollars.
-          </p>
+          <h3><span class="tag" aria-hidden="true"></span>{c.wideTitle}</h3>
+          <p set:html={c.wideDesc} />
         </div>
       </article>
     </div>
   </div>
 
-  <div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="Screenshot preview">
-    <button class="lb-close" id="lb-close" type="button" aria-label="Close preview">×</button>
+  <div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label={c.lightboxLabel}>
+    <button class="lb-close" id="lb-close" type="button" aria-label={c.lightboxClose}>×</button>
     <img id="lb-img" src="" alt="" />
   </div>
 </section>

@@ -1,29 +1,16 @@
 ---
-const pillars = [
-  {
-    k: '01',
-    title: 'Reads on-device',
-    body: 'Usage comes from the session logs already on your disk. Nothing is uploaded, nothing is mined — the parse happens locally via the vendored tokscale-core.',
-  },
-  {
-    k: '02',
-    title: 'No telemetry, no account',
-    body: 'No analytics, no sign-up, no cloud sync. TokenBar never phones home with what you do or what you spend.',
-  },
-  {
-    k: '03',
-    title: 'Every request, disclosed',
-    body: 'Network access: the signed updater manifest, public model-pricing data, and — only when you have local Codex/Claude OAuth credentials — direct vendor quota lookups for the limit cards. No third parties, ever.',
-  },
-]
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).privacy
+const pillars = c.pillars.map((p, i) => ({ k: `0${i + 1}`, ...p }))
 ---
 
 <section class="section privacy" id="privacy">
   <div class="container">
     <div class="section-head reveal">
-      <p class="eyebrow">Local-first by construction</p>
-      <h2>Your spend stays on your Mac.</h2>
-      <p>TokenBar is built so the honest answer to “where does my data go?” is: nowhere.</p>
+      <p class="eyebrow">{c.eyebrow}</p>
+      <h2>{c.h2}</h2>
+      <p>{c.intro}</p>
     </div>
     <div class="pillars">
       {pillars.map((p, i) => (

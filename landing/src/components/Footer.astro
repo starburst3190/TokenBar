@@ -1,4 +1,8 @@
 ---
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).footer
+const base = import.meta.env.BASE_URL
 const repo = 'https://github.com/Nanako0129/TokenBar'
 ---
 
@@ -6,19 +10,18 @@ const repo = 'https://github.com/Nanako0129/TokenBar'
   <div class="container foot-inner">
     <div class="foot-brand">
       <a class="wordmark" href="#top"><span class="dot" aria-hidden="true"></span>TokenBar</a>
-      <p>AI token usage monitor for the macOS menu bar. MIT licensed.</p>
+      <p>{c.tagline}</p>
     </div>
     <nav class="foot-links">
       <a href={repo}>GitHub</a>
       <a href={`${repo}/releases`}>Releases</a>
       <a href={`${repo}/blob/main/README.md`}>README</a>
-      <a href={`${repo}/blob/main/README.zh-TW.md`}>繁體中文</a>
-      <a href={`${repo}/blob/main/README.ko-KR.md`}>한국어</a>
+      <a href={c.langSwitch.href === '/' ? base : `${base}${c.langSwitch.href.slice(1)}`}>{c.langSwitch.label}</a>
     </nav>
   </div>
   <div class="container foot-base mono">
-    <span>macOS 14+ · Apple Silicon · Swift + Rust · Liquid Glass · MIT</span>
-    <span>© TokenBar contributors</span>
+    <span>{c.stamp}</span>
+    <span>{c.copyright}</span>
   </div>
 </footer>
 

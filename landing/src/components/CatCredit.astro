@@ -1,4 +1,7 @@
 ---
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).cat
 const base = import.meta.env.BASE_URL
 ---
 
@@ -13,24 +16,14 @@ const base = import.meta.env.BASE_URL
         </span>
         <span class="mb-menus"><b>TokenBar</b><span>File</span><span>View</span></span>
         <span class="mb-spacer"></span>
-        <img src={`${base}screenshots/menubar.gif`} alt="The TokenBar menu-bar cat spinning beside today's cost" width="240" />
+        <img src={`${base}screenshots/menubar.gif`} alt={c.gifAlt} width="240" />
       </div>
     </div>
     <div class="cat-copy reveal" style="--rd:.1s">
-      <p class="eyebrow">A gauge, not a mascot</p>
-      <h2>The cat spins faster<br />the more you burn.</h2>
-      <p>
-        Your token throughput as a single glanceable critter: idle when nothing's
-        flowing, whirling when Claude Code is mid-refactor. One look at the menu
-        bar tells you how fast the meter is running — no window required.
-      </p>
-      <p class="credit">
-        The spinning cat is the signature creative touch of the original
-        <a href="https://github.com/handlecusion/tokcat">tokcat</a> by
-        <strong>handlecusion</strong> — kept here with gratitude. The running
-        menu-bar pet itself began with
-        <a href="https://kyome.io/runcat/">RunCat</a> by <strong>Takuto Nakamura</strong>.
-      </p>
+      <p class="eyebrow">{c.eyebrow}</p>
+      <h2 set:html={c.h2} />
+      <p>{c.body}</p>
+      <p class="credit" set:html={c.credit} />
     </div>
   </div>
 </section>

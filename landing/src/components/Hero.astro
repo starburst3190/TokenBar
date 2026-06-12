@@ -1,5 +1,8 @@
 ---
 import Heatmap from './Heatmap.astro'
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).hero
 const base = import.meta.env.BASE_URL
 const brew = 'brew install --cask nanako0129/tokenbar/tokenbar'
 const repo = 'https://github.com/Nanako0129/TokenBar'
@@ -9,29 +12,20 @@ const repo = 'https://github.com/Nanako0129/TokenBar'
   <Heatmap />
   <div class="container hero-inner">
     <div class="hero-copy">
-      <p class="eyebrow rise" style="animation-delay:.85s">Local-first · Native macOS menu bar</p>
-      <h1 class="rise" style="animation-delay:.92s">
-        Know every AI<br />token you <span class="hot">burn</span>.
-      </h1>
-      <p class="lede rise" style="animation-delay:1s">
-        TokenBar reads your AI coding logs on-device and lays your spend bare
-        across <strong>25+ agents</strong> — Claude Code, Codex, Cursor, OpenCode
-        and more. Native Swift, dressed in Liquid Glass. No telemetry, no
-        account. Just the numbers.
-      </p>
+      <p class="eyebrow rise" style="animation-delay:.85s">{c.eyebrow}</p>
+      <h1 class:list={['rise', { cjk: locale === 'zh-tw' }]} style="animation-delay:.92s" set:html={c.h1} />
+      <p class="lede rise" style="animation-delay:1s" set:html={c.lede} />
 
       <div class="cta rise" style="animation-delay:1.08s">
-        <button class="brew" id="brew" type="button" title="Copy install command">
+        <button class="brew" id="brew" type="button" title="Copy install command" data-copied={c.copied}>
           <span class="prompt">$</span>
           <code>{brew}</code>
-          <span class="copy" aria-hidden="true">copy</span>
+          <span class="copy" aria-hidden="true">{c.copy}</span>
         </button>
-        <a class="btn btn-ghost" href={repo}>View on GitHub</a>
+        <a class="btn btn-ghost" href={repo}>{c.github}</a>
       </div>
 
-      <p class="statline mono rise" style="animation-delay:1.16s">
-        25+ agents · 6 lenses · 160 fps 3D · 0 telemetry
-      </p>
+      <p class="statline mono rise" style="animation-delay:1.16s">{c.statline}</p>
     </div>
 
     <div class="hero-pop" aria-hidden="false">
@@ -41,7 +35,7 @@ const repo = 'https://github.com/Nanako0129/TokenBar'
           <img
             class="pop-img"
             src={`${base}screenshots/native/popover-hero.png`}
-            alt="The TokenBar popover: token usage dashboard with agent limits and live pace"
+            alt={c.popAlt}
             width="365"
             height="849"
             fetchpriority="high"
@@ -57,13 +51,14 @@ const repo = 'https://github.com/Nanako0129/TokenBar'
   if (b) {
     const cmd = b.querySelector('code')?.textContent ?? ''
     const label = b.querySelector('.copy')
+    const idle = label?.textContent ?? 'copy'
     b.addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(cmd)
         if (label) {
-          label.textContent = 'copied'
+          label.textContent = b.dataset.copied || 'copied'
           b.classList.add('done')
-          setTimeout(() => { label.textContent = 'copy'; b.classList.remove('done') }, 1600)
+          setTimeout(() => { label.textContent = idle; b.classList.remove('done') }, 1600)
         }
       } catch {}
     })
@@ -93,6 +88,8 @@ const repo = 'https://github.com/Nanako0129/TokenBar'
     margin: 16px 0 0;
     text-wrap: balance;
   }
+  /* CJK glyphs run much wider per line — drop the scale, open the leading */
+  .hero h1.cjk { font-size: clamp(34px, 4.7vw, 62px); line-height: 1.18; }
   .hero h1 .hot {
     background: linear-gradient(120deg, var(--accent-bright), var(--accent-pink));
     -webkit-background-clip: text; background-clip: text; color: transparent;

@@ -3,6 +3,9 @@
 // the top. Left side reads like the frontmost app's menus (anchor links in
 // disguise); right side is a faithful status item — the staircase-bars brand
 // icon plus a mono token counter that drifts like the live tray title.
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).menubar
 const repo = 'https://github.com/Nanako0129/TokenBar'
 ---
 
@@ -15,15 +18,11 @@ const repo = 'https://github.com/Nanako0129/TokenBar'
     </span>
     <a class="mb-app" href="#top">TokenBar</a>
     <nav class="mb-menus" aria-label="Site">
-      <a href="#native">About</a>
-      <a href="#views">Views</a>
-      <a href="#quota">Menu Bar</a>
-      <a href="#privacy">Privacy</a>
-      <a href="#install">Install</a>
+      {c.items.map((it) => <a href={it.href}>{it.label}</a>)}
     </nav>
     <span class="mb-spacer"></span>
     <a class="mb-gh mono" href={repo}>GitHub ↗</a>
-    <span class="mb-status" id="mb-status" title="TokenBar lives right here">
+    <span class="mb-status" id="mb-status" title={c.statusTitle}>
       <svg class="mb-icon" viewBox="0 0 16 16" aria-hidden="true">
         <!-- staircase bars, mirrors TrayIcons.drawBars on its 16-grid -->
         <rect x="0" y="10" width="3" height="5" rx="1.2" />

@@ -1,52 +1,26 @@
 ---
-const credits = [
-  {
-    name: 'tokcat',
-    who: 'by handlecusion',
-    href: 'https://github.com/handlecusion/tokcat',
-    body: 'The original macOS menu-bar token monitor TokenBar is forked from. The Tauri shell, native tray, and the spinning menu-bar cat all originate here.',
-    accent: '--p-anthropic',
-  },
-  {
-    name: 'tokscale',
-    who: 'by Junho Yeo',
-    href: 'https://github.com/junhoyeo/tokscale',
-    body: 'Its tokscale-core crate powers TokenBar’s multi-agent session parsing, dedup, and pricing. The multi-view dashboard is inspired by tokscale’s TUI.',
-    accent: '--p-deepseek',
-  },
-  {
-    name: 'RunCat',
-    who: 'by Takuto Nakamura',
-    href: 'https://kyome.io/runcat/',
-    body: 'The original running menu-bar pet. Every cat that has ever sprinted across a Mac menu bar — tokcat’s and TokenBar’s included — traces back here.',
-    accent: '--p-cursor',
-  },
-  {
-    name: 'CodexBar',
-    who: 'by Peter Steinberger',
-    href: 'https://github.com/steipete/CodexBar',
-    body: 'TokenBar’s quota-pace presentation — ahead of or behind your window, projected run-dry time — references CodexBar’s approach.',
-    accent: '--p-openai',
-  },
-]
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).credits
+const credits = c.items
 ---
 
 <section class="section credits">
   <div class="container">
     <div class="section-head reveal">
-      <p class="eyebrow">Standing on shoulders</p>
-      <h2>Built on great open source.</h2>
-      <p>TokenBar wouldn’t exist without these projects — thank you to their maintainers.</p>
+      <p class="eyebrow">{c.eyebrow}</p>
+      <h2>{c.h2}</h2>
+      <p>{c.intro}</p>
     </div>
     <div class="credit-grid">
-      {credits.map((c, i) => (
-        <a class="credit-card glass reveal" href={c.href} style={`--ac: var(${c.accent}); --rd: ${(i % 2) * 0.09}s;`}>
+      {credits.map((item, i) => (
+        <a class="credit-card glass reveal" href={item.href} style={`--ac: var(${item.accent}); --rd: ${(i % 2) * 0.09}s;`}>
           <div class="ch">
-            <h3>{c.name}</h3>
-            <span class="who mono">{c.who}</span>
+            <h3>{item.name}</h3>
+            <span class="who mono">{item.who}</span>
           </div>
-          <p>{c.body}</p>
-          <span class="go mono">View on GitHub ↗</span>
+          <p>{item.body}</p>
+          <span class="go mono">{c.go}</span>
         </a>
       ))}
     </div>

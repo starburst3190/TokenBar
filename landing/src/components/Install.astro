@@ -1,44 +1,31 @@
 ---
-const repo = 'https://github.com/Nanako0129/TokenBar'
-const repoLegacy = 'https://github.com/Nanako0129/TokenBar-Tauri'
+import { t, type Locale } from '../i18n/copy'
+const { locale = 'en' } = Astro.props as { locale?: Locale }
+const c = t(locale).install
 const brew = 'brew install --cask nanako0129/tokenbar/tokenbar'
 ---
 
 <section class="section install" id="install">
   <div class="container">
     <div class="section-head reveal">
-      <p class="eyebrow">Two minutes, Apple Silicon</p>
-      <h2>One command. The cat moves in.</h2>
-      <p>
-        TokenBar installs through Homebrew for <strong>Apple Silicon Macs</strong>
-        on macOS 14+. The fully-qualified cask auto-taps, so there is no separate
-        <code>brew tap</code> step.
-      </p>
+      <p class="eyebrow">{c.eyebrow}</p>
+      <h2>{c.h2}</h2>
+      <p set:html={c.intro} />
     </div>
 
     <div class="channel glass reveal" style="--rd:.1s">
       <div class="ch-head">
         <h3>TokenBar</h3>
-        <span class="pill pill-hot mono">Native Swift · macOS 14+</span>
+        <span class="pill pill-hot mono">{c.pill}</span>
       </div>
-      <p class="ch-desc">
-        The shipping app. In-app updates arrive over a signed Sparkle feed and
-        are verified before install; beta builds are an in-app
-        <strong>Settings toggle</strong>, not a separate cask.
-      </p>
+      <p class="ch-desc" set:html={c.desc} />
       <div class="term quiet">
         <pre class="term-body"><code><span class="c">$</span> {brew}</code></pre>
-        <button class="term-copy mono" data-cmd={brew} type="button">Copy command</button>
+        <button class="term-copy mono" data-cmd={brew} data-copied={c.copied} type="button">{c.copyBtn}</button>
       </div>
     </div>
 
-    <p class="legacy-note reveal" style="--rd:.18s">
-      Still on an older Mac? <code>tokenbar@legacy</code> pins the final Tauri
-      build (v0.4.5, macOS 11+) — the
-      <a href={repoLegacy}>legacy repo</a> is archived but the cask stays.
-      Building from source? <a href={repo}>Swift 6 + Rust</a>, Command Line Tools
-      are enough.
-    </p>
+    <p class="legacy-note reveal" style="--rd:.18s" set:html={c.legacy} />
   </div>
 </section>
 
@@ -48,7 +35,7 @@ const brew = 'brew install --cask nanako0129/tokenbar/tokenbar'
       try {
         await navigator.clipboard.writeText(b.dataset.cmd || '')
         const t = b.textContent
-        b.textContent = 'Copied ✓'
+        b.textContent = b.dataset.copied || 'Copied ✓'
         b.classList.add('ok')
         setTimeout(() => { b.textContent = t; b.classList.remove('ok') }, 1600)
       } catch {}
