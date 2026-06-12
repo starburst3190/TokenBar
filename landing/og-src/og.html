@@ -1,7 +1,9 @@
 <!doctype html>
-<!-- The OG/embed card: the landing page's "Liquid Glass mirror" concept in
-     1200×630 — aurora wallpaper, a mini menu bar with the live status item,
-     and one glass card carrying the wordmark. Render with ./render.sh. -->
+<!-- The OG/embed card, v2: the landing hero in miniature — aurora wallpaper,
+     mini menu bar with the live status item, wordmark + pills on the left and
+     the real popover screenshot springing in from the right. Render with
+     ./render.sh (writes a *versioned* filename: bump it on every redesign so
+     every platform's scrape cache misses). -->
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -14,23 +16,23 @@
     font-family: 'Hanken Grotesk', sans-serif;
     color: #f0eff5;
     background:
-      radial-gradient(46% 42% at 20% 20%, rgba(124, 108, 255, 0.42), transparent 70%),
-      radial-gradient(34% 30% at 86% 12%, rgba(255, 93, 143, 0.2), transparent 70%),
-      radial-gradient(52% 46% at 74% 82%, rgba(91, 70, 214, 0.46), transparent 72%),
-      radial-gradient(24% 22% at 38% 92%, rgba(6, 182, 212, 0.16), transparent 70%),
+      radial-gradient(46% 42% at 18% 22%, rgba(124, 108, 255, 0.45), transparent 70%),
+      radial-gradient(34% 30% at 60% 8%, rgba(255, 93, 143, 0.18), transparent 70%),
+      radial-gradient(56% 50% at 82% 80%, rgba(91, 70, 214, 0.5), transparent 72%),
+      radial-gradient(24% 22% at 30% 92%, rgba(6, 182, 212, 0.15), transparent 70%),
       #08070d;
     position: relative;
   }
-  /* grain */
   body::after {
     content: ''; position: absolute; inset: 0; opacity: 0.05; pointer-events: none;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   }
 
   .menubar {
-    height: 44px; display: flex; align-items: center; gap: 26px;
-    padding: 0 36px;
-    background: rgba(12, 11, 20, 0.42);
+    position: relative; z-index: 3;
+    height: 46px; display: flex; align-items: center; gap: 26px;
+    padding: 0 38px;
+    background: rgba(12, 11, 20, 0.45);
     border-bottom: 1px solid rgba(255, 255, 255, 0.12);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
     font-size: 18px; color: #c6c5d4;
@@ -41,50 +43,52 @@
   .status {
     display: inline-flex; align-items: center; gap: 10px;
     height: 32px; padding: 0 13px; border-radius: 7px;
-    background: rgba(124, 108, 255, 0.3);
+    background: rgba(124, 108, 255, 0.34);
     font-family: 'JetBrains Mono', monospace; font-size: 16px; color: #f0eff5;
   }
   .status svg { width: 18px; height: 18px; fill: #f0eff5; }
 
-  .card {
-    position: absolute; left: 80px; top: 124px; width: 1040px; height: 400px;
-    border-radius: 28px;
-    background: rgba(12, 11, 20, 0.45);
-    border: 1px solid rgba(255, 255, 255, 0.16);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 40px 90px -30px rgba(0, 0, 0, 0.8);
-    padding: 52px 64px 44px;
-    display: flex; flex-direction: column;
+  /* the popover springs from the status item, exactly like the landing hero */
+  .pop {
+    position: absolute; z-index: 2;
+    top: 60px; right: 64px; width: 360px;
+    border-radius: 15px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow:
+      0 60px 120px -40px rgba(0, 0, 0, 0.85),
+      0 24px 60px -28px rgba(91, 70, 214, 0.6);
   }
+
+  .copy { position: absolute; z-index: 2; left: 80px; top: 158px; width: 660px; }
   .wordmark {
     font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800;
-    font-size: 96px; letter-spacing: -0.03em; line-height: 1;
-    display: flex; align-items: center; gap: 24px;
+    font-size: 104px; letter-spacing: -0.03em; line-height: 1;
+    display: flex; align-items: center; gap: 26px;
   }
   .wordmark .dot {
-    width: 52px; height: 52px; border-radius: 14px; flex: 0 0 auto;
+    width: 58px; height: 58px; border-radius: 16px; flex: 0 0 auto;
     background: linear-gradient(135deg, #9b8cff, #5b46d6);
-    box-shadow: 0 0 44px -4px #7c6cff;
+    box-shadow: 0 0 48px -4px #7c6cff;
   }
   .tagline {
-    margin-top: 22px; font-size: 34px; font-weight: 500; color: #c6c5d4;
-    letter-spacing: -0.01em;
+    margin-top: 30px; font-size: 37px; font-weight: 500; color: #d6d4e4;
+    letter-spacing: -0.01em; line-height: 1.3;
   }
   .tagline .hot {
     background: linear-gradient(120deg, #9b8cff, #ff5d8f);
     -webkit-background-clip: text; background-clip: text; color: transparent;
     font-weight: 600;
   }
+  .sub {
+    margin-top: 14px; font-size: 22px; color: #9a98ad; white-space: nowrap;
+  }
 
-  .heat { margin-top: 38px; display: flex; gap: 7px; }
-  .heat .col { display: flex; flex-direction: column; gap: 7px; }
-  .heat i { width: 17px; height: 17px; border-radius: 4px; display: block; }
-
-  .pills { margin-top: auto; display: flex; gap: 14px; }
+  .pills { margin-top: 44px; display: flex; gap: 14px; }
   .pill {
-    font-family: 'JetBrains Mono', monospace; font-size: 17px; color: #c6c5d4;
-    padding: 9px 20px; border-radius: 999px;
-    border: 1px solid rgba(255, 255, 255, 0.18);
-    background: rgba(240, 239, 245, 0.06);
+    font-family: 'JetBrains Mono', monospace; font-size: 17px; color: #d6d4e4;
+    padding: 10px 20px; border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(12, 11, 20, 0.5);
   }
 </style>
 </head>
@@ -100,38 +104,17 @@
     </span>
   </div>
 
-  <div class="card">
+  <img class="pop" src="../public/screenshots/native/popover-hero.png" alt="" />
+
+  <div class="copy">
     <div class="wordmark"><span class="dot"></span>TokenBar</div>
-    <p class="tagline">Know every AI token you <span class="hot">burn</span> — from the macOS menu bar.</p>
-    <div class="heat" id="heat"></div>
+    <p class="tagline">Know every AI token you <span class="hot">burn</span>.</p>
+    <p class="sub">Claude Code · Codex · Cursor · 25+ agents, read from local logs</p>
     <div class="pills">
-      <span class="pill">macOS · native Swift</span>
+      <span class="pill">native Swift · Liquid Glass</span>
       <span class="pill">open source</span>
-      <span class="pill">local-first · 0 telemetry</span>
+      <span class="pill">0 telemetry</span>
     </div>
   </div>
-
-  <script>
-    // deterministic mini heatmap, provider palette, density rising rightward
-    const P = ['#da7756', '#10a37f', '#06b6d4', '#a855f7', '#4d6bfe', '#0866ff', '#fa520f']
-    let seed = 20260612
-    const rand = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff)
-    const heat = document.getElementById('heat')
-    const COLS = 38, ROWS = 3
-    for (let c = 0; c < COLS; c++) {
-      const col = document.createElement('span')
-      col.className = 'col'
-      for (let r = 0; r < ROWS; r++) {
-        const cell = document.createElement('i')
-        const active = rand() < 0.3 + (c / COLS) * 0.55
-        const color = P[Math.floor(rand() * P.length)]
-        const a = active ? 0.35 + rand() * 0.65 : 0.07
-        cell.style.background = active ? color : 'rgba(240,239,245,0.1)'
-        cell.style.opacity = a.toFixed(2)
-        col.appendChild(cell)
-      }
-      heat.appendChild(col)
-    }
-  </script>
 </body>
 </html>

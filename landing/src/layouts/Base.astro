@@ -14,9 +14,10 @@ const { title = meta.title, description = meta.description } = Astro.props
 
 const base = import.meta.env.BASE_URL
 const canonical = new URL(Astro.url.pathname, Astro.site).href
-// og-card.png (1200×630 brand card) replaced the old portrait og.png; the new
-// filename also dodges messaging platforms' sticky scrape caches
-const ogImage = new URL(`${base}og-card.png`, Astro.site).href
+// versioned brand card (1200×630) — bump the filename on every redesign:
+// social platforms cache scrapes per image URL and a fresh name is the only
+// reliable bust (og.png / og-card.png stay for already-shared links)
+const ogImage = new URL(`${base}og-card-v2.png`, Astro.site).href
 const ogImageAlt = 'TokenBar — know every AI token you burn, from the macOS menu bar'
 
 const enUrl = new URL(base, Astro.site).href

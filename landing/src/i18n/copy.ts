@@ -7,9 +7,9 @@ export type Locale = 'en' | 'zh-tw'
 
 const en = {
   meta: {
-    title: 'TokenBar — see every AI token you burn, from the macOS menu bar',
+    title: 'TokenBar — track Claude Code & Codex token usage from the macOS menu bar',
     description:
-      'A local-first AI token usage monitor for the macOS menu bar. Track spend across 25+ AI coding agents (Claude Code, Codex, Cursor, OpenCode…) straight from local logs — no telemetry, no account. Native Swift with Liquid Glass.',
+      'Free, open-source menu-bar app that reads local logs to track AI coding spend across 25+ agents — Claude Code, Codex, Cursor, OpenCode and more. Live throughput, quota gauges, 3D usage graph. Native Swift, Liquid Glass, zero telemetry.',
     ogLocale: 'en_US',
     htmlLang: 'en',
   },
@@ -216,9 +216,9 @@ const en = {
 
 const zhTw: typeof en = {
   meta: {
-    title: 'TokenBar — 在 macOS 選單列看見你燒掉的每顆 AI token',
+    title: 'TokenBar — 在 macOS 選單列追蹤 Claude Code／Codex 的 token 用量',
     description:
-      'macOS 選單列的 local-first AI token 用量監視器。直接從本機紀錄追蹤 25+ 個 AI 編碼 agent（Claude Code、Codex、Cursor、OpenCode…）的花費——零遙測、免帳號。原生 Swift、Liquid Glass。',
+      '免費開源的選單列 App，直接讀本機紀錄追蹤 25+ 個 AI 編碼 agent 的花費——Claude Code、Codex、Cursor、OpenCode 等。即時吞吐、額度儀錶、3D 用量圖。原生 Swift、Liquid Glass、零遙測。',
     ogLocale: 'zh_TW',
     htmlLang: 'zh-Hant-TW',
   },
