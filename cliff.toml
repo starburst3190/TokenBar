@@ -8,7 +8,7 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}
-- {{ commit.message | split(pat=":") | last | trim | upper_first }}\
+- {{ commit.message | trim | upper_first }}\
 {% endfor %}
 {% endfor %}
 """
@@ -25,11 +25,17 @@ tag_pattern = "v[0-9]*"
 topo_order = false
 sort_commits = "oldest"
 commit_parsers = [
+  # Website/repo-facing scopes first: these notes ship to app users (Sparkle
+  # dialog + release page), so the landing page and README are noise here.
+  { message = "^[a-z]+\\(landing\\)", skip = true },
+  { message = "^[a-z]+\\(readme\\)", skip = true },
+  { message = "^[a-z]+\\(release\\)", skip = true },
+  { message = "^[a-z]+\\(ci\\)", skip = true },
   { message = "^feat", group = "New" },
   { message = "^fix", group = "Fixes" },
   { message = "^perf", group = "Performance" },
   { message = "^refactor", group = "Refactor" },
-  { message = "^docs", group = "Documentation" },
+  { message = "^docs", skip = true },
   { message = "^chore\\(release\\)", skip = true },
   { message = "^chore", skip = true },
   { message = "^ci", skip = true },

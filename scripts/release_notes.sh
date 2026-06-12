@@ -34,7 +34,12 @@ CLIFF="$(git-cliff --config cliff.toml --current --strip all 2>/dev/null || true
 
 PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
 if [[ -n "$PREV" ]]; then RANGE="${PREV}..${TAG}"; else RANGE="$TAG"; fi
-COMMITS="$(git log --no-merges --pretty='- %s' "$RANGE" 2>/dev/null || true)"
+# Mirror cliff.toml's noise filter: app users don't care about the landing
+# page, README, or CI plumbing, and an unfiltered list here would let the
+# AI resurrect entries cliff dropped.
+COMMITS="$(git log --no-merges --pretty='- %s' "$RANGE" 2>/dev/null \
+  | grep -vE '^- (docs|chore|ci|build|test|style)(\(|:)' \
+  | grep -vE '^- [a-z]+\((landing|readme|release|ci)\):' || true)"
 STAT="$(git diff --stat "$RANGE" 2>/dev/null | tail -1 || true)"
 
 # --- GitHub auto-generated notes: PR attribution + New Contributors. ---------
