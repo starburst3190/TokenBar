@@ -56,9 +56,25 @@ fi
 # External PR authors: everyone credited "by @login" except the owner and bots.
 CONTRIB="$(printf '%s\n' "$AUTO" | grep -oE 'by @[A-Za-z0-9_-]+' | sed 's/^by //' \
   | sort -u | grep -vix "@${OWNER}" | grep -vi 'bot$' || true)"
-# GitHub's tail sections, kept verbatim (never AI-rewritten).
+# GitHub's tail sections, kept verbatim (never AI-rewritten); the head
+# (What's Changed) is what feeds the AI prompt.
 AUTO_TAIL="$(printf '%s\n' "$AUTO" | awk '/^## New Contributors/{f=1} f' || true)"
 [[ -z "$AUTO_TAIL" ]] && AUTO_TAIL="$(printf '%s\n' "$AUTO" | grep '^\*\*Full Changelog' || true)"
+AUTO_HEAD="$(printf '%s\n' "$AUTO" | awk '/^## New Contributors|^\*\*Full Changelog/{exit} {print}' || true)"
+
+# PR titles + bodies (truncated): the richest context the AI gets — PR
+# descriptions carry the why and the measurements that commit subjects lack.
+PR_DETAILS=""
+if [[ -n "$AUTO" && -n "${GH_TOKEN:-}" ]]; then
+  PR_NUMS="$(printf '%s\n' "$AUTO" | grep -oE "${REPO}/pull/[0-9]+" | grep -oE '[0-9]+$' | sort -un | head -8 || true)"
+  for n in $PR_NUMS; do
+    PR_JSON="$(gh api "repos/${REPO}/pulls/${n}" 2>/dev/null || true)"
+    [[ -z "$PR_JSON" ]] && continue
+    PR_TITLE="$(printf '%s' "$PR_JSON" | jq -r '.title // empty')"
+    PR_BODY="$(printf '%s' "$PR_JSON" | jq -r '.body // empty' | head -c 2500)"
+    PR_DETAILS+="$(printf '### PR #%s: %s\n%s' "$n" "$PR_TITLE" "$PR_BODY")"$'\n\n'
+  done
+fi
 
 deepseek() {
   local prompt="$1"
@@ -76,8 +92,33 @@ deepseek() {
 # --- Plain text for Sparkle / appcast / latest.json. --------------------------
 printf '%s\n' "$CLIFF" > "$TXT"
 if [[ -n "${DEEPSEEK_API_KEY:-}" && -s "$TXT" ]]; then
-  PROMPT="$(printf 'Write concise, user-facing release notes for TokenBar %s, a native macOS menu-bar AI token-usage monitor. STRICT FORMAT RULES: plain text only — absolutely no markdown syntax (no #, no **, no _, no backticks, no links, no tables). Structure: group lines under plain headings that are exactly "New:" or "Fixes:" on their own line, each item on its own line starting with "- ". Nothing else. Be specific and factual — only describe changes present below, do not invent. Keep it tight.\n\nGrouped changelog:\n%s\n\nCommits:\n%s\n\nDiff summary: %s\n' \
-    "$VERSION" "$CLIFF" "$COMMITS" "$STAT")"
+  # read -d '' instead of $(cat <<EOF): bash 3.2 (macOS default) mis-parses
+  # apostrophes inside heredocs nested in command substitution.
+  read -r -d '' PROMPT <<PROMPT_EOF || true
+You are writing the update notes shown in TokenBar ${VERSION}'s Sparkle update dialog. TokenBar is a native macOS menu-bar app that monitors local AI token usage and agent quotas.
+
+Audience: end users deciding whether to install the update. Describe the user-visible effect of each change in plain language. Never mention internal identifiers: no function, file, struct, or flag names, no CI/build/refactor plumbing.
+
+STRICT FORMAT: plain text only. No markdown of any kind: no #, no asterisks, no underscores, no backticks, no links, no tables. Headings are exactly "New:", "Improved:", "Fixes:" on their own lines, in that order; omit a heading when it has no items. Every item is one line starting with "- ". Output nothing else: no title, no intro, no closing line.
+
+Content rules:
+- Only describe changes present in the input. Never invent features, numbers, or effects.
+- Do not guess specifics the input does not state — where a control lives, whether a window is resizable, what a default is. When unsure, stay general.
+- Merge commits that belong to one feature into a single item; put the most impactful item first in each section.
+- Performance work goes under "Improved:", stating the concrete effect (for example lower CPU or memory on large histories) when the input states it.
+- Keep the whole output under 12 lines.
+
+Grouped changelog:
+${CLIFF}
+
+Commit subjects:
+${COMMITS}
+
+Pull request details:
+${PR_DETAILS}
+
+Diff summary: ${STAT}
+PROMPT_EOF
   AI="$(deepseek "$PROMPT")"
   if [[ -n "$AI" ]]; then
     printf '%s\n' "$AI" > "$TXT"
@@ -93,8 +134,33 @@ fi
 # --- Markdown for the GitHub release page. ------------------------------------
 MD_BODY=""
 if [[ -n "${DEEPSEEK_API_KEY:-}" ]]; then
-  MD_PROMPT="$(printf 'Write user-facing release notes for TokenBar %s, a native macOS menu-bar AI token-usage monitor, in GitHub-flavored markdown. Structure: an optional "## Highlights" section (only when a change is clearly major), then "## Changes" and "## Fixes" with one "- " bullet per item. When an item matches a pull request in the "What'"'"'s Changed" list below, end its bullet with the PR link in the form [#N](https://github.com/%s/pull/N) and, unless the author is @%s, append "— thanks @login". Changes without a PR get no link and no credit. Be specific and factual — only describe changes present below, never invent. Do NOT include "New Contributors" or "Full Changelog" sections; they are appended separately. Keep it tight.\n\nGrouped changelog:\n%s\n\nWhat'"'"'s Changed (PR attribution):\n%s\n\nCommits:\n%s\n\nDiff summary: %s\n' \
-    "$VERSION" "$REPO" "$OWNER" "$CLIFF" "$AUTO" "$COMMITS" "$STAT")"
+  read -r -d '' MD_PROMPT <<PROMPT_EOF || true
+Write the GitHub release notes for TokenBar ${VERSION}, a native macOS menu-bar app that monitors local AI token usage and agent quotas, in GitHub-flavored markdown.
+
+Audience: end users and contributors reading the release page. Describe the user-visible effect of each change; never mention internal identifiers (function, file, struct, or flag names) or CI/build plumbing.
+
+Structure:
+- "## Highlights": include only when a change is clearly major (a big performance win, a headline feature). One bullet per highlight, up to two sentences, concrete — use the measurements from the pull request details when present, never invented ones.
+- "## Changes" then "## Fixes": one "- " bullet per item, most impactful first. Merge commits that belong to one feature into a single bullet. Drop items with no user-visible effect.
+
+Attribution: when an item comes from a pull request in the "What's Changed" list below, end its bullet with the PR link in the form [#N](https://github.com/${REPO}/pull/N) and, unless the author is @${OWNER}, append " — thanks @login". Items without a PR get no link and no credit.
+
+Hard rules: only describe changes present in the input, never invent. Do not guess specifics the input does not state — where a control lives, whether a window is resizable, what a default is; when unsure, stay general. Do NOT include "New Contributors" or "Full Changelog" sections — they are appended separately. No title line, no intro, no closing line. Keep it tight.
+
+Grouped changelog:
+${CLIFF}
+
+What's Changed (PR attribution):
+${AUTO_HEAD}
+
+Pull request details:
+${PR_DETAILS}
+
+Commit subjects:
+${COMMITS}
+
+Diff summary: ${STAT}
+PROMPT_EOF
   MD_BODY="$(deepseek "$MD_PROMPT")"
 fi
 if [[ -n "$MD_BODY" ]]; then
