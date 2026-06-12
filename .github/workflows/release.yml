@@ -33,45 +33,15 @@ jobs:
           shasum -a 256 "TokenBar.app.tar.gz" | awk '{print $1}' > sha256.txt
           echo "SHA256=$(cat sha256.txt)" >> "$GITHUB_ENV"
 
+      # release-notes.txt: plain text for Sparkle/appcast/latest.json.
+      # release-notes.md: markdown for the GitHub release page, with PR
+      # links, contributor credit, and GitHub's New Contributors tail.
       - name: Generate release notes
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
-        run: |
-          set -euo pipefail
-          NOTES_FILE="release-notes.txt"
-
-          # Deterministic baseline: grouped changelog for this tag.
-          brew list git-cliff >/dev/null 2>&1 || brew install git-cliff
-          CLIFF="$(git-cliff --config cliff.toml --current --strip all 2>/dev/null || true)"
-          [[ -z "$CLIFF" ]] && CLIFF="$(git-cliff --config cliff.toml --latest --strip all 2>/dev/null || true)"
-          printf '%s\n' "$CLIFF" > "$NOTES_FILE"
-
-          # Polish into user-facing prose via DeepSeek; plain text only — the
-          # same notes render in the Sparkle dialog and as HTML in the
-          # appcast, so markdown syntax would leak through as raw characters.
-          if [[ -n "${DEEPSEEK_API_KEY:-}" && -s "$NOTES_FILE" ]]; then
-            MODEL="${DEEPSEEK_MODEL:-deepseek-v4-pro}"
-            PREV="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
-            if [[ -n "$PREV" ]]; then RANGE="${PREV}..${GITHUB_REF_NAME}"; else RANGE="${GITHUB_REF_NAME}"; fi
-            COMMITS="$(git log --no-merges --pretty='- %s' "$RANGE" 2>/dev/null || true)"
-            STAT="$(git diff --stat "$RANGE" 2>/dev/null | tail -1 || true)"
-            PROMPT="$(printf 'Write concise, user-facing release notes for TokenBar %s, a native macOS menu-bar AI token-usage monitor. STRICT FORMAT RULES: plain text only — absolutely no markdown syntax (no #, no **, no _, no backticks, no links, no tables). Structure: group lines under plain headings that are exactly "New:" or "Fixes:" on their own line, each item on its own line starting with "- ". Nothing else. Be specific and factual — only describe changes present below, do not invent. Keep it tight.\n\nGrouped changelog:\n%s\n\nCommits:\n%s\n\nDiff summary: %s\n' "$VERSION" "$CLIFF" "$COMMITS" "$STAT")"
-            REQ="$(jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, stream:false, temperature:0.3, messages:[{role:"user", content:$p}]}')"
-            RESP="$(curl -sS --max-time 60 https://api.deepseek.com/chat/completions \
-              -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d "$REQ" 2>/dev/null || true)"
-            AI="$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)"
-            if [[ -n "$AI" ]]; then
-              printf '%s\n' "$AI" > "$NOTES_FILE"
-            else
-              echo "::warning::DeepSeek polish unavailable; using git-cliff changelog"
-            fi
-          fi
-          [[ -s "$NOTES_FILE" ]] || printf 'TokenBar %s\n' "$VERSION" > "$NOTES_FILE"
-          echo "----- release notes -----"
-          cat "$NOTES_FILE"
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release_notes.sh
 
       - name: Sign and build appcast
         env:
@@ -118,10 +88,12 @@ jobs:
             *-*) PRERELEASE_FLAG="--prerelease";;
             *) ASSETS="$ASSETS latest.json";;  # Tauri migration manifest
           esac
+          NOTES="release-notes.md"
+          [[ -s "$NOTES" ]] || NOTES="release-notes.txt"
           gh release create "$GITHUB_REF_NAME" \
             $ASSETS \
             --title "TokenBar $VERSION" \
-            --notes-file release-notes.txt $PRERELEASE_FLAG
+            --notes-file "$NOTES" $PRERELEASE_FLAG
 
       - name: Publish appcast to main
         run: |
