@@ -21,7 +21,6 @@
 </ul>
 <b>Fixes:</b>
 <ul>
-<li>The popover’s scrollbars no longer switch to a space-occupying style after restarting the app.</li>
 <li>Quitting the app now properly removes the menu bar icon and popover, preventing a leftover icon from appearing.</li>
 </ul>
       ]]></description>
