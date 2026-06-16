@@ -46,7 +46,7 @@ const en = {
       },
       {
         title: 'Liquid Glass, for real',
-        body: 'On macOS 26 the dashboard renders as clear glass cards floating over your wallpaper — the Control Center look. Earlier systems get a vibrancy fallback.',
+        body: 'On macOS 26 the dashboard renders as Liquid Glass cards floating over your wallpaper — the real system material, not a CSS imitation. Earlier systems get a vibrancy fallback.',
       },
       {
         title: 'SceneKit 3D at 160 fps',
@@ -255,7 +255,7 @@ const zhTw: typeof en = {
       },
       {
         title: '真正的 Liquid Glass',
-        body: '在 macOS 26 上，儀表板是漂在桌布上的透明玻璃卡——控制中心的那種質感。較舊的系統自動退回 vibrancy。',
+        body: '在 macOS 26 上，儀表板是漂在桌布上的 Liquid Glass 玻璃卡——系統原生的真材質，不是 CSS 仿的。較舊的系統自動退回 vibrancy。',
       },
       {
         title: 'SceneKit 3D，160 fps',
