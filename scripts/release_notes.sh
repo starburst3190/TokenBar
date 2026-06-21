@@ -91,7 +91,12 @@ deepseek() {
 
 # --- Plain text for Sparkle / appcast / latest.json. --------------------------
 printf '%s\n' "$CLIFF" > "$TXT"
-if [[ -n "${DEEPSEEK_API_KEY:-}" && -s "$TXT" ]]; then
+# Manual override: a committed release-notes.override.txt is shipped verbatim
+# (DeepSeek skipped) so an important release can carry hand-written notes. The
+# "Thanks:" contributor line is still appended below.
+if [[ -f release-notes.override.txt ]]; then
+  cp release-notes.override.txt "$TXT"
+elif [[ -n "${DEEPSEEK_API_KEY:-}" && -s "$TXT" ]]; then
   # read -d '' instead of $(cat <<EOF): bash 3.2 (macOS default) mis-parses
   # apostrophes inside heredocs nested in command substitution.
   read -r -d '' PROMPT <<PROMPT_EOF || true
@@ -133,7 +138,12 @@ fi
 
 # --- Markdown for the GitHub release page. ------------------------------------
 MD_BODY=""
-if [[ -n "${DEEPSEEK_API_KEY:-}" ]]; then
+# Manual override: a committed release-notes.override.md is used as the body
+# (DeepSeek skipped); the GitHub "New Contributors"/"Full Changelog" tail is
+# still appended below.
+if [[ -f release-notes.override.md ]]; then
+  MD_BODY="$(cat release-notes.override.md)"
+elif [[ -n "${DEEPSEEK_API_KEY:-}" ]]; then
   read -r -d '' MD_PROMPT <<PROMPT_EOF || true
 Write the GitHub release notes for TokenBar ${VERSION}, a native macOS menu-bar app that monitors local AI token usage and agent quotas, in GitHub-flavored markdown.
 
