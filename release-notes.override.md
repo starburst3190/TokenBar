@@ -1,4 +1,0 @@
-## Fixes
-
-- **TokenBar no longer breaks your Claude Code login.** It was refreshing Claude's OAuth token on your behalf but never saving the rotated token pair back to the shared credential store, so your next `claude` command (or TokenBar's own next refresh) could hit an expired token and force a `claude logout && claude login`. The refreshed token is now persisted atomically to whichever store it came from - the Keychain or `~/.claude/.credentials.json`. Fixes #4 / #25. Thanks [@starburst3190](https://github.com/starburst3190) ([#29](https://github.com/Nanako0129/TokenBar/pull/29)).
-- **Restored the Codex (OpenAI) menu-bar icon.** The v1.2.0 icon audit had swapped Codex's recognizable ChatGPT-green mark for a muddy black outline; this brings the original back. ([#31](https://github.com/Nanako0129/TokenBar/pull/31))
