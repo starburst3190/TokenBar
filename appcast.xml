@@ -3,6 +3,36 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>1.2.0</title>
+            <pubDate>Sat, 04 Jul 2026 11:59:48 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.2.0</link>
+            <sparkle:version>192</sparkle:version>
+            <sparkle:shortVersionString>1.2.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>New:</b>
+<ul>
+<li>Claude limits now work with setup-token / CLAUDE_CODE_OAUTH_TOKEN. When the usage endpoint is scope-blocked (403 user:profile), TokenBar reads your Session (5h) and Weekly (7d) windows from Anthropic's rate-limit response headers, and picks the token up from your environment or Keychain. Thanks @sayre4ux (#26).</li>
+</ul>
+<b>Accuracy — parsing engine caught up to tokscale v4.0.7:</b>
+<ul>
+<li>MiMo Code usage now parses at all (it was reading empty).</li>
+<li>Codex: fixed a ~50% token under-count on same-millisecond forks.</li>
+<li>GitHub Copilot: sub-agents are now attributed separately instead of collapsing into one bucket.</li>
+<li>Recovered dropped spend for gjc and Pi (messages with no provider field were skipped).</li>
+<li>Fixed provider bucketing and pricing across OpenCode, Kilo, Mux, Antigravity and Jcode.</li>
+<li>fable-5 is now priced correctly instead of resolving to "unknown".</li>
+<li>More accurate "active days" and average-per-day.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Refreshed every agent brand icon: fixed 4 wrong and 2 broken ones, and added marks for 8 that showed a plain letter disc.</li>
+<li>Homebrew: silenced the depends_on macos: deprecation warning. Thanks @yiskang (#23).</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.2.0/TokenBar.app.tar.gz" length="7390235" type="application/octet-stream" sparkle:edSignature="9RRaaKVKIGuYWsvZbMdZOKRHAn4mC3odcHoBPTpov2naMTQbshU6qV72FTGGpFN/amEE1UhBgpf8Uzp0jTb7CQ=="/>
+        </item>
+        <item>
             <title>1.1.4</title>
             <pubDate>Thu, 25 Jun 2026 13:34:13 +0000</pubDate>
             <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.1.4</link>
