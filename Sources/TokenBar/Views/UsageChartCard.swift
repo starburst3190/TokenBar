@@ -18,9 +18,7 @@ struct UsageChartCard: View {
     @AppStorage("tokenbar.chart.metric") private var metricRaw = ChartMetric.tokens.rawValue
     /// "2d" = trailing-30-day stacked bars, "3d" = full-year contribution grid.
     @AppStorage("tokenbar.chart.view") private var chartViewRaw = "2d"
-    @State private var hoverIndex: Int?
-    @State private var hoverY: CGFloat = 0
-    @State private var tooltipSize: CGSize = .zero
+    @Environment(TooltipHost.self) private var tooltipHost
 
     private static let legendMax = 12
     private static let chartHeight: CGFloat = 150
@@ -153,31 +151,26 @@ struct UsageChartCard: View {
             let barWidth = (width - Self.gap * CGFloat(bars.count - 1)) / CGFloat(bars.count)
             let maxValue = max(bars.map(barTotal).max() ?? 1, metric == .cost ? 0.000001 : 1)
 
-            ZStack(alignment: .topLeading) {
-                canvas(bars: bars, barWidth: barWidth, maxValue: maxValue)
-                if let index = hoverIndex, bars.indices.contains(index),
-                   !bars[index].isEmpty {
-                    // Dodge the cursor like the model-card tooltip: below the
-                    // pointer in the chart's upper half, above it lower down —
-                    // pinning to the top kept covering the hovered area.
-                    tooltip(bars[index])
-                        .offset(
-                            x: tooltipX(index: index, barWidth: barWidth, width: width),
-                            y: hoverY < Self.chartHeight * 0.45
-                                ? hoverY + 16
-                                : hoverY - (tooltipSize.height > 0 ? tooltipSize.height : 120) - 12)
+            canvas(bars: bars, barWidth: barWidth, maxValue: maxValue)
+                .onContinuousHover { phase in
+                    switch phase {
+                    case let .active(point):
+                        let index = Int(point.x / (barWidth + Self.gap))
+                        guard bars.indices.contains(index), !bars[index].isEmpty else {
+                            tooltipHost.hide(owner: Self.tooltipOwner)
+                            return
+                        }
+                        // Report the cursor in the viewport space so the root
+                        // layer places the panel over the whole popover.
+                        let frame = geo.frame(in: .named(PopoverViewport.space))
+                        tooltipHost.show(
+                            owner: Self.tooltipOwner,
+                            at: CGPoint(x: frame.minX + point.x, y: frame.minY + point.y)
+                        ) { tooltip(bars[index]) }
+                    case .ended:
+                        tooltipHost.hide(owner: Self.tooltipOwner)
+                    }
                 }
-            }
-            .onContinuousHover { phase in
-                switch phase {
-                case let .active(point):
-                    let index = Int(point.x / (barWidth + Self.gap))
-                    hoverIndex = bars.indices.contains(index) ? index : nil
-                    hoverY = point.y
-                case .ended:
-                    hoverIndex = nil
-                }
-            }
         }
         .frame(height: Self.chartHeight)
     }
@@ -232,12 +225,9 @@ struct UsageChartCard: View {
     // MARK: - Tooltip
 
     private static let tooltipWidth: CGFloat = 210
+    private static let tooltipOwner = "usage-chart"
 
-    private func tooltipX(index: Int, barWidth: CGFloat, width: CGFloat) -> CGFloat {
-        let center = CGFloat(index) * (barWidth + Self.gap) + barWidth / 2
-        return min(max(center - Self.tooltipWidth / 2, 0), width - Self.tooltipWidth)
-    }
-
+    /// Placement and clamping are handled by the root HoverTooltipLayer.
     private func tooltip(_ bar: DayBar) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(Format.monthDay(bar.date))
@@ -264,20 +254,6 @@ struct UsageChartCard: View {
         }
         .padding(8)
         .frame(width: Self.tooltipWidth, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
-        .background(
-            GeometryReader { geo in
-                Color.clear.preference(key: TooltipSizeKey.self, value: geo.size)
-            })
-        .onPreferenceChange(TooltipSizeKey.self) { tooltipSize = $0 }
-        .allowsHitTesting(false)
-    }
-
-    private struct TooltipSizeKey: PreferenceKey {
-        static let defaultValue: CGSize = .zero
-        static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
-            value = nextValue()
-        }
+        .tooltipSurface()
     }
 }
