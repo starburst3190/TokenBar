@@ -166,12 +166,14 @@ struct ModelBreakdownCard: View {
 
     // MARK: - Hover tooltip
 
-    /// Keep the tooltip inside the card horizontally; flip above the cursor
-    /// for rows past the first few so it never clips out the card's bottom.
+    /// Keep the tooltip inside the rows container: centered on the cursor
+    /// horizontally, and flipped above when showing it below would overflow.
     private func tooltipOffset(point: CGPoint, container: CGSize) -> CGSize {
         let x = min(max(point.x - Self.tooltipWidth / 2, 0), max(0, container.width - Self.tooltipWidth))
         let height = tooltipSize.height > 0 ? tooltipSize.height : 120
-        let y = point.y > 110 ? point.y - height - 10 : point.y + 14
+        let belowY = point.y + 14
+        let fitsBelow = belowY + height <= container.height
+        let y = fitsBelow ? belowY : point.y - height - 10
         return CGSize(width: x, height: y)
     }
 
