@@ -71,4 +71,58 @@ public enum ClientRegistry {
         }
         return name
     }
+
+    // MARK: - Tab bar display order & visibility (new for tabs improvement)
+
+    public static let tabOrderKey = "tokenbar.tabs.order"
+    public static let tabHiddenKey = "tokenbar.tabs.hidden"
+
+    /// Returns the set of client ids that the user has hidden from the top tabs (and now also from Agent limits cards).
+    public static func hiddenClients() -> Set<String> {
+        let defaults = UserDefaults.standard
+        let raw = defaults.string(forKey: tabHiddenKey) ?? ""
+        return Set(raw.isEmpty ? [] : raw.split(separator: ",").map(String.init))
+    }
+
+    /// Returns the subset of `present` clients to show in the top tab bar,
+    /// filtered by hidden list and sorted according to the user's saved order.
+    /// Clients not yet in the saved order are appended at the end (so newly
+    /// discovered agents become visible without breaking existing custom order).
+    public static func displayClients(present: [String]) -> [String] {
+        let orderRaw = UserDefaults.standard.string(forKey: tabOrderKey) ?? ""
+        let hidden = hiddenClients()
+
+        let order = orderRaw.isEmpty ? [] : orderRaw.split(separator: ",").map(String.init)
+
+        let visible = present.filter { !hidden.contains($0) }
+
+        guard !order.isEmpty else {
+            // No custom order yet — preserve incoming order (historically alpha).
+            return visible
+        }
+
+        return visible.sorted { a, b in
+            let ia = order.firstIndex(of: a) ?? Int.max
+            let ib = order.firstIndex(of: b) ?? Int.max
+            if ia == ib {
+                // Preserve relative order among items with no explicit position.
+                return visible.firstIndex(of: a)! < visible.firstIndex(of: b)!
+            }
+            return ia < ib
+        }
+    }
+
+    /// Direction-aware reorder helper (drag down inserts after, up before).
+    /// Mirrors the logic used in AgentLimitsCard.
+    public static func reorder(_ list: [String], from: String, to: String) -> [String] {
+        guard let fromI = list.firstIndex(of: from),
+              let toI = list.firstIndex(of: to),
+              fromI != toI
+        else { return list }
+
+        var out = list.filter { $0 != from }
+        let anchor = out.firstIndex(of: to)!
+        out.insert(from, at: fromI < toI ? anchor + 1 : anchor)
+        return out
+    }
 }

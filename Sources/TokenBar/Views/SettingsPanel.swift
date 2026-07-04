@@ -9,6 +9,9 @@ struct SettingsPanel: View {
     /// For the quota-source picker (the windows currently known).
     var agentUsage: AgentUsagePayload?
 
+    /// Present clients (used for the client tabs reorder/hide UI).
+    var presentClients: [String] = []
+
     @AppStorage(TrayMode.storageKey) private var trayModeRaw = TrayMode.todayTokens.rawValue
     @AppStorage(TrayAnimator.animateKey) private var animateTray = true
     @AppStorage(TrayAnimator.styleKey) private var animationStyle = "cat"
@@ -26,7 +29,54 @@ struct SettingsPanel: View {
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
 
+    // New for tabs improvement
+    @AppStorage(ClientRegistry.tabOrderKey) private var tabsOrderRaw = ""
+    @AppStorage(ClientRegistry.tabHiddenKey) private var tabsHiddenRaw = ""
+
+    // Drag state for client tabs reorder (scoped to this panel)
+    @State private var tabsDragId: String?
+    @State private var tabsOverId: String?
+    @State private var tabsCardFrames: [String: CGRect] = [:]
+
+    private static let tabsDragSpace = "client-tabs-order"
+
+    private struct TabsCardFramesKey: PreferenceKey {
+        static let defaultValue: [String: CGRect] = [:]
+        static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+            value.merge(nextValue(), uniquingKeysWith: { $1 })
+        }
+    }
+
     static let refreshIntervalOptions = [1, 5, 15, 30, 60]
+
+    // MARK: - Client tabs drag reorder helpers (adapted from AgentLimitsCard)
+
+    private func dropEdge(for id: String, in orderList: [String]) -> VerticalEdge? {
+        guard let dragId = tabsDragId,
+              tabsOverId == id,
+              dragId != id,
+              let fromI = orderList.firstIndex(of: dragId),
+              let toI = orderList.firstIndex(of: id)
+        else { return nil }
+        return fromI < toI ? .bottom : .top
+    }
+
+    private func dragGestureForTab(id: String, orderList: [String]) -> some Gesture {
+        DragGesture(minimumDistance: 2, coordinateSpace: .named(Self.tabsDragSpace))
+            .onChanged { value in
+                tabsDragId = id
+                let over = tabsCardFrames.first { $0.value.contains(value.location) }?.key
+                tabsOverId = (over != nil && over != id) ? over : nil
+            }
+            .onEnded { _ in
+                if let over = tabsOverId, over != id {
+                    let next = ClientRegistry.reorder(orderList, from: id, to: over)
+                    tabsOrderRaw = next.joined(separator: ",")
+                }
+                tabsDragId = nil
+                tabsOverId = nil
+            }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -84,6 +134,94 @@ struct SettingsPanel: View {
                         options: PaceMode.allCases.map { ($0.rawValue, "Pace: \($0.rawValue.capitalized)") })
                     hint("The deficit/reserve marker. Historical learns your weekly usage curve and shows run-out risk, falling back to linear until enough weeks accrue; Linear paces evenly by the clock; Off hides the marker.")
                 }
+            }
+
+            section("Client tabs (top bar)") {
+                let hiddenSet = Set(tabsHiddenRaw.isEmpty ? [] : tabsHiddenRaw.split(separator: ",").map(String.init))
+
+                // Master order: show ALL present clients (checked or unchecked) sorted by saved order.
+                // Hidden ones remain visible in settings so you can always reorder them.
+                let order = tabsOrderRaw.isEmpty ? [] : tabsOrderRaw.split(separator: ",").map(String.init)
+                let fullOrdered = presentClients.sorted { a, b in
+                    let ia = order.firstIndex(of: a) ?? Int.max
+                    let ib = order.firstIndex(of: b) ?? Int.max
+                    if ia == ib {
+                        return presentClients.firstIndex(of: a)! < presentClients.firstIndex(of: b)!
+                    }
+                    return ia < ib
+                }
+
+                if presentClients.isEmpty {
+                    Text("No clients with usage data yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Drag to reorder. Check = show in top tabs, uncheck = hide from top tabs (but stays here).")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+
+                        VStack(spacing: 4) {
+                            ForEach(fullOrdered, id: \.self) { id in
+                                let isVisible = !hiddenSet.contains(id)
+                                HStack(spacing: 8) {
+                                    // Drag handle - always shown for every provider
+                                    Text("⠿")
+                                        .font(.caption)
+                                        .foregroundStyle(tabsDragId == id ? .primary : .tertiary)
+                                        .help("Drag to reorder")
+                                        .gesture(dragGestureForTab(id: id, orderList: fullOrdered))
+
+                                    Toggle(isOn: Binding(
+                                        get: { isVisible },
+                                        set: { show in
+                                            var hidden = hiddenSet
+                                            if show {
+                                                hidden.remove(id)
+                                            } else {
+                                                hidden.insert(id)
+                                            }
+                                            tabsHiddenRaw = hidden.sorted().joined(separator: ",")
+                                        }
+                                    )) {
+                                        HStack(spacing: 6) {
+                                            AgentIconView(clientId: id, size: 14)
+                                            Text(ClientRegistry.shortName(id))
+                                                .font(.caption)
+                                            if !isVisible {
+                                                Text("(hidden)")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                    }
+                                    .toggleStyle(.checkbox)
+
+                                    Spacer()
+                                }
+                                .opacity(tabsDragId == id ? 0.5 : 1)
+                                .overlay(alignment: dropEdge(for: id, in: fullOrdered) == .top ? .top : .bottom) {
+                                    if let edge = dropEdge(for: id, in: fullOrdered) {
+                                        Rectangle()
+                                            .fill(Color.accentColor)
+                                            .frame(height: 2)
+                                            .offset(y: edge == .top ? -3 : 3)
+                                    }
+                                }
+                                .background(
+                                    GeometryReader { geo in
+                                        Color.clear.preference(
+                                            key: TabsCardFramesKey.self,
+                                            value: [id: geo.frame(in: .named(Self.tabsDragSpace))])
+                                    })
+                            }
+                        }
+                        .coordinateSpace(name: Self.tabsDragSpace)
+                        .onPreferenceChange(TabsCardFramesKey.self) { tabsCardFrames = $0 }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                hint("All providers always appear here so you can arrange order + visibility. Unchecked = hidden from top tabs AND from Agent limits cards (and overview charts). Order applies to top tabs and quota cards.")
             }
 
             section("Live trace") {

@@ -30,8 +30,10 @@ struct AgentLimitsCard: View {
     @AppStorage("tokenbar.limits.asUsed") private var asUsed = false
     @AppStorage("tokenbar.limits.paceMode") private var paceModeRaw = PaceMode.historical.rawValue
     @AppStorage("tokenbar.limits.layout") private var layoutRaw = LimitsLayout.full.rawValue
-    /// Saved drag order, comma-joined client ids (ids never contain commas).
-    @AppStorage("tokenbar.limits.order") private var orderRaw = ""
+    /// Saved drag order (shared with the "Client tabs (top bar)" order in Settings).
+    /// Reordering providers in Settings → Client tabs now also reorders the
+    /// quota cards shown in Overview → Agent limits (and vice-versa via drag).
+    @AppStorage(ClientRegistry.tabOrderKey) private var orderRaw = ""
 
     @State private var dragId: String?
     @State private var overId: String?
@@ -95,8 +97,15 @@ struct AgentLimitsCard: View {
         }
         if restrict { return clients.filter(known) }
         var seen = Set<String>()
-        return (clients.filter(known) + (agentUsage?.agents.map(\.clientId) ?? []))
+        var base = (clients.filter(known) + (agentUsage?.agents.map(\.clientId) ?? []))
             .filter { seen.insert($0).inserted }
+
+        // Apply the same hide logic as Client tabs: hidden providers should not appear in limits cards either.
+        if reorderable {
+            let hidden = ClientRegistry.hiddenClients()
+            base = base.filter { !hidden.contains($0) }
+        }
+        return base
     }
 
     /// Saved drag order applied; ids without a saved position keep their

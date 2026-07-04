@@ -17,7 +17,7 @@ struct SettingsWindowView: View {
     var body: some View {
         HStack(spacing: 0) {
             ScrollView {
-                SettingsPanel(agentUsage: model.agentUsage)
+                SettingsPanel(agentUsage: model.agentUsage, presentClients: model.stats?.presentClients ?? [])
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(OverlayScrollerEnforcer())
@@ -63,9 +63,18 @@ struct SettingsWindowView: View {
             }
 
             section("Agent limits card") {
+                let displayClients = ClientRegistry.displayClients(present: model.stats?.presentClients ?? [])
                 AgentLimitsCard(
-                    clients: model.stats?.presentClients ?? [],
-                    trace: model.trace, agentUsage: model.agentUsage)
+                    clients: displayClients,
+                    trace: model.trace, agentUsage: model.agentUsage,
+                    reorderable: true)
+            }
+
+            section("Client tabs (top bar preview + controls)") {
+                SettingsPanel(
+                    agentUsage: model.agentUsage,
+                    presentClients: model.stats?.presentClients ?? []
+                )
             }
 
             section("Live session card") {

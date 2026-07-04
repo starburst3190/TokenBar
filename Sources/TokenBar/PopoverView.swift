@@ -43,12 +43,23 @@ struct PopoverView: View {
             if BridgeBuild.isActive && !bridgeDismissed {
                 bridgeBanner
             }
-            if let stats = model.stats, stats.presentClients.count > 1 {
-                DashboardTabs(
-                    clients: stats.presentClients, active: $activeTab,
-                    kbdHints: cmdHeld)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
+            if let stats = model.stats {
+                let displayClients = ClientRegistry.displayClients(present: stats.presentClients)
+                // Show the tabs row (which always starts with Overview) as soon as there is client data.
+                // This ensures Overview is visible alongside the clients.
+                if !displayClients.isEmpty {
+                    DashboardTabs(
+                        clients: displayClients, active: $activeTab,
+                        kbdHints: cmdHeld)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+                }
+                // If the active tab was hidden by user preference, fall back (side-effect)
+                let _ = {
+                    if activeTab != "overview" && !displayClients.contains(activeTab) {
+                        activeTab = "overview"
+                    }
+                }()
             }
             ViewSwitch(active: activeView)
                 .padding(.horizontal, 12)
@@ -274,7 +285,7 @@ struct PopoverView: View {
     @ViewBuilder private var lensContent: some View {
         if let payload = model.payload, let stats = model.stats {
             let singleClient = activeTab == "overview" ? nil : activeTab
-            let clientIds = singleClient.map { [$0] } ?? stats.presentClients
+            let clientIds = singleClient.map { [$0] } ?? ClientRegistry.displayClients(present: stats.presentClients)
             let activeStats = singleClient == nil
                 ? stats
                 : UsageStats(payload: payload, selectedClients: Set(clientIds))
@@ -415,7 +426,7 @@ struct PopoverView: View {
         guard mods == .command, let chars = event.charactersIgnoringModifiers?.lowercased()
         else { return false }
 
-        let tabs = ["overview"] + (model.stats?.presentClients ?? [])
+        let tabs = ["overview"] + ClientRegistry.displayClients(present: model.stats?.presentClients ?? [])
         switch chars {
         case "1", "2", "3", "4", "5", "6", "7", "8", "9":
             let index = Int(chars)! - 1
