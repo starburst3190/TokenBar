@@ -168,7 +168,7 @@ struct AgentLimitsCard: View {
     /// Move `from` to the `to` card's slot, direction-aware: dragging downward
     /// drops it just after `to`, dragging upward just before it. (Plain
     /// "insert before" makes single-step downward moves a no-op.)
-    static func reorder(_ list: [String], from: String, to: String) -> [String] {
+    nonisolated static func reorder(_ list: [String], from: String, to: String) -> [String] {
         guard let fromI = list.firstIndex(of: from), let toI = list.firstIndex(of: to),
               fromI != toI
         else { return list }
