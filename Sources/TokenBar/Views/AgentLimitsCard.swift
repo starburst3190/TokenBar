@@ -41,6 +41,8 @@ struct AgentLimitsCard: View {
     @State private var overId: String?
     @State private var cardFrames: [String: CGRect] = [:]
 
+    @Environment(\.colorScheme) private var colorScheme
+
     private var paceMode: PaceMode { PaceMode(rawValue: paceModeRaw) ?? .historical }
     private var classic: Bool { LimitsLayout(rawValue: layoutRaw) ?? .full == .classic }
 
@@ -202,7 +204,7 @@ struct AgentLimitsCard: View {
                         : "No supported agents yet"
                 )
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
             } else {
@@ -220,7 +222,7 @@ struct AgentLimitsCard: View {
     private var noteLabel: some View {
         Text(note)
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
     }
 
     private func integrationLine(_ text: String) -> some View {
@@ -292,7 +294,7 @@ struct AgentLimitsCard: View {
                 if reorderable {
                     Text("⠿")
                         .font(.caption)
-                        .foregroundStyle(dragId == id ? .primary : .tertiary)
+                        .foregroundStyle(dragId == id ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiaryAdaptive))
                         .help("Drag to reorder")
                         .gesture(dragGesture(for: id, visible: visible))
                 }
@@ -445,7 +447,7 @@ struct AgentLimitsCard: View {
                     Spacer()
                     Text(window.resetText ?? leftLabel)
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
                 bar(fillPercent: fill, color: gauge, paceLeft: nil, paceIsDeficit: false)
                 if window.resetText != nil {
@@ -463,7 +465,7 @@ struct AgentLimitsCard: View {
                     if let reset = window.resetText {
                         Text(reset)
                             .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                     }
                 }
                 bar(
@@ -539,9 +541,12 @@ struct AgentLimitsCard: View {
     private func paceTextLabel(_ text: String, pace: UsagePace?) -> some View {
         Text(text)
             .font(.caption2)
+            // Pace/ETA is tertiary text like every other former .tertiary
+            // label; a deficit pace flips it to orange as a warning.
             .foregroundStyle(
                 Self.PacePresentation.isHistoricalDeficit(pace)
-                    ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
+                    ? AnyShapeStyle(.orange)
+                    : AnyShapeStyle(.tertiaryAdaptive))
     }
 
     private func placeholderRow(_ label: String, brand: String) -> some View {
@@ -553,14 +558,14 @@ struct AgentLimitsCard: View {
                 if classic {
                     Text("No data")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
             }
             bar(fillPercent: 0, color: Color(hex: brand), paceLeft: nil, paceIsDeficit: false)
             if !classic {
                 Text("No data")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
         }
     }
@@ -579,8 +584,16 @@ struct AgentLimitsCard: View {
                         width: geo.size.width * fillPercent / 100,
                         height: geo.size.height)
                 if let paceLeft {
+                    // Reserve marker: light mode keeps the original .secondary
+                    // tick (translucent black reads as a darker shade of the
+                    // green fill). Dark mode uses a soft, low-opacity white so
+                    // the tick stays light rather than dark, sitting gently over
+                    // the fill instead of starkly popping.
+                    let reserveMarker: Color = colorScheme == .dark
+                        ? Color.white.opacity(0.35)
+                        : Color.secondary
                     RoundedRectangle(cornerRadius: 0.75)
-                        .fill(paceIsDeficit ? Color.orange : Color.secondary)
+                        .fill(paceIsDeficit ? Color.orange : reserveMarker)
                         .frame(width: 1.5, height: geo.size.height + 4)
                         .offset(x: geo.size.width * paceLeft / 100 - 0.75)
                         .help("Expected \(Int((asUsed ? paceLeft : 100 - paceLeft).rounded()))% used by now")

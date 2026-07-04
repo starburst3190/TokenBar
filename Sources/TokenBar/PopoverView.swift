@@ -450,6 +450,7 @@ struct PopoverView: View {
                     Label("Update \(version)", systemImage: "arrow.down.circle.fill")
                         .font(.caption.weight(.medium))
                 }
+                .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .tint(.accentColor)
                 .help("A new version is ready — click to install")
