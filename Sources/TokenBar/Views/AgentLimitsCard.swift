@@ -37,6 +37,8 @@ struct AgentLimitsCard: View {
     @State private var overId: String?
     @State private var cardFrames: [String: CGRect] = [:]
 
+    @Environment(\.colorScheme) private var colorScheme
+
     private var paceMode: PaceMode { PaceMode(rawValue: paceModeRaw) ?? .historical }
     private var classic: Bool { LimitsLayout(rawValue: layoutRaw) ?? .full == .classic }
 
@@ -409,7 +411,13 @@ struct AgentLimitsCard: View {
                                 .compactMap(\.self).joined(separator: " · ")
                         )
                         .font(.caption2)
-                        .foregroundStyle(pace.stage.isDeficit ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
+                        // Reserve hint sits one notch under .secondary so it
+                        // stays brighter than .tertiary yet reads distinct from
+                        // the '% left' label (.secondary) beside it.
+                        .foregroundStyle(
+                            pace.stage.isDeficit
+                                ? AnyShapeStyle(.orange)
+                                : AnyShapeStyle(Color.primary.opacity(0.45)))
                         .lineLimit(1)
                     }
                 }
@@ -448,8 +456,16 @@ struct AgentLimitsCard: View {
                     .fill(color.opacity(0.85))
                     .frame(width: geo.size.width * fillPercent / 100)
                 if let paceLeft {
+                    // Reserve marker: light mode keeps the original .secondary
+                    // tick (translucent black reads as a darker shade of the
+                    // green fill). Dark mode uses a soft, low-opacity white so
+                    // the tick stays light rather than dark, sitting gently over
+                    // the fill instead of starkly popping.
+                    let reserveMarker: Color = colorScheme == .dark
+                        ? Color.white.opacity(0.35)
+                        : Color.secondary
                     RoundedRectangle(cornerRadius: 0.75)
-                        .fill(paceIsDeficit ? Color.orange : Color.secondary)
+                        .fill(paceIsDeficit ? Color.orange : reserveMarker)
                         .frame(width: 1.5, height: geo.size.height + 4)
                         .offset(x: geo.size.width * paceLeft / 100 - 0.75)
                         .help("Expected \(Int((asUsed ? paceLeft : 100 - paceLeft).rounded()))% used by now")
