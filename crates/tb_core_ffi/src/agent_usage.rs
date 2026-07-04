@@ -1374,19 +1374,52 @@ fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("credentials");
-    let tmp = parent.join(format!(".{}.tmp.{}", file_name, std::process::id()));
+    // Per-write-unique temp name (pid + a monotonic seq). The O_EXCL open below
+    // must never collide with an orphan a crashed earlier write left at a fixed
+    // path, or every later write-back in this long-lived process would fail with
+    // AlreadyExists and silently stop persisting rotated tokens.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".{}.tmp.{}.{}", file_name, std::process::id(), seq));
 
-    fs::write(&tmp, data).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Credentials are secrets: keep the temp owner-only so the rename can't
-        // briefly expose them at the umask default.
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    // Stage into the temp, fsync it, then rename over the target. Create with
+    // O_EXCL + 0600 up front: the mode-at-creation closes the umask-default
+    // window a write-then-chmod leaves the secret readable in, and O_EXCL
+    // refuses to follow a symlink pre-seeded at the temp path.
+    let staged = (|| -> Result<(), String> {
+        use std::io::Write as _;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp)
+            .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
+        file.write_all(data.as_bytes())
+            .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+        // Flush data to disk before the rename so a power loss can't leave the
+        // renamed file pointing at never-written blocks — the crash-safety this
+        // function's doc-comment promises.
+        file.sync_all()
+            .map_err(|e| format!("sync {}: {}", tmp.display(), e))
+    })();
+    // Any failure after the temp exists removes it, so a transient write error
+    // can't strand an orphan that wedges the next write.
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
     if let Err(error) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("replace {}: {}", path.display(), error));
+    }
+    // Persist the rename itself so it survives a power loss right afterward.
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -1420,18 +1453,33 @@ fn merge_claude_credentials_json(credentials: &ClaudeCredentials) -> Result<Stri
 
 #[cfg(target_os = "macos")]
 fn save_claude_credentials_to_keychain(data: &str) -> Result<(), String> {
-    // `-U` updates the existing generic-password item in place; the account is
-    // whatever the Claude CLI created the item under, so reuse it.
-    let account = claude_keychain_account().unwrap_or_default();
-    let mut args = vec!["add-generic-password", "-U", "-s", CLAUDE_KEYCHAIN_SERVICE];
-    if !account.is_empty() {
-        args.push("-a");
-        args.push(&account);
-    }
-    args.push("-w");
-    args.push(data);
+    // Fail closed: only update the item once we can confirm the exact account
+    // the Claude CLI stored it under. `add-generic-password -U` matches on
+    // (service, account), so updating with the wrong or an empty account would
+    // create a SECOND "Claude Code-credentials" item and confuse the store the
+    // CLI shares — worse than not persisting. If the account can't be read,
+    // skip the write-back (the caller logs it); the next refresh retries.
+    let account = claude_keychain_account().ok_or_else(|| {
+        "could not resolve the Claude Keychain account; skipping write-back to avoid a duplicate item"
+            .to_string()
+    })?;
+    // NOTE: `-w <data>` puts the credential JSON on the argv, briefly visible via
+    // `ps` to same-user processes. security(1) has no stdin form for
+    // add-generic-password (only an interactive `-w` prompt, unusable from a
+    // background app) and the item is already same-user-readable once the
+    // keychain is unlocked, so on a single-user Mac this narrow window is an
+    // accepted trade-off; move to the SecItem API if that assumption changes.
     let status = std::process::Command::new("/usr/bin/security")
-        .args(&args)
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            CLAUDE_KEYCHAIN_SERVICE,
+            "-a",
+            &account,
+            "-w",
+            data,
+        ])
         .status()
         .map_err(|e| format!("write Claude Keychain credentials: {}", e))?;
     if !status.success() {
@@ -1463,6 +1511,14 @@ fn claude_keychain_account() -> Option<String> {
         if let Some(rest) = line.strip_prefix("\"acct\"") {
             if let Some(eq) = rest.find('=') {
                 let value = rest[eq + 1..].trim();
+                // security renders a non-printable acct as `0x<hex>  "ascii"`;
+                // the string-scrape can't recover the real bytes, so treat it as
+                // unresolved (fail closed) rather than returning a corrupt
+                // account that `add-generic-password -U` would spawn a duplicate
+                // "Claude Code-credentials" item under.
+                if value.starts_with("0x") {
+                    return None;
+                }
                 let value = value.trim_matches('"');
                 if !value.is_empty() && value != "<NULL>" {
                     return Some(value.to_string());
