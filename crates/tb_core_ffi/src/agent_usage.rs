@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -1355,16 +1355,40 @@ fn save_claude_credentials(credentials: &ClaudeCredentials) -> Result<(), String
     let data = merge_claude_credentials_json(credentials)?;
     match credentials.source {
         ClaudeCredentialSource::Keychain => save_claude_credentials_to_keychain(&data),
-        ClaudeCredentialSource::File => {
-            let path = claude_credentials_path();
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            fs::write(&path, data)
-                .map_err(|e| format!("save Claude credentials file {}: {}", path.display(), e))
-        }
+        ClaudeCredentialSource::File => atomic_write(&claude_credentials_path(), &data),
         ClaudeCredentialSource::Environment => Ok(()),
     }
+}
+
+/// Replace `path` atomically: write a sibling temp file, then rename over the
+/// target. A crash or partial write leaves the original credentials intact
+/// rather than a truncated file that would break both TokenBar and the Claude
+/// CLI (the rename is atomic within one filesystem).
+fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("credentials path {} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("credentials");
+    let tmp = parent.join(format!(".{}.tmp.{}", file_name, std::process::id()));
+
+    fs::write(&tmp, data).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Credentials are secrets: keep the temp owner-only so the rename can't
+        // briefly expose them at the umask default.
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("replace {}: {}", path.display(), error));
+    }
+    Ok(())
 }
 
 /// Merge the rotated tokens into the loaded credentials JSON, preserving any
@@ -2183,6 +2207,26 @@ mod tests {
         // Untouched fields the Claude CLI wrote survive the merge.
         assert_eq!(reparsed.subscription_type.as_deref(), Some("pro"));
         assert_eq!(reparsed.scopes, vec!["user:profile"]);
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_contents() {
+        let dir = std::env::temp_dir().join(format!("tb_atomic_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        fs::write(&path, "old").unwrap();
+
+        atomic_write(&path, "new").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        // No temp turds left in the directory.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file not cleaned up");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
