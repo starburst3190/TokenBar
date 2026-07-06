@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -141,6 +141,20 @@ struct ClaudeCredentials {
     scopes: Vec<String>,
     rate_limit_tier: Option<String>,
     subscription_type: Option<String>,
+    /// Where the credentials were read from, so a rotated token can be written
+    /// back to the same place (the Claude CLI shares this store).
+    source: ClaudeCredentialSource,
+    /// Full credentials JSON as loaded, so a write-back preserves fields we
+    /// don't model (merge-update rather than overwrite).
+    raw_root: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeCredentialSource {
+    Keychain,
+    File,
+    /// Token injected via env var — read-only, has no refresh token.
+    Environment,
 }
 
 #[derive(Debug, Deserialize)]
@@ -890,13 +904,15 @@ fn load_claude_login_credentials() -> Result<Option<ClaudeCredentials>, String> 
         return Ok(Some(credentials));
     }
     if let Some(raw) = load_claude_credentials_from_keychain()? {
-        if let Ok(credentials) = parse_claude_credentials_data(&raw) {
+        if let Ok(credentials) = parse_claude_credentials_data(&raw, ClaudeCredentialSource::Keychain)
+        {
             return Ok(Some(credentials));
         }
     }
     match fs::read_to_string(claude_credentials_path()) {
         Ok(raw) => {
-            if let Ok(credentials) = parse_claude_credentials_data(&raw) {
+            if let Ok(credentials) = parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)
+            {
                 return Ok(Some(credentials));
             }
             // Parsed but unusable (logged-out / no accessToken): fall through.
@@ -959,10 +975,17 @@ fn load_claude_credentials_from_environment() -> Result<Option<ClaudeCredentials
         scopes,
         rate_limit_tier: None,
         subscription_type: None,
+        source: ClaudeCredentialSource::Environment,
+        raw_root: None,
     }))
 }
 
-fn parse_claude_credentials_data(raw: &str) -> Result<ClaudeCredentials, String> {
+fn parse_claude_credentials_data(
+    raw: &str,
+    source: ClaudeCredentialSource,
+) -> Result<ClaudeCredentials, String> {
+    let raw_root: Value =
+        serde_json::from_str(raw).map_err(|e| format!("decode Claude OAuth credentials: {}", e))?;
     let root: ClaudeCredentialsRoot =
         serde_json::from_str(raw).map_err(|e| format!("decode Claude OAuth credentials: {}", e))?;
     let oauth = root
@@ -986,6 +1009,8 @@ fn parse_claude_credentials_data(raw: &str) -> Result<ClaudeCredentials, String>
         scopes: oauth.scopes.unwrap_or_default(),
         rate_limit_tier: oauth.rate_limit_tier,
         subscription_type: oauth.subscription_type,
+        source,
+        raw_root: Some(raw_root),
     })
 }
 
@@ -1024,6 +1049,10 @@ fn claude_credentials_from_access_token(access_token: String) -> ClaudeCredentia
         scopes: Vec::new(),
         rate_limit_tier: None,
         subscription_type: None,
+        // A bare setup-token has no refresh token and no backing store to write
+        // to, so treat it as read-only — save_claude_credentials skips it.
+        source: ClaudeCredentialSource::Environment,
+        raw_root: None,
     }
 }
 
@@ -1293,7 +1322,7 @@ async fn refresh_claude_credentials(
     }
     let token_response: ClaudeRefreshResponse = serde_json::from_str(&body)
         .map_err(|e| format!("decode Claude refresh response: {}", e))?;
-    Ok(ClaudeCredentials {
+    let refreshed = ClaudeCredentials {
         access_token: token_response.access_token,
         refresh_token: token_response
             .refresh_token
@@ -1302,7 +1331,202 @@ async fn refresh_claude_credentials(
         scopes: credentials.scopes.clone(),
         rate_limit_tier: credentials.rate_limit_tier.clone(),
         subscription_type: credentials.subscription_type.clone(),
-    })
+        source: credentials.source,
+        raw_root: credentials.raw_root.clone(),
+    };
+    // Anthropic rotates refresh tokens: the token we just spent is now dead.
+    // Persist the new pair back to the shared store, or the next refresh — by
+    // TokenBar *or* the Claude CLI — fails with a stale token, forcing a manual
+    // `claude logout && claude login`. Best-effort: a write failure shouldn't
+    // sink this usage fetch, but it's worth surfacing in logs.
+    if let Err(error) = save_claude_credentials(&refreshed) {
+        eprintln!("tb_core_ffi: failed to persist refreshed Claude credentials: {error}");
+    }
+    Ok(refreshed)
+}
+
+/// Merge the rotated access/refresh tokens back into the credentials store they
+/// came from, preserving every other field the Claude CLI wrote.
+fn save_claude_credentials(credentials: &ClaudeCredentials) -> Result<(), String> {
+    if credentials.source == ClaudeCredentialSource::Environment {
+        return Ok(());
+    }
+
+    let data = merge_claude_credentials_json(credentials)?;
+    match credentials.source {
+        ClaudeCredentialSource::Keychain => save_claude_credentials_to_keychain(&data),
+        ClaudeCredentialSource::File => atomic_write(&claude_credentials_path(), &data),
+        ClaudeCredentialSource::Environment => Ok(()),
+    }
+}
+
+/// Replace `path` atomically: write a sibling temp file, then rename over the
+/// target. A crash or partial write leaves the original credentials intact
+/// rather than a truncated file that would break both TokenBar and the Claude
+/// CLI (the rename is atomic within one filesystem).
+fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("credentials path {} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("credentials");
+    // Per-write-unique temp name (pid + a monotonic seq). The O_EXCL open below
+    // must never collide with an orphan a crashed earlier write left at a fixed
+    // path, or every later write-back in this long-lived process would fail with
+    // AlreadyExists and silently stop persisting rotated tokens.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".{}.tmp.{}.{}", file_name, std::process::id(), seq));
+
+    // Stage into the temp, fsync it, then rename over the target. Create with
+    // O_EXCL + 0600 up front: the mode-at-creation closes the umask-default
+    // window a write-then-chmod leaves the secret readable in, and O_EXCL
+    // refuses to follow a symlink pre-seeded at the temp path.
+    let staged = (|| -> Result<(), String> {
+        use std::io::Write as _;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp)
+            .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
+        file.write_all(data.as_bytes())
+            .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+        // Flush data to disk before the rename so a power loss can't leave the
+        // renamed file pointing at never-written blocks — the crash-safety this
+        // function's doc-comment promises.
+        file.sync_all()
+            .map_err(|e| format!("sync {}: {}", tmp.display(), e))
+    })();
+    // Any failure after the temp exists removes it, so a transient write error
+    // can't strand an orphan that wedges the next write.
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("replace {}: {}", path.display(), error));
+    }
+    // Persist the rename itself so it survives a power loss right afterward.
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Merge the rotated tokens into the loaded credentials JSON, preserving any
+/// other fields, and return it serialized. Pure so it's unit-testable.
+fn merge_claude_credentials_json(credentials: &ClaudeCredentials) -> Result<String, String> {
+    let mut root = credentials
+        .raw_root
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({ "claudeAiOauth": {} }));
+    let oauth = root
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "Claude credentials JSON has no claudeAiOauth object.".to_string())?;
+    oauth.insert(
+        "accessToken".to_string(),
+        Value::String(credentials.access_token.clone()),
+    );
+    if let Some(refresh) = &credentials.refresh_token {
+        oauth.insert("refreshToken".to_string(), Value::String(refresh.clone()));
+    }
+    if let Some(expires_at) = credentials.expires_at {
+        oauth.insert(
+            "expiresAt".to_string(),
+            Value::Number(expires_at.timestamp_millis().into()),
+        );
+    }
+    serde_json::to_string(&root).map_err(|e| format!("encode Claude credentials: {}", e))
+}
+
+#[cfg(target_os = "macos")]
+fn save_claude_credentials_to_keychain(data: &str) -> Result<(), String> {
+    // Fail closed: only update the item once we can confirm the exact account
+    // the Claude CLI stored it under. `add-generic-password -U` matches on
+    // (service, account), so updating with the wrong or an empty account would
+    // create a SECOND "Claude Code-credentials" item and confuse the store the
+    // CLI shares — worse than not persisting. If the account can't be read,
+    // skip the write-back (the caller logs it); the next refresh retries.
+    let account = claude_keychain_account().ok_or_else(|| {
+        "could not resolve the Claude Keychain account; skipping write-back to avoid a duplicate item"
+            .to_string()
+    })?;
+    // NOTE: `-w <data>` puts the credential JSON on the argv, briefly visible via
+    // `ps` to same-user processes. security(1) has no stdin form for
+    // add-generic-password (only an interactive `-w` prompt, unusable from a
+    // background app) and the item is already same-user-readable once the
+    // keychain is unlocked, so on a single-user Mac this narrow window is an
+    // accepted trade-off; move to the SecItem API if that assumption changes.
+    let status = std::process::Command::new("/usr/bin/security")
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            CLAUDE_KEYCHAIN_SERVICE,
+            "-a",
+            &account,
+            "-w",
+            data,
+        ])
+        .status()
+        .map_err(|e| format!("write Claude Keychain credentials: {}", e))?;
+    if !status.success() {
+        return Err("security add-generic-password failed for Claude credentials.".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_claude_credentials_to_keychain(_data: &str) -> Result<(), String> {
+    Err("Keychain writes are only supported on macOS.".to_string())
+}
+
+/// Read the account name the Claude Keychain item is stored under so the
+/// write-back updates that same item instead of creating a duplicate.
+#[cfg(target_os = "macos")]
+fn claude_keychain_account() -> Option<String> {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Attribute line looks like: `    "acct"<blob>="alice"`
+    for line in text.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("\"acct\"") {
+            if let Some(eq) = rest.find('=') {
+                let value = rest[eq + 1..].trim();
+                // security renders a non-printable acct as `0x<hex>  "ascii"`;
+                // the string-scrape can't recover the real bytes, so treat it as
+                // unresolved (fail closed) rather than returning a corrupt
+                // account that `add-generic-password -U` would spawn a duplicate
+                // "Claude Code-credentials" item under.
+                if value.starts_with("0x") {
+                    return None;
+                }
+                let value = value.trim_matches('"');
+                if !value.is_empty() && value != "<NULL>" {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn save_codex_credentials(credentials: &CodexCredentials) -> Result<(), String> {
@@ -2002,11 +2226,63 @@ mod tests {
                 "subscriptionType": "pro"
             }
         }"#;
-        let credentials = parse_claude_credentials_data(raw).unwrap();
+        let credentials =
+            parse_claude_credentials_data(raw, ClaudeCredentialSource::File).unwrap();
         assert_eq!(credentials.access_token, "access");
         assert_eq!(credentials.refresh_token.as_deref(), Some("refresh"));
         assert_eq!(credentials.scopes, vec!["user:profile"]);
         assert_eq!(credentials.subscription_type.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn merge_claude_credentials_rotates_tokens_and_preserves_other_fields() {
+        let raw = r#"{
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 1700000000000,
+                "scopes": ["user:profile"],
+                "subscriptionType": "pro"
+            }
+        }"#;
+        let mut credentials =
+            parse_claude_credentials_data(raw, ClaudeCredentialSource::File).unwrap();
+        credentials.access_token = "new-access".to_string();
+        credentials.refresh_token = Some("new-refresh".to_string());
+        credentials.expires_at = Utc.timestamp_millis_opt(1_700_009_999_000).single();
+
+        let merged = merge_claude_credentials_json(&credentials).unwrap();
+        let reparsed =
+            parse_claude_credentials_data(&merged, ClaudeCredentialSource::File).unwrap();
+        assert_eq!(reparsed.access_token, "new-access");
+        assert_eq!(reparsed.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(
+            reparsed.expires_at,
+            Utc.timestamp_millis_opt(1_700_009_999_000).single()
+        );
+        // Untouched fields the Claude CLI wrote survive the merge.
+        assert_eq!(reparsed.subscription_type.as_deref(), Some("pro"));
+        assert_eq!(reparsed.scopes, vec!["user:profile"]);
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_contents() {
+        let dir = std::env::temp_dir().join(format!("tb_atomic_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        fs::write(&path, "old").unwrap();
+
+        atomic_write(&path, "new").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        // No temp turds left in the directory.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file not cleaned up");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
