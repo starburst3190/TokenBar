@@ -43,7 +43,7 @@ struct PopoverView: View {
             if BridgeBuild.isActive && !bridgeDismissed {
                 bridgeBanner
             }
-            if let stats = model.stats, stats.presentClients.count > 1 {
+            if let stats = model.stats, !stats.presentClients.isEmpty {
                 DashboardTabs(
                     clients: stats.presentClients, active: $activeTab,
                     kbdHints: cmdHeld)
