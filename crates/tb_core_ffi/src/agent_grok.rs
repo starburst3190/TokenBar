@@ -372,7 +372,7 @@ fn load_credentials_from(auth_path: &Path) -> Result<Option<GrokCredentials>, St
     // billing endpoint and, on 401, POSTed to auth.x.ai/oauth2/token. Absent that
     // entry, treat it as no Grok auth on disk and omit the card silently — the
     // same stance as a missing auth.json.
-    let (entry_key, entry) = match map.iter().find(|(k, _)| k.contains("auth.x.ai")) {
+    let (entry_key, entry) = match map.iter().find(|(k, _)| is_grok_auth_entry_key(k)) {
         Some((k, v)) => (k.clone(), v.clone()),
         None => return Ok(None),
     };
@@ -422,6 +422,18 @@ fn load_credentials_from(auth_path: &Path) -> Result<Option<GrokCredentials>, St
         email,
         raw_json: raw,
     }))
+}
+
+/// True only when `key` is a genuine Grok Build OIDC entry, keyed
+/// `https://auth.x.ai::<client_id>`. The issuer segment (everything before the
+/// first `::` separator) must equal `https://auth.x.ai` by byte equality — a
+/// substring/prefix test would let a lookalike host like
+/// `https://auth.x.ai.example.com::<id>` masquerade as the real issuer and get
+/// its bearer/refresh tokens shipped to the Grok billing + token endpoints. A
+/// key with no `::` separator has no client-id segment and is not the shape
+/// Grok writes, so it is rejected too (fail-closed).
+fn is_grok_auth_entry_key(key: &str) -> bool {
+    matches!(key.split_once("::"), Some((issuer, _)) if issuer == "https://auth.x.ai")
 }
 
 fn client_id_from_entry_key(key: &str) -> Option<String> {
@@ -666,6 +678,77 @@ mod tests {
         // No field ever carries the sibling secrets.
         assert_ne!(creds.access_token, "FAKE-FOREIGN-ACCESS");
         assert_ne!(creds.refresh_token, "FAKE-FOREIGN-REFRESH");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_grok_auth_entry_key_requires_exact_issuer() {
+        // The genuine Grok Build key shape.
+        assert!(is_grok_auth_entry_key(
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+        ));
+        // A lookalike subdomain must NOT match — a substring/prefix test would
+        // have accepted it and shipped its tokens to the Grok endpoints.
+        assert!(!is_grok_auth_entry_key(
+            "https://auth.x.ai.example.com::b1a00492"
+        ));
+        assert!(!is_grok_auth_entry_key(
+            "https://auth.x.ai.evil.example::deadbeef"
+        ));
+        // A foreign issuer and a shapeless key are rejected.
+        assert!(!is_grok_auth_entry_key("https://auth.openai.com::deadbeef"));
+        assert!(!is_grok_auth_entry_key("https://auth.x.ai"));
+    }
+
+    #[test]
+    fn lookalike_only_auth_json_yields_no_credentials() {
+        // A key whose issuer merely CONTAINS "auth.x.ai" (a lookalike host) must
+        // not be selected: no card, and none of its tokens are read into the
+        // request-bearing credentials. Fail-closed, exactly like a foreign entry.
+        let (dir, path) = temp_auth_json(
+            "lookalike",
+            r#"{
+                "https://auth.x.ai.example.com::deadbeef": {
+                    "key": "FAKE-LOOKALIKE-ACCESS",
+                    "refresh_token": "FAKE-LOOKALIKE-REFRESH",
+                    "oidc_client_id": "deadbeef"
+                }
+            }"#,
+        );
+        let loaded = load_credentials_from(&path).unwrap();
+        assert!(
+            loaded.is_none(),
+            "a lookalike-host auth.json must yield no Grok credentials, got {loaded:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picks_real_issuer_over_lookalike_sibling() {
+        // A lookalike entry sitting next to the genuine one must never win: the
+        // loader selects the exact-issuer key and reads only its secrets.
+        let (dir, path) = temp_auth_json(
+            "lookalike_mixed",
+            r#"{
+                "https://auth.x.ai.example.com::deadbeef": {
+                    "key": "FAKE-LOOKALIKE-ACCESS",
+                    "refresh_token": "FAKE-LOOKALIKE-REFRESH",
+                    "oidc_client_id": "deadbeef"
+                },
+                "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                    "key": "FAKE-XAI-ACCESS",
+                    "refresh_token": "FAKE-XAI-REFRESH"
+                }
+            }"#,
+        );
+        let creds = load_credentials_from(&path)
+            .unwrap()
+            .expect("genuine auth.x.ai entry loads");
+        assert_eq!(creds.entry_key, "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828");
+        assert_eq!(creds.access_token, "FAKE-XAI-ACCESS");
+        assert_eq!(creds.refresh_token, "FAKE-XAI-REFRESH");
+        assert_ne!(creds.access_token, "FAKE-LOOKALIKE-ACCESS");
+        assert_ne!(creds.refresh_token, "FAKE-LOOKALIKE-REFRESH");
         let _ = fs::remove_dir_all(&dir);
     }
 
