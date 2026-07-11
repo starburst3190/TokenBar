@@ -339,31 +339,43 @@ async fn refresh_credentials(mut credentials: GrokCredentials) -> Result<GrokCre
         credentials.expires_at = Some(Utc::now() + chrono::Duration::seconds(expires_in.max(0)));
     }
 
-    // Best-effort persist so a rotated refresh token doesn't invalidate the CLI.
-    let _ = save_credentials(&credentials);
+    // Grok rotates refresh tokens on refresh: the token we just spent is now
+    // dead. Persist the new pair back, or the next refresh — by TokenBar *or* the
+    // grok CLI — fails with a stale token, forcing a manual `grok` re-login.
+    // Best-effort: a write failure shouldn't sink this usage fetch, but it's
+    // worth surfacing in logs (mirrors the Claude write-back in agent_usage.rs).
+    if let Err(error) = save_credentials(&credentials) {
+        eprintln!("tb_core_ffi: failed to persist refreshed Grok credentials: {error}");
+    }
 
     Ok(credentials)
 }
 
 fn load_credentials() -> Result<Option<GrokCredentials>, String> {
-    let auth_path = grok_home().join("auth.json");
+    load_credentials_from(&grok_home().join("auth.json"))
+}
+
+fn load_credentials_from(auth_path: &Path) -> Result<Option<GrokCredentials>, String> {
     if !auth_path.is_file() {
         return Ok(None);
     }
-    let data = fs::read(&auth_path).map_err(|e| format!("read Grok auth.json: {e}"))?;
+    let data = fs::read(auth_path).map_err(|e| format!("read Grok auth.json: {e}"))?;
     let raw: Value =
         serde_json::from_slice(&data).map_err(|e| format!("parse Grok auth.json: {e}"))?;
     let map = raw
         .as_object()
         .ok_or_else(|| "Grok auth.json is not an object.".to_string())?;
 
-    // Prefer the auth.x.ai OIDC entry Grok Build writes today.
-    let (entry_key, entry) = map
-        .iter()
-        .find(|(k, _)| k.contains("auth.x.ai"))
-        .or_else(|| map.iter().next())
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .ok_or_else(|| "Grok auth.json has no credential entries.".to_string())?;
+    // Use ONLY the auth.x.ai OIDC entry Grok Build writes (keys look like
+    // `https://auth.x.ai::<client_id>`). Never fall back to any other entry: a
+    // sibling provider's bearer/refresh tokens would then be shipped to the Grok
+    // billing endpoint and, on 401, POSTed to auth.x.ai/oauth2/token. Absent that
+    // entry, treat it as no Grok auth on disk and omit the card silently — the
+    // same stance as a missing auth.json.
+    let (entry_key, entry) = match map.iter().find(|(k, _)| k.contains("auth.x.ai")) {
+        Some((k, v)) => (k.clone(), v.clone()),
+        None => return Ok(None),
+    };
 
     let obj = entry
         .as_object()
@@ -401,7 +413,7 @@ fn load_credentials() -> Result<Option<GrokCredentials>, String> {
         .and_then(parse_timestamp);
 
     Ok(Some(GrokCredentials {
-        auth_path,
+        auth_path: auth_path.to_path_buf(),
         entry_key,
         access_token,
         refresh_token,
@@ -584,6 +596,99 @@ mod tests {
             client_id_from_entry_key("https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828")
                 .as_deref(),
             Some("b1a00492-073a-47ea-816f-4c329264a828")
+        );
+    }
+
+    /// Write `contents` to a fresh temp `auth.json` and return (dir, path).
+    fn temp_auth_json(tag: &str, contents: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "tb_grok_load_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn foreign_only_auth_json_yields_no_credentials() {
+        // auth.json holding ONLY a sibling provider's entry (no auth.x.ai key)
+        // must not become a request-bearing candidate: no card, and — crucially —
+        // none of the foreign entry's tokens are surfaced anywhere.
+        let (dir, path) = temp_auth_json(
+            "foreign",
+            r#"{
+                "https://auth.openai.com::deadbeef": {
+                    "key": "FAKE-FOREIGN-ACCESS",
+                    "refresh_token": "FAKE-FOREIGN-REFRESH",
+                    "oidc_client_id": "deadbeef"
+                }
+            }"#,
+        );
+        let loaded = load_credentials_from(&path).unwrap();
+        assert!(
+            loaded.is_none(),
+            "a foreign-only auth.json must yield no Grok credentials, got {loaded:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picks_auth_x_ai_entry_never_a_sibling() {
+        // With both a sibling entry and the real auth.x.ai entry present, the
+        // loader must select the auth.x.ai one and never read the sibling's
+        // secrets into the request-bearing credentials.
+        let (dir, path) = temp_auth_json(
+            "mixed",
+            r#"{
+                "https://auth.openai.com::deadbeef": {
+                    "key": "FAKE-FOREIGN-ACCESS",
+                    "refresh_token": "FAKE-FOREIGN-REFRESH",
+                    "oidc_client_id": "deadbeef"
+                },
+                "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                    "key": "FAKE-XAI-ACCESS",
+                    "refresh_token": "FAKE-XAI-REFRESH"
+                }
+            }"#,
+        );
+        let creds = load_credentials_from(&path).unwrap().expect("auth.x.ai entry loads");
+        assert!(creds.entry_key.contains("auth.x.ai"));
+        assert_eq!(creds.access_token, "FAKE-XAI-ACCESS");
+        assert_eq!(creds.refresh_token, "FAKE-XAI-REFRESH");
+        // Client id derives from the auth.x.ai key, not the sibling's.
+        assert_eq!(creds.client_id, "b1a00492-073a-47ea-816f-4c329264a828");
+        // No field ever carries the sibling secrets.
+        assert_ne!(creds.access_token, "FAKE-FOREIGN-ACCESS");
+        assert_ne!(creds.refresh_token, "FAKE-FOREIGN-REFRESH");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_credentials_surfaces_missing_entry_as_err() {
+        // P2: a failed write-back must be an inspectable Err (the caller logs it
+        // instead of swallowing it), not a silent success that drops a rotated
+        // refresh token. An entry_key absent from raw_json is the deterministic
+        // failure the seam exposes without touching the network.
+        let creds = GrokCredentials {
+            auth_path: PathBuf::from("/tmp/unused-grok-save"),
+            entry_key: "https://auth.x.ai::missing".into(),
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            client_id: "missing".into(),
+            expires_at: None,
+            email: None,
+            raw_json: Value::Object(Default::default()),
+        };
+        let result = save_credentials(&creds);
+        assert!(
+            result.is_err(),
+            "save_credentials must surface a failure as Err so the caller can log it"
         );
     }
 
