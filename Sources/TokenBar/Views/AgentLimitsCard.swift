@@ -191,7 +191,7 @@ struct AgentLimitsCard: View {
     /// Move `from` to the `to` card's slot, direction-aware. Delegates to the
     /// single `ClientRegistry.reorder` implementation (SelfTest asserts against
     /// this symbol; keeping the wrapper keeps those checks addressing the card).
-    static func reorder(_ list: [String], from: String, to: String) -> [String] {
+    nonisolated static func reorder(_ list: [String], from: String, to: String) -> [String] {
         ClientRegistry.reorder(list, from: from, to: to)
     }
 
@@ -490,7 +490,7 @@ struct AgentLimitsCard: View {
     /// HERE (quota grouping) and must NOT leak into the hidden-set deny-filters,
     /// which need `antigravity-cli` kept distinct — hence it lives in the card,
     /// not in `ClientRegistry.canonicalClient`.
-    static func normalizeTraceClient(_ id: String) -> String {
+    nonisolated static func normalizeTraceClient(_ id: String) -> String {
         let canonical = ClientRegistry.canonicalClient(id)
         guard canonical == id else { return canonical } // an explicit alias applied
         return id.hasSuffix("-cli") ? String(id.dropLast(4)) : id
