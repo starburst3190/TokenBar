@@ -13,6 +13,7 @@ struct SettingsPanel: View {
     var presentClients: [String] = []
 
     @AppStorage(TrayMode.storageKey) private var trayModeRaw = TrayMode.todayTokens.rawValue
+    @AppStorage(PopoverScale.storageKey) private var popoverScaleRaw = PopoverScale.default.rawValue
     @AppStorage(TrayAnimator.animateKey) private var animateTray = true
     @AppStorage(TrayAnimator.styleKey) private var animationStyle = "cat"
     @AppStorage(IconColoring.storageKey) private var iconColoringRaw = IconColoring.warningOnly.rawValue
@@ -110,6 +111,13 @@ struct SettingsPanel: View {
                 radioGroup(
                     selection: $trayModeRaw,
                     options: TrayMode.allCases.map { ($0.rawValue, $0.label) })
+            }
+
+            section("Menu size") {
+                radioGroup(
+                    selection: $popoverScaleRaw,
+                    options: PopoverScale.allCases.map { ($0.rawValue, $0.label) })
+                hint("Scales the whole menu — text, icons and layout — proportionally. Reopen the menu to see the new size.")
             }
 
             if AutostartService.isAvailable {
