@@ -18,25 +18,21 @@ struct UsageChartCard: View {
     @AppStorage("tokenbar.chart.metric") private var metricRaw = ChartMetric.tokens.rawValue
     /// "2d" = trailing-30-day stacked bars, "3d" = full-year contribution grid.
     @AppStorage("tokenbar.chart.view") private var chartViewRaw = "2d"
-    @Environment(TooltipHost.self) private var tooltipHost
-    /// Date of the bar the cursor is on, so continuous-hover events rebuild
-    /// the tooltip only when the cursor crosses into a different bar.
-    @State private var hoverDate: String?
 
     private static let legendMax = 12
-    private static let chartHeight: CGFloat = 150
-    private static let gap: CGFloat = 3
 
     private var stackBy: StackBy { StackBy(rawValue: stackByRaw) ?? .model }
     private var metric: ChartMetric { ChartMetric(rawValue: metricRaw) ?? .tokens }
 
     private var bars: [DayBar] {
-        // Anchor the trailing window to the filtered stats' range end (selection-
-        // derived; equals meta.dateRange.end when nothing is hidden) so a hidden
-        // client's later activity can't shift visible activity out of the chart.
+        // Anchor the window to the filtered stats' range (selection-derived;
+        // equals meta.dateRange when nothing is hidden) so a hidden client's
+        // later activity can't shift visible activity out of the chart. The
+        // series spans the whole range; the chart scrolls it a window at a time.
         DayBars.build(
             payload: payload, clientIds: clientIds, stackBy: stackBy,
-            colors: colors, rangeEnd: stats.dateRange.end, endFallback: Format.todayKey())
+            colors: colors, rangeStart: stats.dateRange.start, rangeEnd: stats.dateRange.end,
+            endFallback: Format.todayKey())
     }
 
     private var is3D: Bool { chartViewRaw == "3d" }
@@ -64,12 +60,7 @@ struct UsageChartCard: View {
                 .frame(height: 196)
             } else {
                 legendView(legend)
-                chart(bars)
-                HStack {
-                    axisLabel(bars.first?.date)
-                    Spacer()
-                    axisLabel(bars.last?.date)
-                }
+                ScrollingBarChart(bars: bars, metric: metric)
             }
         }
     }
@@ -148,53 +139,152 @@ struct UsageChartCard: View {
             }
         }
     }
+}
 
-    // MARK: - Chart
+/// The scrollable 2D bar strip plus its window-tracking axis labels. A
+/// separate view so the per-frame scroll state lives here: every scroll tick
+/// mutates scrollOffset/chartSlot, and if the parent card owned that state
+/// each tick would also rebuild the full DayBar series (O(history)) and the
+/// legend — the scroll loop only pays for this view's body.
+private struct ScrollingBarChart: View {
+    let bars: [DayBar]
+    let metric: ChartMetric
 
-    private func chart(_ bars: [DayBar]) -> some View {
-        GeometryReader { geo in
-            let width = geo.size.width
-            let barWidth = (width - Self.gap * CGFloat(bars.count - 1)) / CGFloat(bars.count)
-            let maxValue = max(bars.map(barTotal).max() ?? 1, metric == .cost ? 0.000001 : 1)
+    @Environment(TooltipHost.self) private var tooltipHost
+    /// Date of the bar the cursor is on, so continuous-hover events rebuild
+    /// the tooltip only when the cursor crosses into a different bar.
+    @State private var hoverDate: String?
+    /// Content-space x at the viewport's left edge, and the per-bar slot width;
+    /// both are published from the scroll view's layout and drive the axis
+    /// labels, the hover→viewport mapping, and draw culling.
+    @State private var scrollOffset: CGFloat = 0
+    @State private var chartSlot: CGFloat = 0
 
-            canvas(bars: bars, barWidth: barWidth, maxValue: maxValue)
-                .onContinuousHover { phase in
-                    switch phase {
-                    case let .active(point):
-                        let index = Int(point.x / (barWidth + Self.gap))
-                        guard bars.indices.contains(index), !bars[index].isEmpty else {
-                            hoverDate = nil
-                            tooltipHost.hide(owner: Self.tooltipOwner)
-                            return
-                        }
-                        // Report the cursor in the viewport space so the root
-                        // layer places the panel over the whole popover.
-                        let frame = geo.frame(in: .named(PopoverViewport.space))
-                        let anchor = CGPoint(x: frame.minX + point.x, y: frame.minY + point.y)
-                        // Rebuild the panel only on crossing into another bar;
-                        // within a bar just re-anchor it to the cursor.
-                        if hoverDate == bars[index].date,
-                           tooltipHost.isActive(owner: Self.tooltipOwner) {
-                            tooltipHost.move(owner: Self.tooltipOwner, to: anchor)
-                        } else {
-                            hoverDate = bars[index].date
-                            tooltipHost.show(owner: Self.tooltipOwner, at: anchor) {
-                                tooltip(bars[index])
+    private static let chartHeight: CGFloat = 150
+    private static let gap: CGFloat = 3
+    private static let scrollSpace = "usageChartScroll"
+
+    var body: some View {
+        // A window of bars fills the viewport; the full series scrolls behind
+        // it. The axis labels ride below, tracking the visible window.
+        VStack(spacing: 10) {
+            GeometryReader { geo in
+                let width = geo.size.width
+                // slot = one bar + its trailing gap; sized so exactly `window`
+                // bars span the viewport. Global max (over ALL bars, not the
+                // visible window) keeps bar heights comparable while scrolling.
+                let slot = (width + Self.gap) / CGFloat(DayBars.window)
+                let barWidth = slot - Self.gap
+                let contentWidth = slot * CGFloat(bars.count) - Self.gap
+                let maxValue = max(bars.map(barTotal).max() ?? 1, metric == .cost ? 0.000001 : 1)
+
+                let scroll = ScrollView(.horizontal, showsIndicators: false) {
+                    canvas(
+                        barWidth: barWidth, maxValue: maxValue,
+                        range: drawableRange(viewportWidth: width))
+                        .frame(width: contentWidth, height: Self.chartHeight)
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case let .active(point):
+                                let index = Int(point.x / (barWidth + Self.gap))
+                                guard bars.indices.contains(index), !bars[index].isEmpty else {
+                                    hoverDate = nil
+                                    tooltipHost.hide(owner: Self.tooltipOwner)
+                                    return
+                                }
+                                // Map the content-space cursor into the popover
+                                // viewport (subtract the scrolled distance) so the
+                                // root layer places the panel over the whole popover.
+                                let frame = geo.frame(in: .named(PopoverViewport.space))
+                                let anchor = CGPoint(
+                                    x: frame.minX + point.x - scrollOffset,
+                                    y: frame.minY + point.y)
+                                // Rebuild the panel only on crossing into another
+                                // bar; within a bar just re-anchor it to the cursor.
+                                if hoverDate == bars[index].date,
+                                   tooltipHost.isActive(owner: Self.tooltipOwner) {
+                                    tooltipHost.move(owner: Self.tooltipOwner, to: anchor)
+                                } else {
+                                    hoverDate = bars[index].date
+                                    tooltipHost.show(owner: Self.tooltipOwner, at: anchor) {
+                                        tooltip(bars[index])
+                                    }
+                                }
+                            case .ended:
+                                hoverDate = nil
+                                tooltipHost.hide(owner: Self.tooltipOwner)
                             }
                         }
-                    case .ended:
-                        hoverDate = nil
-                        tooltipHost.hide(owner: Self.tooltipOwner)
-                    }
+                    // Preference-based tracking only reports the initial layout
+                    // on macOS — frames aren't republished while scrolling — so
+                    // it merely seeds slot/offset for the .v14 path; live
+                    // updates come from onScrollGeometryChange below (15+).
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: ScrollMetricsKey.self,
+                                value: ScrollMetrics(
+                                    offset: -proxy.frame(in: .named(Self.scrollSpace)).minX,
+                                    slot: slot))
+                        })
                 }
-                // The chart can be switched out (3D toggle, tab change) while
-                // hovered, with no `.ended` to clean up the shared panel.
-                .onDisappear { tooltipHost.hide(owner: Self.tooltipOwner) }
+                .coordinateSpace(name: Self.scrollSpace)
+                .defaultScrollAnchor(.trailing)
+                .scrollTargetBehavior(BarSnapTargetBehavior(slot: slot))
+                .onPreferenceChange(ScrollMetricsKey.self) { applyScrollMetrics($0) }
+                trackingScrollGeometry(scroll)
+            }
+            .frame(height: Self.chartHeight)
+            // The chart can be switched out (3D toggle, tab change) while
+            // hovered, with no `.ended` to clean up the shared panel.
+            .onDisappear {
+                hoverDate = nil
+                tooltipHost.hide(owner: Self.tooltipOwner)
+            }
+
+            HStack {
+                axisLabel(visibleDate(leadingIndex()))
+                Spacer()
+                axisLabel(visibleDate(trailingIndex()))
+            }
         }
-        .frame(height: Self.chartHeight)
     }
 
-    private func canvas(bars: [DayBar], barWidth: CGFloat, maxValue: Double) -> some View {
+    /// First bar index of the visible window from the current scroll offset,
+    /// clamped so the window never runs past the series end. Before any scroll
+    /// callback lands (slot still 0) assume the trailing window — that's where
+    /// defaultScrollAnchor(.trailing) opens the chart.
+    private func leadingIndex() -> Int {
+        guard bars.count > DayBars.window else { return 0 }
+        guard chartSlot > 0 else { return bars.count - DayBars.window }
+        let raw = Int((scrollOffset / chartSlot).rounded())
+        return min(max(raw, 0), bars.count - DayBars.window)
+    }
+
+    private func trailingIndex() -> Int {
+        min(leadingIndex() + DayBars.window - 1, bars.count - 1)
+    }
+
+    private func visibleDate(_ index: Int) -> String? {
+        bars.indices.contains(index) ? bars[index].date : nil
+    }
+
+    /// Bars worth drawing at the current scroll position: the visible window
+    /// plus a viewport of buffer each side, so a fling can't outrun the draw
+    /// between scroll callbacks. Draw everything before the first callback
+    /// seeds the slot, and on macOS 14, where the offset never updates after
+    /// the initial layout (no live culling input — a stale range would blank
+    /// out scrolled-to bars).
+    private func drawableRange(viewportWidth: CGFloat) -> Range<Int> {
+        guard #available(macOS 15.0, *), chartSlot > 0 else { return bars.indices }
+        let first = Int(((scrollOffset - viewportWidth) / chartSlot).rounded(.down))
+        let last = Int(((scrollOffset + viewportWidth * 2) / chartSlot).rounded(.up))
+        let lower = min(max(first, 0), bars.count)
+        let upper = min(max(last, lower), bars.count)
+        return lower..<upper
+    }
+
+    private func canvas(barWidth: CGFloat, maxValue: Double, range: Range<Int>) -> some View {
         Canvas { context, size in
             let bottom = size.height - 1
             // Axis line.
@@ -202,7 +292,8 @@ struct UsageChartCard: View {
                 Path(CGRect(x: 0, y: bottom, width: size.width, height: 1)),
                 with: .color(.secondary.opacity(0.3)))
 
-            for (index, bar) in bars.enumerated() {
+            for index in range {
+                let bar = bars[index]
                 let x = CGFloat(index) * (barWidth + Self.gap)
                 let total = barTotal(bar)
                 if total <= 0 {
@@ -274,5 +365,61 @@ struct UsageChartCard: View {
         .padding(8)
         .frame(width: Self.tooltipWidth, alignment: .leading)
         .tooltipSurface()
+    }
+
+    // MARK: - Scroll tracking
+
+    /// Live offset updates. macOS never republishes GeometryReader frames while
+    /// an NSScrollView-backed ScrollView scrolls, so the preference path above
+    /// goes stale after the initial layout; the purpose-built scroll-geometry
+    /// callback (macOS 15+) is the one that tracks the user's scrolling.
+    @ViewBuilder private func trackingScrollGeometry(_ scroll: some View) -> some View {
+        if #available(macOS 15.0, *) {
+            scroll.onScrollGeometryChange(for: ScrollMetrics.self) { geo in
+                ScrollMetrics(
+                    offset: geo.contentOffset.x + geo.contentInsets.leading,
+                    slot: (geo.containerSize.width + Self.gap) / CGFloat(DayBars.window))
+            } action: { _, metrics in
+                applyScrollMetrics(metrics)
+            }
+        } else {
+            scroll
+        }
+    }
+
+    private func applyScrollMetrics(_ metrics: ScrollMetrics) {
+        // A tooltip still pinned to a bar sliding out from under the cursor
+        // reads as broken — drop it the moment we scroll.
+        if metrics.offset != scrollOffset {
+            hoverDate = nil
+            tooltipHost.hide(owner: Self.tooltipOwner)
+        }
+        scrollOffset = metrics.offset
+        chartSlot = metrics.slot
+    }
+
+    private struct ScrollMetrics: Equatable {
+        var offset: CGFloat = 0
+        var slot: CGFloat = 0
+    }
+
+    private struct ScrollMetricsKey: PreferenceKey {
+        static let defaultValue = ScrollMetrics()
+        static func reduce(value: inout ScrollMetrics, nextValue: () -> ScrollMetrics) {
+            value = nextValue()
+        }
+    }
+
+    /// Apple-Health-style snap: whether the scroll stops from a slow release or
+    /// a fast fling, SwiftUI hands us the deceleration target and we round it to
+    /// the nearest bar slot, clamped to the scrollable range.
+    private struct BarSnapTargetBehavior: ScrollTargetBehavior {
+        let slot: CGFloat
+        func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
+            guard slot > 0 else { return }
+            let maxOffset = max(context.contentSize.width - context.containerSize.width, 0)
+            let snapped = (target.rect.origin.x / slot).rounded() * slot
+            target.rect.origin.x = min(max(snapped, 0), maxOffset)
+        }
     }
 }

@@ -496,7 +496,8 @@ enum SelfTest {
         let chartColors = ModelColorMap(report: nil)
         let visBars = DayBars.build(
             payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeEnd: "2026-07-03", endFallback: "2026-07-09")
+            colors: chartColors, rangeStart: "2026-07-03", rangeEnd: "2026-07-03",
+            endFallback: "2026-07-09")
         expect(visBars.count == DayBars.window && visBars.last?.date == "2026-07-03",
             "chart window anchors to the filtered range end")
         expect((visBars.last?.totalTokens ?? 0) > 0,
@@ -505,9 +506,51 @@ enum SelfTest {
         // later day) shifts the window forward, stranding an empty trailing bar.
         let shiftedBars = DayBars.build(
             payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeEnd: "2026-07-05", endFallback: "2026-07-09")
+            colors: chartColors, rangeStart: "2026-07-05", rangeEnd: "2026-07-05",
+            endFallback: "2026-07-09")
         expect(shiftedBars.last?.date == "2026-07-05" && (shiftedBars.last?.totalTokens ?? 0) == 0,
             "unfiltered anchor would shift the window past the visible activity")
+
+        // DayBars now spans the whole recorded range so the chart can scroll
+        // back to the first day (padding to a full viewport for short history).
+        // Fixture: vis active on the range endpoints 60 days apart.
+        let longPayload = rangeStatsPayload(end: "2026-07-05", days: [
+            daily("vis", "2026-05-07", 1), daily("vis", "2026-07-05", 1),
+        ])
+        // (a) History longer than the window → full-length series ending at
+        // rangeEnd and starting at rangeStart, one bar per inclusive day.
+        let longBars = DayBars.build(
+            payload: longPayload, clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeStart: "2026-05-07", rangeEnd: "2026-07-05",
+            endFallback: "2026-07-09")
+        expect(longBars.count == 60 && longBars.first?.date == "2026-05-07"
+            && longBars.last?.date == "2026-07-05",
+            "long history yields a full-range series from rangeStart to rangeEnd")
+        expect((longBars.first?.totalTokens ?? 0) > 0 && (longBars.last?.totalTokens ?? 0) > 0,
+            "both endpoints of the long series carry their activity")
+        // (b) History shorter than the window pads older empty days so the
+        // viewport is always full — exactly `window` bars ending at rangeEnd.
+        let shortBars = DayBars.build(
+            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeStart: "2026-07-03", rangeEnd: "2026-07-03",
+            endFallback: "2026-07-09")
+        expect(shortBars.count == DayBars.window
+            && shortBars.first?.date == "2026-06-04" && shortBars.last?.date == "2026-07-03",
+            "short history pads to exactly one window ending at rangeEnd")
+        // (c) Empty/invalid rangeStart falls back to a trailing window series.
+        let emptyStartBars = DayBars.build(
+            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeStart: "", rangeEnd: "2026-07-03",
+            endFallback: "2026-07-09")
+        expect(emptyStartBars.count == DayBars.window
+            && emptyStartBars.first?.date == "2026-06-04" && emptyStartBars.last?.date == "2026-07-03",
+            "empty rangeStart falls back to a trailing window")
+        let badStartBars = DayBars.build(
+            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeStart: "not-a-date", rangeEnd: "2026-07-03",
+            endFallback: "2026-07-09")
+        expect(badStartBars.count == DayBars.window && badStartBars.last?.date == "2026-07-03",
+            "unparseable rangeStart falls back to a trailing window")
 
         // FFI envelope/error contract (hermetic; no FFI allocation or live data).
         for (label, passed) in TBCore.envelopeContractChecks() {

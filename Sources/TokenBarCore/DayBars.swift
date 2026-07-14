@@ -33,22 +33,31 @@ public struct DayBar: Sendable {
 }
 
 public enum DayBars {
+    /// Bars visible in the chart viewport at once — NOT the series length. The
+    /// series spans the full recorded range (`rangeStart`…`rangeEnd`) and the
+    /// UsageChartCard scrolls it 30 bars at a time.
     public static let window = 30
 
-    /// Build the trailing `window`-day series ending at `rangeEnd` (today, via
-    /// `endFallback`, when absent). Days outside the data render as empty bars.
+    /// Build the day series from `rangeStart` through `rangeEnd` inclusive, so
+    /// the chart can scroll back to the first recorded day. The series always
+    /// covers at least `window` days — older days are padded empty when history
+    /// is shorter so the viewport is always full — and extends further back when
+    /// history is longer. Days with no data render as empty bars.
     ///
-    /// `rangeEnd` must be the SELECTED clients' range end (`stats.dateRange.end`,
-    /// selection-derived), NOT the unfiltered `payload.meta.dateRange.end`: a
-    /// hidden client whose activity extends past the visible clients' last day
-    /// would otherwise shift the trailing window forward and push visible
-    /// activity off the chart while the range-filtered headline stats disagree.
-    /// When nothing is hidden the two are equal, so the window is unchanged.
+    /// Both bounds must be the SELECTED clients' range (`stats.dateRange`,
+    /// selection-derived), NOT the unfiltered `payload.meta.dateRange`: a hidden
+    /// client whose activity extends past the visible clients' last day would
+    /// otherwise shift the window forward and push visible activity off the
+    /// chart while the range-filtered headline stats disagree. When nothing is
+    /// hidden the two are equal, so the window is unchanged. `rangeEnd` falls
+    /// back to `endFallback` (today) when absent; an empty/unparseable
+    /// `rangeStart` falls back to a trailing `window`-day series.
     public static func build(
         payload: UsagePayload,
         clientIds: [String],
         stackBy: StackBy,
         colors: ModelColorMap,
+        rangeStart: String,
         rangeEnd: String,
         endFallback: String
     ) -> [DayBar] {
@@ -61,8 +70,12 @@ public enum DayBars {
 
         let end = rangeEnd.isEmpty ? endFallback : rangeEnd
         guard let endDay = ISODay(end) else { return [] }
-        return (0..<window).map { i in
-            let date = ISODay(number: endDay.number - (window - 1) + i).iso
+        // Always show a full viewport: clamp the start so the series is never
+        // shorter than `window`, extending earlier when history is longer.
+        let trailingStart = endDay.number - (window - 1)
+        let startNumber = ISODay(rangeStart).map { min($0.number, trailingStart) } ?? trailingStart
+        return (startNumber...endDay.number).map { n in
+            let date = ISODay(number: n).iso
             return byDate[date] ?? DayBar(date: date, segments: [])
         }
     }
