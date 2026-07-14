@@ -13,18 +13,10 @@ struct ModelBreakdownCard: View {
     var title = "Models"
 
     @State private var expanded = false
-    @State private var hover: HoverState?
-    @State private var tooltipSize: CGSize = .zero
-
-    private struct HoverState {
-        let entry: ModelReportEntry
-        /// Cursor location in the rows container's coordinate space.
-        let point: CGPoint
-    }
+    @Environment(TooltipHost.self) private var tooltipHost
 
     private static let maxRows = 8
     private static let tooltipWidth: CGFloat = 210
-    private static let rowsSpace = "model-rows"
 
     /// Token-category palette (matches the Tauri .model-seg-* CSS classes).
     private static let tokenKinds: [(label: String, color: String, pick: (ModelReportEntry) -> Int64)] = [
@@ -69,15 +61,6 @@ struct ModelBreakdownCard: View {
                         id: \.self.rowID
                     ) { entry in
                         row(entry)
-                    }
-                }
-                .coordinateSpace(name: Self.rowsSpace)
-                .overlay(alignment: .topLeading) {
-                    if let hover {
-                        GeometryReader { geo in
-                            tooltip(hover.entry)
-                                .offset(tooltipOffset(point: hover.point, container: geo.size))
-                        }
                     }
                 }
                 let hidden = rows.count - min(rows.count, Self.maxRows)
@@ -131,16 +114,26 @@ struct ModelBreakdownCard: View {
         }
         // Float the rich tooltip near the cursor anywhere on the row — the
         // web card tracks just the bar, but a 6pt-tall hover target is too
-        // fiddly with a real pointer.
+        // fiddly with a real pointer. Report the cursor in the viewport space
+        // so the root layer can place the panel over the whole popover.
         .contentShape(Rectangle())
-        .onContinuousHover(coordinateSpace: .named(Self.rowsSpace)) { phase in
+        .onContinuousHover(coordinateSpace: .named(PopoverViewport.space)) { phase in
             switch phase {
             case let .active(point):
-                hover = HoverState(entry: entry, point: point)
+                // Build the panel once on row entry; afterwards only re-anchor.
+                if tooltipHost.isActive(owner: entry.rowID) {
+                    tooltipHost.move(owner: entry.rowID, to: point)
+                } else {
+                    tooltipHost.show(owner: entry.rowID, at: point) { tooltip(entry) }
+                }
             case .ended:
-                hover = nil
+                tooltipHost.hide(owner: entry.rowID)
             }
         }
+        // A row can vanish without an `.ended` (data refresh drops it from the
+        // ForEach, "Show less" collapses it, the tab switches the card out) —
+        // take the panel down with it or it floats over stale content.
+        .onDisappear { tooltipHost.hide(owner: entry.rowID) }
     }
 
     /// sqrt-scaled stacked category bar.
@@ -166,24 +159,9 @@ struct ModelBreakdownCard: View {
 
     // MARK: - Hover tooltip
 
-    /// Keep the tooltip inside the card horizontally; flip above the cursor
-    /// for rows past the first few so it never clips out the card's bottom.
-    private func tooltipOffset(point: CGPoint, container: CGSize) -> CGSize {
-        let x = min(max(point.x - Self.tooltipWidth / 2, 0), max(0, container.width - Self.tooltipWidth))
-        let height = tooltipSize.height > 0 ? tooltipSize.height : 120
-        let y = point.y > 110 ? point.y - height - 10 : point.y + 14
-        return CGSize(width: x, height: y)
-    }
-
-    private struct TooltipSizeKey: PreferenceKey {
-        static let defaultValue: CGSize = .zero
-        static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
-            value = nextValue()
-        }
-    }
-
     /// True token counts and linear shares per category — the bar itself is
-    /// sqrt-scaled, so this is where the real numbers live.
+    /// sqrt-scaled, so this is where the real numbers live. Placement and
+    /// clamping are handled by the root HoverTooltipLayer.
     private func tooltip(_ entry: ModelReportEntry) -> some View {
         let kinds = Self.tokenKinds
             .map { (label: $0.label, color: $0.color, value: $0.pick(entry)) }
@@ -200,7 +178,7 @@ struct ModelBreakdownCard: View {
             }
             Text("\(ClientRegistry.style(entry.client).displayName) · \(entry.provider)")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
             HStack {
                 Text("\(Format.compactTokens(entry.total)) tokens")
                 Spacer()
@@ -223,14 +201,7 @@ struct ModelBreakdownCard: View {
         }
         .padding(8)
         .frame(width: Self.tooltipWidth, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
-        .background(
-            GeometryReader { geo in
-                Color.clear.preference(key: TooltipSizeKey.self, value: geo.size)
-            })
-        .onPreferenceChange(TooltipSizeKey.self) { tooltipSize = $0 }
-        .allowsHitTesting(false)
+        .tooltipSurface()
     }
 }
 

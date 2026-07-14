@@ -18,9 +18,10 @@ struct UsageChartCard: View {
     @AppStorage("tokenbar.chart.metric") private var metricRaw = ChartMetric.tokens.rawValue
     /// "2d" = trailing-30-day stacked bars, "3d" = full-year contribution grid.
     @AppStorage("tokenbar.chart.view") private var chartViewRaw = "2d"
-    @State private var hoverIndex: Int?
-    @State private var hoverY: CGFloat = 0
-    @State private var tooltipSize: CGSize = .zero
+    @Environment(TooltipHost.self) private var tooltipHost
+    /// Date of the bar the cursor is on, so continuous-hover events rebuild
+    /// the tooltip only when the cursor crosses into a different bar.
+    @State private var hoverDate: String?
 
     private static let legendMax = 12
     private static let chartHeight: CGFloat = 150
@@ -156,31 +157,39 @@ struct UsageChartCard: View {
             let barWidth = (width - Self.gap * CGFloat(bars.count - 1)) / CGFloat(bars.count)
             let maxValue = max(bars.map(barTotal).max() ?? 1, metric == .cost ? 0.000001 : 1)
 
-            ZStack(alignment: .topLeading) {
-                canvas(bars: bars, barWidth: barWidth, maxValue: maxValue)
-                if let index = hoverIndex, bars.indices.contains(index),
-                   !bars[index].isEmpty {
-                    // Dodge the cursor like the model-card tooltip: below the
-                    // pointer in the chart's upper half, above it lower down —
-                    // pinning to the top kept covering the hovered area.
-                    tooltip(bars[index])
-                        .offset(
-                            x: tooltipX(index: index, barWidth: barWidth, width: width),
-                            y: hoverY < Self.chartHeight * 0.45
-                                ? hoverY + 16
-                                : hoverY - (tooltipSize.height > 0 ? tooltipSize.height : 120) - 12)
+            canvas(bars: bars, barWidth: barWidth, maxValue: maxValue)
+                .onContinuousHover { phase in
+                    switch phase {
+                    case let .active(point):
+                        let index = Int(point.x / (barWidth + Self.gap))
+                        guard bars.indices.contains(index), !bars[index].isEmpty else {
+                            hoverDate = nil
+                            tooltipHost.hide(owner: Self.tooltipOwner)
+                            return
+                        }
+                        // Report the cursor in the viewport space so the root
+                        // layer places the panel over the whole popover.
+                        let frame = geo.frame(in: .named(PopoverViewport.space))
+                        let anchor = CGPoint(x: frame.minX + point.x, y: frame.minY + point.y)
+                        // Rebuild the panel only on crossing into another bar;
+                        // within a bar just re-anchor it to the cursor.
+                        if hoverDate == bars[index].date,
+                           tooltipHost.isActive(owner: Self.tooltipOwner) {
+                            tooltipHost.move(owner: Self.tooltipOwner, to: anchor)
+                        } else {
+                            hoverDate = bars[index].date
+                            tooltipHost.show(owner: Self.tooltipOwner, at: anchor) {
+                                tooltip(bars[index])
+                            }
+                        }
+                    case .ended:
+                        hoverDate = nil
+                        tooltipHost.hide(owner: Self.tooltipOwner)
+                    }
                 }
-            }
-            .onContinuousHover { phase in
-                switch phase {
-                case let .active(point):
-                    let index = Int(point.x / (barWidth + Self.gap))
-                    hoverIndex = bars.indices.contains(index) ? index : nil
-                    hoverY = point.y
-                case .ended:
-                    hoverIndex = nil
-                }
-            }
+                // The chart can be switched out (3D toggle, tab change) while
+                // hovered, with no `.ended` to clean up the shared panel.
+                .onDisappear { tooltipHost.hide(owner: Self.tooltipOwner) }
         }
         .frame(height: Self.chartHeight)
     }
@@ -235,12 +244,9 @@ struct UsageChartCard: View {
     // MARK: - Tooltip
 
     private static let tooltipWidth: CGFloat = 210
+    private static let tooltipOwner = "usage-chart"
 
-    private func tooltipX(index: Int, barWidth: CGFloat, width: CGFloat) -> CGFloat {
-        let center = CGFloat(index) * (barWidth + Self.gap) + barWidth / 2
-        return min(max(center - Self.tooltipWidth / 2, 0), width - Self.tooltipWidth)
-    }
-
+    /// Placement and clamping are handled by the root HoverTooltipLayer.
     private func tooltip(_ bar: DayBar) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(Format.monthDay(bar.date))
@@ -267,20 +273,6 @@ struct UsageChartCard: View {
         }
         .padding(8)
         .frame(width: Self.tooltipWidth, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
-        .background(
-            GeometryReader { geo in
-                Color.clear.preference(key: TooltipSizeKey.self, value: geo.size)
-            })
-        .onPreferenceChange(TooltipSizeKey.self) { tooltipSize = $0 }
-        .allowsHitTesting(false)
-    }
-
-    private struct TooltipSizeKey: PreferenceKey {
-        static let defaultValue: CGSize = .zero
-        static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
-            value = nextValue()
-        }
+        .tooltipSurface()
     }
 }
