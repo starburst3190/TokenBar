@@ -142,10 +142,10 @@ struct UsageChartCard: View {
 }
 
 /// The scrollable 2D bar strip plus its window-tracking axis labels. A
-/// separate view so the per-frame scroll state lives here: every scroll tick
-/// mutates scrollOffset/chartSlot, and if the parent card owned that state
-/// each tick would also rebuild the full DayBar series (O(history)) and the
-/// legend — the scroll loop only pays for this view's body.
+/// separate view so the scroll state lives here: a scroll tick that crosses a
+/// bar slot mutates scrollSlotIndex, and if the parent card owned that state
+/// each crossing would also rebuild the full DayBar series (O(history)) and
+/// the legend — the scroll loop only pays for this view's body.
 private struct ScrollingBarChart: View {
     let bars: [DayBar]
     let metric: ChartMetric
@@ -154,11 +154,21 @@ private struct ScrollingBarChart: View {
     /// Date of the bar the cursor is on, so continuous-hover events rebuild
     /// the tooltip only when the cursor crosses into a different bar.
     @State private var hoverDate: String?
-    /// Content-space x at the viewport's left edge, and the per-bar slot width;
-    /// both are published from the scroll view's layout and drive the axis
-    /// labels, the hover→viewport mapping, and draw culling.
-    @State private var scrollOffset: CGFloat = 0
+    /// The scroll offset published to the body, quantized to whole bar slots
+    /// (index of the bar at the viewport's left edge). Every consumer — axis
+    /// labels, draw culling, the hover→viewport mapping — is slot-grained or
+    /// sampled only at rest, and the snap behavior parks resting offsets on
+    /// slot multiples, so publishing at bar granularity loses nothing visible
+    /// while cutting the body re-eval (and Canvas re-rasterization) from every
+    /// scrolled pixel to slot crossings; between crossings the scroll view
+    /// just translates the drawn layer.
+    @State private var scrollSlotIndex = 0
+    /// Per-bar slot width, published from the scroll view's layout.
     @State private var chartSlot: CGFloat = 0
+    /// The precise (per-pixel) offset, boxed OUTSIDE SwiftUI state: the
+    /// per-frame scroll callback compares/updates it without invalidating the
+    /// view. Only the any-movement check in applyScrollMetrics reads it.
+    @State private var preciseOffset = ScrollOffsetBox()
 
     private static let chartHeight: CGFloat = 150
     private static let gap: CGFloat = 3
@@ -181,7 +191,7 @@ private struct ScrollingBarChart: View {
                 let scroll = ScrollView(.horizontal, showsIndicators: false) {
                     canvas(
                         barWidth: barWidth, maxValue: maxValue,
-                        range: drawableRange(viewportWidth: width))
+                        range: drawableRange())
                         .frame(width: contentWidth, height: Self.chartHeight)
                         .onContinuousHover { phase in
                             switch phase {
@@ -194,10 +204,14 @@ private struct ScrollingBarChart: View {
                                 }
                                 // Map the content-space cursor into the popover
                                 // viewport (subtract the scrolled distance) so the
-                                // root layer places the panel over the whole popover.
+                                // root layer places the panel over the whole
+                                // popover. The slot-quantized offset is exact
+                                // here: hover only fires at rest (any movement
+                                // drops it), and the snap behavior parks resting
+                                // offsets on slot multiples.
                                 let frame = geo.frame(in: .named(PopoverViewport.space))
                                 let anchor = CGPoint(
-                                    x: frame.minX + point.x - scrollOffset,
+                                    x: frame.minX + point.x - CGFloat(scrollSlotIndex) * chartSlot,
                                     y: frame.minY + point.y)
                                 // Rebuild the panel only on crossing into another
                                 // bar; within a bar just re-anchor it to the cursor.
@@ -257,8 +271,7 @@ private struct ScrollingBarChart: View {
     private func leadingIndex() -> Int {
         guard bars.count > DayBars.window else { return 0 }
         guard chartSlot > 0 else { return bars.count - DayBars.window }
-        let raw = Int((scrollOffset / chartSlot).rounded())
-        return min(max(raw, 0), bars.count - DayBars.window)
+        return min(max(scrollSlotIndex, 0), bars.count - DayBars.window)
     }
 
     private func trailingIndex() -> Int {
@@ -270,17 +283,15 @@ private struct ScrollingBarChart: View {
     }
 
     /// Bars worth drawing at the current scroll position: the visible window
-    /// plus a viewport of buffer each side, so a fling can't outrun the draw
-    /// between scroll callbacks. Draw everything before the first callback
-    /// seeds the slot, and on macOS 14, where the offset never updates after
-    /// the initial layout (no live culling input — a stale range would blank
-    /// out scrolled-to bars).
-    private func drawableRange(viewportWidth: CGFloat) -> Range<Int> {
+    /// plus a viewport (DayBars.window bars) of buffer each side, so a fling
+    /// can't outrun the draw between slot-crossing updates. Draw everything
+    /// before the first callback seeds the slot, and on macOS 14, where the
+    /// offset never updates after the initial layout (no live culling input —
+    /// a stale range would blank out scrolled-to bars).
+    private func drawableRange() -> Range<Int> {
         guard #available(macOS 15.0, *), chartSlot > 0 else { return bars.indices }
-        let first = Int(((scrollOffset - viewportWidth) / chartSlot).rounded(.down))
-        let last = Int(((scrollOffset + viewportWidth * 2) / chartSlot).rounded(.up))
-        let lower = min(max(first, 0), bars.count)
-        let upper = min(max(last, lower), bars.count)
+        let lower = min(max(scrollSlotIndex - DayBars.window, 0), bars.count)
+        let upper = min(max(scrollSlotIndex + 2 * DayBars.window, lower), bars.count)
         return lower..<upper
     }
 
@@ -389,18 +400,31 @@ private struct ScrollingBarChart: View {
 
     private func applyScrollMetrics(_ metrics: ScrollMetrics) {
         // A tooltip still pinned to a bar sliding out from under the cursor
-        // reads as broken — drop it the moment we scroll.
-        if metrics.offset != scrollOffset {
-            hoverDate = nil
+        // reads as broken — drop it the moment we scroll, even a sub-slot
+        // wiggle. The precise offset lives in the box so this per-pixel check
+        // never touches SwiftUI state; every state write below is guarded so
+        // an unchanged value can't dirty the view (tooltipHost.hide is a no-op
+        // unless this chart currently owns the tooltip).
+        if metrics.offset != preciseOffset.value {
+            preciseOffset.value = metrics.offset
+            if hoverDate != nil { hoverDate = nil }
             tooltipHost.hide(owner: Self.tooltipOwner)
         }
-        scrollOffset = metrics.offset
-        chartSlot = metrics.slot
+        if metrics.slot != chartSlot { chartSlot = metrics.slot }
+        let index = metrics.slot > 0 ? Int((metrics.offset / metrics.slot).rounded()) : 0
+        if index != scrollSlotIndex { scrollSlotIndex = index }
     }
 
     private struct ScrollMetrics: Equatable {
         var offset: CGFloat = 0
         var slot: CGFloat = 0
+    }
+
+    /// Plain reference box: @State keeps the instance alive across body
+    /// re-evals, but mutating `value` through the reference bypasses SwiftUI's
+    /// change tracking — exactly what the per-pixel scroll callback needs.
+    private final class ScrollOffsetBox {
+        var value: CGFloat = 0
     }
 
     private struct ScrollMetricsKey: PreferenceKey {
