@@ -13,6 +13,8 @@ final class SettingsWindowController {
     // AnyView so the live UI can be swapped for a static placeholder on close.
     private var host: NSHostingController<AnyView>?
     private var closeObserver: NSObjectProtocol?
+    // One-shot first-layout re-center observer; cleared when it fires.
+    private var resizeObserver: NSObjectProtocol?
 
     func show() {
         let existing = self.window
@@ -81,13 +83,18 @@ final class SettingsWindowController {
         // amount of layoutIfNeeded forces early — re-center once when it
         // lands so the first open sits dead-center (one-shot; later opens
         // start from the final size and never resize again).
-        var token: NSObjectProtocol?
-        token = NotificationCenter.default.addObserver(
+        resizeObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResizeNotification, object: window, queue: .main
         ) { [weak self] notification in
-            if let token { NotificationCenter.default.removeObserver(token) }
-            guard let window = notification.object as? NSWindow else { return }
-            MainActor.assumeIsolated { self?.center(window) }
+            let window = notification.object as? NSWindow
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if let token = self.resizeObserver {
+                    NotificationCenter.default.removeObserver(token)
+                    self.resizeObserver = nil
+                }
+                if let window { self.center(window) }
+            }
         }
         return window
     }
