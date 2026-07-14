@@ -2,6 +2,14 @@ import AppKit
 import SwiftUI
 import TokenBarCore
 
+/// Base (unscaled) content size of the settings window — the single source
+/// for the view's fixed frame, the scale modifier, and the window
+/// controller's scaled sizing and close placeholder.
+enum SettingsWindowMetrics {
+    static let width: CGFloat = 685
+    static let height: CGFloat = 580
+}
+
 /// Standalone settings window: the settings form on the left, a live preview
 /// column on the right. Every control writes UserDefaults and every preview
 /// piece reads the same keys (plus the real menu bar reacts anyway), so
@@ -13,6 +21,7 @@ struct SettingsWindowView: View {
     // cache with it would re-introduce the reopen flash).
     @State private var model = DashboardModel()
     @State private var tokensPerMin: Double?
+    @AppStorage(PopoverScale.storageKey) private var popoverScaleRaw = PopoverScale.default.rawValue
 
     var body: some View {
         HStack(spacing: 0) {
@@ -34,7 +43,10 @@ struct SettingsWindowView: View {
             .scrollIndicators(.never)
             .frame(width: 330)
         }
-        .frame(width: 685, height: 580)
+        .frame(width: SettingsWindowMetrics.width, height: SettingsWindowMetrics.height)
+        .modifier(PopoverScaleModifier(
+            baseWidth: SettingsWindowMetrics.width, baseHeight: SettingsWindowMetrics.height,
+            scale: (PopoverScale(rawValue: popoverScaleRaw) ?? .default).factor))
         .background(PopoverBackdrop().ignoresSafeArea())
         .task { await model.load() }
         .task { await model.pollAgentUsage() }

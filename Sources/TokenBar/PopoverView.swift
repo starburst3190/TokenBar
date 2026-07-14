@@ -19,6 +19,12 @@ struct PopoverView: View {
     @State private var keyMonitor: Any?
     @State private var flagsMonitor: Any?
     @State private var cmdHintTask: Task<Void, Never>?
+    @AppStorage(PopoverScale.storageKey) private var popoverScaleRaw = PopoverScale.default.rawValue
+
+    /// Geometric factor the PopoverScaleModifier applies to the whole body.
+    private var popoverScale: CGFloat {
+        (PopoverScale(rawValue: popoverScaleRaw) ?? .default).factor
+    }
     @AppStorage("tokenbar.chart.view") private var chartViewRaw = "2d"
     @AppStorage("tokenbar.view") private var activeViewRaw = AppView.overview.rawValue
     @AppStorage("tokenbar.bridge.dismissed") private var bridgeDismissed = false
@@ -65,6 +71,8 @@ struct PopoverView: View {
             footer
         }
         .frame(width: chrome.width, height: chrome.height)
+        .modifier(PopoverScaleModifier(baseWidth: chrome.width, baseHeight: chrome.height,
+            scale: popoverScale))
         .animation(.easeOut(duration: 0.16), value: activeViewRaw)
         .animation(.easeOut(duration: 0.16), value: activeTab)
         .background(PopoverBackdrop().ignoresSafeArea())
@@ -343,7 +351,9 @@ struct PopoverView: View {
     /// Bottom-edge grabber: drag to set the popover height. Lives in the empty
     /// center of the footer strip (the buttons hug the edges) so it never
     /// steals their clicks. Global coordinate space keeps the drag stable as
-    /// the popover grows under the pointer.
+    /// the popover grows under the pointer. The translation arrives in screen
+    /// points while chrome.height is in unscaled content points — divide by
+    /// the scale factor or the window (height × scale) outruns the cursor.
     private var resizeHandle: some View {
         Capsule()
             .fill(Color.primary.opacity(0.18))
@@ -356,12 +366,14 @@ struct PopoverView: View {
                         let base = dragBase ?? chrome.height
                         dragBase = base
                         chrome.setHeight(
-                            base + value.translation.height, persist: false, live: true)
+                            base + value.translation.height / popoverScale,
+                            persist: false, live: true)
                     }
                     .onEnded { value in
                         let base = dragBase ?? chrome.height
                         chrome.setHeight(
-                            base + value.translation.height, persist: true, live: false)
+                            base + value.translation.height / popoverScale,
+                            persist: true, live: false)
                         dragBase = nil
                     }
             )

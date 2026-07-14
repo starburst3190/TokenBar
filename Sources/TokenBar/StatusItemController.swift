@@ -13,6 +13,9 @@ final class StatusItemController: NSObject {
     let chrome = PopoverChrome()
     private var defaultsObserver: NSObjectProtocol?
     private var closeObserver: NSObjectProtocol?
+    /// Last scale factor pushed to the popover window, so the defaults
+    /// observer only re-sizes when the scale actually changed.
+    private var appliedScale = PopoverScale.current.factor
     private var host: NSHostingController<AnyView>?
 
     override init() {
@@ -27,7 +30,10 @@ final class StatusItemController: NSObject {
         // instead of chasing intrinsic-size updates. The real size is set per
         // open in showPopover() against the status item's actual screen.
         host.sizingOptions = []
-        popover.contentSize = NSSize(width: chrome.width, height: chrome.minHeight)
+        let scale = PopoverScale.current.factor
+        popover.contentSize = NSSize(
+            width: (chrome.width * scale).rounded(),
+            height: (chrome.minHeight * scale).rounded())
         popover.contentViewController = host
 
         // Swap the live UI for a placeholder when the popover closes for any
@@ -55,17 +61,37 @@ final class StatusItemController: NSObject {
 
         // The chrome model drives the popover window from three inputs: the
         // bottom drag handle, the settings slider, and the screen-size resolve.
+        // The PopoverScale factor is baked in so the window stays in sync with
+        // the geometric scaleEffect SwiftUI applies to the content.
         chrome.onResize = { [weak popover] height, live in
             guard let popover else { return }
-            popover.animates = !live // 1:1 tracking mid-drag; animate otherwise
-            popover.contentSize = NSSize(width: PopoverChrome.width, height: height)
+            let s = PopoverScale.current.factor
+            popover.animates = !live
+            popover.contentSize = NSSize(
+                width: (PopoverChrome.width * s).rounded(),
+                height: (height * s).rounded())
         }
-        // The settings window's slider writes the height default from another
-        // window — mirror it onto a live popover.
+        // The settings window writes height and scale defaults from another
+        // window — mirror both onto a live popover. reloadFromDefaults()
+        // pushes through onResize itself when the height changed; the scale
+        // is compared here so the popover window only re-sizes on an actual
+        // scale change, not on every unrelated defaults write. (The async hop
+        // defers past the @AppStorage write that posted the notification —
+        // resizing the popover mid-write re-enters SwiftUI's update.)
         defaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.chrome.reloadFromDefaults() }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.chrome.reloadFromDefaults()
+                    let scale = PopoverScale.current.factor
+                    if scale != self.appliedScale {
+                        self.appliedScale = scale
+                        self.chrome.onResize?(self.chrome.height, false)
+                    }
+                }
+            }
         }
 
         if let button = statusItem.button {
