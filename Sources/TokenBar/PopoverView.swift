@@ -82,9 +82,7 @@ struct PopoverView: View {
             if BridgeBuild.isActive && !bridgeDismissed {
                 bridgeBanner
             }
-            // Show the tabs row (which always starts with Overview) as soon as
-            // there is client data, so Overview is visible alongside the clients.
-            if !displayClients.isEmpty {
+            if let stats = model.stats, !stats.presentClients.isEmpty {
                 DashboardTabs(
                     clients: displayClients, active: $activeTab,
                     kbdHints: cmdHeld)
