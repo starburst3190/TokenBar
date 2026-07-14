@@ -19,6 +19,9 @@ struct UsageChartCard: View {
     /// "2d" = trailing-30-day stacked bars, "3d" = full-year contribution grid.
     @AppStorage("tokenbar.chart.view") private var chartViewRaw = "2d"
     @Environment(TooltipHost.self) private var tooltipHost
+    /// Date of the bar the cursor is on, so continuous-hover events rebuild
+    /// the tooltip only when the cursor crosses into a different bar.
+    @State private var hoverDate: String?
 
     private static let legendMax = 12
     private static let chartHeight: CGFloat = 150
@@ -157,20 +160,33 @@ struct UsageChartCard: View {
                     case let .active(point):
                         let index = Int(point.x / (barWidth + Self.gap))
                         guard bars.indices.contains(index), !bars[index].isEmpty else {
+                            hoverDate = nil
                             tooltipHost.hide(owner: Self.tooltipOwner)
                             return
                         }
                         // Report the cursor in the viewport space so the root
                         // layer places the panel over the whole popover.
                         let frame = geo.frame(in: .named(PopoverViewport.space))
-                        tooltipHost.show(
-                            owner: Self.tooltipOwner,
-                            at: CGPoint(x: frame.minX + point.x, y: frame.minY + point.y)
-                        ) { tooltip(bars[index]) }
+                        let anchor = CGPoint(x: frame.minX + point.x, y: frame.minY + point.y)
+                        // Rebuild the panel only on crossing into another bar;
+                        // within a bar just re-anchor it to the cursor.
+                        if hoverDate == bars[index].date,
+                           tooltipHost.isActive(owner: Self.tooltipOwner) {
+                            tooltipHost.move(owner: Self.tooltipOwner, to: anchor)
+                        } else {
+                            hoverDate = bars[index].date
+                            tooltipHost.show(owner: Self.tooltipOwner, at: anchor) {
+                                tooltip(bars[index])
+                            }
+                        }
                     case .ended:
+                        hoverDate = nil
                         tooltipHost.hide(owner: Self.tooltipOwner)
                     }
                 }
+                // The chart can be switched out (3D toggle, tab change) while
+                // hovered, with no `.ended` to clean up the shared panel.
+                .onDisappear { tooltipHost.hide(owner: Self.tooltipOwner) }
         }
         .frame(height: Self.chartHeight)
     }

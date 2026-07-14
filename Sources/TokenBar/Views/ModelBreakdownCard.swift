@@ -120,11 +120,20 @@ struct ModelBreakdownCard: View {
         .onContinuousHover(coordinateSpace: .named(PopoverViewport.space)) { phase in
             switch phase {
             case let .active(point):
-                tooltipHost.show(owner: entry.rowID, at: point) { tooltip(entry) }
+                // Build the panel once on row entry; afterwards only re-anchor.
+                if tooltipHost.isActive(owner: entry.rowID) {
+                    tooltipHost.move(owner: entry.rowID, to: point)
+                } else {
+                    tooltipHost.show(owner: entry.rowID, at: point) { tooltip(entry) }
+                }
             case .ended:
                 tooltipHost.hide(owner: entry.rowID)
             }
         }
+        // A row can vanish without an `.ended` (data refresh drops it from the
+        // ForEach, "Show less" collapses it, the tab switches the card out) —
+        // take the panel down with it or it floats over stale content.
+        .onDisappear { tooltipHost.hide(owner: entry.rowID) }
     }
 
     /// sqrt-scaled stacked category bar.

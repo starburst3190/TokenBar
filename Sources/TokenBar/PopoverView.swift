@@ -79,6 +79,12 @@ struct PopoverView: View {
             footer
         }
         .frame(width: chrome.width, height: chrome.height)
+        // Container-level tooltip invalidation: a tab switch swaps every card
+        // under the cursor, and a payload refresh can change the data a shown
+        // panel was built from while the cursor sits still (no hover event
+        // fires to rebuild it) — drop the panel rather than show stale numbers.
+        .onChange(of: activeTab) { tooltipHost.clear() }
+        .onChange(of: model.payload?.meta.generatedAt) { tooltipHost.clear() }
         .animation(.easeOut(duration: 0.16), value: activeViewRaw)
         .animation(.easeOut(duration: 0.16), value: activeTab)
         .background(PopoverBackdrop().ignoresSafeArea())

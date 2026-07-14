@@ -23,11 +23,37 @@ final class TooltipHost {
         self.content = AnyView(content())
     }
 
+    /// Re-anchor the panel without rebuilding its content — the cheap path
+    /// for continuous hover, where only the cursor moved. Continuous-hover
+    /// events arrive per pixel; rebuilding the content view for each would
+    /// re-render the whole layer at pointer frequency for identical content.
+    /// No-op unless `owner` still holds the tooltip.
+    func move(owner: AnyHashable, to anchor: CGPoint) {
+        guard self.owner == owner else { return }
+        self.anchor = anchor
+    }
+
+    /// Whether `owner` currently holds a visible tooltip — lets a card decide
+    /// between the `move` fast path and a full `show` (e.g. after `clear()`
+    /// dropped the panel out from under a still-hovering cursor).
+    func isActive(owner: AnyHashable) -> Bool {
+        self.owner == owner && content != nil
+    }
+
     func hide(owner: AnyHashable) {
         guard self.owner == owner else { return }
         self.owner = nil
         self.anchor = nil
         self.content = nil
+    }
+
+    /// Unconditional reset for container-level invalidation — a tab switch or
+    /// data refresh replaces the content under the cursor, and no single owner
+    /// is in a position to clean up a panel built from the old data.
+    func clear() {
+        owner = nil
+        anchor = nil
+        content = nil
     }
 }
 
