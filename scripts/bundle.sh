@@ -67,6 +67,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>14.0</string>
     <key>LSUIElement</key>
     <true/>
+    <!-- Session restoration + the SMAppService login item can both launch
+         the app at login; let LaunchServices refuse the duplicate instead of
+         showing two status items. -->
+    <key>LSMultipleInstancesProhibited</key>
+    <true/>
     <key>NSHumanReadableCopyright</key>
     <string>MIT License</string>
     <key>SUEnableInstallerLauncherService</key>
