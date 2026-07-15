@@ -6,7 +6,11 @@ license = "MIT"
 publish = false
 
 [lib]
-crate-type = ["staticlib"]
+# cdylib: the WinUI/C# shell loads this over P/Invoke (tb_core_ffi.dll on
+# Windows, libtb_core_ffi.dylib for the macOS-side test loop). staticlib is
+# what the macOS app links via SwiftPM. Keeping both here means the Windows
+# repo's vendor re-sync is a byte-identical copy (no local re-apply).
+crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 tokscale-core = { path = "../../vendor/tokscale-core" }
