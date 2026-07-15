@@ -6,6 +6,9 @@ import PackageDescription
 let package = Package(
     name: "TokenBar",
     platforms: [.macOS(.v14)],
+    products: [
+        .executable(name: "crosscheck-harness", targets: ["CrossCheckHarness"]),
+    ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
     ],
@@ -30,6 +33,16 @@ let package = Package(
                 .copy("Resources/anim-parrot"),
                 .copy("Resources/anim-parrot-light"),
             ],
+            linkerSettings: rustLinkerSettings
+        ),
+        // Swift↔C# fixture cross-check harness. Depends on TokenBarCore (which
+        // links the Rust staticlib), so it needs the same rustLinkerSettings.
+        // Format.swift is symlinked in from Sources/TokenBar so the harness
+        // compiles the exact shipping formatter source, not a reimplementation.
+        .executableTarget(
+            name: "CrossCheckHarness",
+            dependencies: ["TokenBarCore"],
+            path: "Sources/CrossCheckHarness",
             linkerSettings: rustLinkerSettings
         ),
     ]
