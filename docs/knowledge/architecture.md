@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-07-14
+last_verified: 2026-07-16
 sources: ["Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "Sources/TokenBarCore", "Sources/TokenBar", "vendor/README.md"]
 ---
 
@@ -18,6 +18,7 @@ sources: ["Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_c
 
 - [Ownership map](#ownership-map)
 - [FFI data flow](#ffi-data-flow)
+- [Windows downstream consumer](#windows-downstream-consumer)
 - [Streaming and cache](#streaming-and-cache)
 - [Pre-aggregation filters](#pre-aggregation-filters)
 - [Pricing and quota boundaries](#pricing-and-quota-boundaries)
@@ -56,6 +57,18 @@ flowchart LR
 Rust owns the raw-session interpretation and all expensive aggregation. Swift calls the blocking FFI entry points away from the main actor, decodes the returned heap JSON, and frees the pointer through `tb_free`. Successful calls use `{"ok":true,"data":...}`; failures use `{"ok":false,"err":"..."}`. `tb_probe` keeps its legacy shape for the smoke path.
 
 > **核心不變量：** Rust 產生的 payload 是跨語言契約。Swift 可以格式化、排序或選擇顯示視角，但不能假設自己能從已預聚合的數字反推出每個 client 的貢獻。
+
+## Windows downstream consumer
+
+C ABI 有第二個消費者：Windows port（[Nanako0129/TokenBar-Windows](https://github.com/Nanako0129/TokenBar-Windows)，WinUI 3 + C#）。它以 byte-identical 方式複製本 repo 的 `crates/`＋`vendor/`＋`Sources/CTB/include/ctb.h`，本 repo 是**唯一同步源**；來源 commit 記錄在該 repo 的 `vendor/tokscale-core/SYNC.md`。
+
+| 不變量 | 規則 |
+|---|---|
+| Sync 方向 | 平台中立或 cfg-gated 的 Windows 修補一律先落在本 repo，再由 Windows 側 re-sync；Windows 側的 local-patch 表以空為目標 |
+| `crate-type` | `tb_core_ffi` 的 `["cdylib", "staticlib"]` 兩者都必須保留：cdylib 供 C# P/Invoke（與 Windows repo 在 macOS 上的測試迴圈）載入，staticlib 供 SwiftPM 連結。單獨移除任何一個都會斷一邊 |
+| `ctb.h` 簽名 | 簽名變更＝跨 repo breaking change。P/Invoke 綁定沒有編譯期檢查，參數數量錯誤到執行期才以垃圾指標顯現（先例：`tb_hourly_report`/`tb_agents_report` 新增 `clients` 參數）。變更 `ctb.h` 時把 Windows port 視為必須通知的消費者 |
+| Build-infra 選型 | vendor 的 reqwest TLS 選型（0.13 `rustls`＝rustls-platform-verifier）部分理由來自 Windows 建置限制（vendored OpenSSL 需 Perl+NASM）；精確帳目在 [`vendor/README.md`](../../vendor/README.md) 的 local-patch 表 |
+| 邏輯層對拍 | `Sources/TokenBarCore` 在 Windows 側有 C# 逐檔移植；語意變更後的跨語言驗證見 [`verification.md`](verification.md) |
 
 ## Streaming and cache
 

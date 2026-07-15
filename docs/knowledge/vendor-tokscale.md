@@ -4,7 +4,7 @@ id: kb-vendor-tokscale
 kind: canonical
 scope: repository
 read_when: assessing upstream commits, re-vendoring, changing parser output, or updating the vendor ledger
-last_verified: 2026-07-15
+last_verified: 2026-07-16
 sources: ["vendor/README.md", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public issue #45"]
 ---
 
@@ -31,6 +31,8 @@ TokenBar vendors a selective copy of `tokscale-core`. This document explains the
 The vendor's true baseline is recorded in `vendor/README.md`; the package version string is not a reliable baseline marker. The current tree contains upstream cherry-picks plus TokenBar-specific streaming, cache, report, FFI, pricing, and defensive adaptations. `vendor/README.md` is the exact source of truth for whether a given commit or local patch is already present.
 
 > **不要整檔 re-vendor。** Upstream does not contain all TokenBar report and streaming work. Replacing a whole `lib.rs`, scanner, cache, sessionize, or aggregator file can silently remove local semantics while still compiling.
+
+這棵 vendor tree 同時是 Windows port 的 byte-identical sync source（見 [`architecture.md`](architecture.md) 的 Windows downstream consumer）。因此 re-vendor 除了語意風險，還有兩條下游規則：`Cargo.toml` 的 build-infra local patch（reqwest 0.13 `rustls`，帳目在 [`vendor/README.md`](../../vendor/README.md)）必須重套；vendor 變更的驗證面多了 Windows 側的 10 入口 FFI smoke 與邏輯層對拍，重大 parser/schema 變更後應排一次 Windows re-sync 重驗。
 
 ## Selective-port method
 
