@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-07-15
+last_verified: 2026-07-16
 sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -147,6 +147,19 @@ A source reader that consumes secondary files must be verified as one unit. The 
 | Arithmetic | Rust report totals, FFI mappers, Swift models, and live-rate consumers use bounded arithmetic where required |
 | Stale-data policy | A failed refresh retains the last good value instead of blanking a working card |
 | Lifecycle | Closing a popover or settings window cancels its tasks and stops background rendering |
+
+## Cross-port fixture cross-check
+
+Windows port（[Nanako0129/TokenBar-Windows](https://github.com/Nanako0129/TokenBar-Windows)）的 C# `TokenBar.Core` 是 `Sources/TokenBarCore` 的逐檔移植。單元測試的期望值由移植者撰寫，因此對「一致地誤讀 Swift 語意」的移植錯誤沒有偵測力；對拍（cross-check）以同一份 fixture JSON 餵 Swift 與 C# 兩邊、逐欄位 diff 輸出，才是移植忠實度的判準。
+
+| 項目 | 內容 |
+|---|---|
+| Swift harness | [`Sources/CrossCheckHarness/main.swift`](../../Sources/CrossCheckHarness/main.swift)，`TZ=Asia/Taipei swift run crosscheck-harness <fixtures> <out>`；經 symlink 編入 app target 的 `Format.swift`，測的是 shipping 程式碼 |
+| 契約與 fixture | Windows repo 的 `crosscheck/`（README＝schema 契約；fixture 以 FFI wire 編碼，兩邊都用 production decoder，無自製映射） |
+| 比對 | Windows repo 的 `crosscheck/diff.py`：字串逐 byte、數字 epsilon 1e-9、缺鍵視同 null |
+| 執行時機 | `Sources/TokenBarCore` 邏輯或 `Format` 語意變更後；Windows repo 每次 re-sync 或 delta 移植後 |
+
+> 首輪實績（2026-07-16）：115 案例抓到 4 條 printf 捨入 seam 的真實漂移——C# 側以 `Math.Round` 預捨入模擬 `%.nf` 會把非 midpoint 的近半值重新量化；printf 對二進位真值做正確捨入。教訓：**模擬 printf 的中介捨入層一律可疑**。修正記錄在 Windows repo。
 
 ## Documentation checks
 
