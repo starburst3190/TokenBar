@@ -3,9 +3,9 @@ status: active
 id: kb-verification
 kind: canonical
 scope: repository
-read_when: changing runtime code, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-07-14
-sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "AGENTS.md", "memory-derived hermetic verification practice"]
+read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
+last_verified: 2026-07-15
+sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
 # Verification contract
@@ -19,6 +19,7 @@ sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "AGENTS.md", 
 - [Evidence model](#evidence-model)
 - [Hermetic fixtures](#hermetic-fixtures)
 - [Runtime and FFI gates](#runtime-and-ffi-gates)
+- [Local build and UX acceptance](#local-build-and-ux-acceptance)
 - [Cache and sibling checks](#cache-and-sibling-checks)
 - [Cross-language invariants](#cross-language-invariants)
 - [Documentation checks](#documentation-checks)
@@ -87,6 +88,41 @@ swift run TokenBar --smoke
 | Rust format | For Rust changes, run `cargo fmt --all -- --check` on the touched scope; vendor formatting policy may be intentionally separate |
 | Local Rust tests | `cargo test` passes across workspace crates and test targets |
 | Local Clippy | `cargo clippy --workspace --all-targets` passes, including test-only targets |
+
+## Local build and UX acceptance
+
+不需要 `.app` bundle 語意的人工 UI 檢查，優先從 repository root 執行 `swift run TokenBar --open-popover`。只有 icon、`Info.plist`、`LSUIElement`、Sparkle、autostart 或安裝路徑等 bundle-only 行為，才以 `make bundle` 產生的 `dist/TokenBar.app` 驗收。
+
+> **本機 bundle 邊界：** `dist/TokenBar.app` 是暫時的驗收產物，不是第二份安裝。日常使用與正式更新的 source of truth 仍是 `/Applications/TokenBar.app`。
+
+[`scripts/bundle.sh`](../../scripts/bundle.sh) 會在組裝 app 前建立 `dist/.metadata_never_index`，避免 Spotlight 主動索引本機 bundle。但這個 marker 不會回溯刪除既有 Spotlight metadata；實際啟動 `dist/TokenBar.app` 也可能讓 LaunchServices 註冊它。因此本機 UX 驗收完成、且不再需要該 bundle 作為 release artifact 時，應撤銷這個特定 app 的註冊並刪除生成物，不要以重設整個 Launchpad database 作為第一步。
+
+| UX surface | Preferred path | Completion evidence |
+|---|---|---|
+| Popover、lens、keyboard、scroll、appearance | `swift run TokenBar --open-popover` | 實際操作與必要截圖；結束測試 process |
+| Icon、bundle identity、Sparkle、autostart | `make bundle` 後啟動 `dist/TokenBar.app` | 記錄 bundle-only 行為；完成後 unregister 並移除本機 bundle |
+| Homebrew、Sparkle stable update、正式安裝路徑 | `/Applications/TokenBar.app` | 不以 `dist/TokenBar.app` 代替 installed-app 驗收 |
+
+從 repository root 清理已完成驗收的本機 bundle：
+
+```bash
+ROOT="$(git rev-parse --show-toplevel)"
+LOCAL_APP="$ROOT/dist/TokenBar.app"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+test -e "$ROOT/dist/.metadata_never_index"
+"$LSREGISTER" -u "$LOCAL_APP" 2>/dev/null || true
+rm -rf -- "$LOCAL_APP"
+```
+
+清理後，Spotlight 與 LaunchServices 查詢都不應再列出 repository 的 `dist/TokenBar.app`；正常情況只保留 `/Applications/TokenBar.app`：
+
+```bash
+mdfind "kMDItemContentType == 'com.apple.application-bundle' && kMDItemFSName == 'TokenBar.app'"
+"$LSREGISTER" -dump | grep -F 'TokenBar.app'
+```
+
+若仍有 stale 結果，先等待 metadata service 收斂並重查；不要直接清空整台機器的 Spotlight index 或重設 Launchpad，因為那會波及其他 app 與使用者排列。
 
 ## Cache and sibling checks
 
