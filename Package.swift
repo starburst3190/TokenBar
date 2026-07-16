@@ -39,7 +39,13 @@ let package = Package(
 // must run from the repo root for the relative -L path to resolve.
 var rustLinkerSettings: [LinkerSetting] {
     [
-        .unsafeFlags(["-L", "target/release", "-ltb_core_ffi"]),
+        // The archive is named as an explicit linker input, NOT -l: since the
+        // crate also builds a cdylib for the Windows port's P/Invoke, both
+        // libtb_core_ffi.a and .dylib sit in target/release, and Darwin's
+        // -l lookup prefers the dylib — which would silently turn the app's
+        // Rust linkage dynamic with a build-tree absolute path (Codex review
+        // finding, verified with otool -L).
+        .unsafeFlags(["-Xlinker", "target/release/libtb_core_ffi.a"]),
         // Sparkle.framework rides in Contents/Frameworks inside the .app.
         .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
         .linkedFramework("Security"),
