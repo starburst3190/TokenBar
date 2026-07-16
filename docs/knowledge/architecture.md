@@ -124,7 +124,7 @@ Pricing metadata is refreshable rather than frozen for the process lifetime; the
 
 ## Swift presentation layer
 
-SwiftUI owns the six dashboard lenses, settings, menu-bar title, quota icon, animation, and lifecycle of the popover and settings window. `DashboardModel` coordinates initial load, lazy hourly and Agents reports, year selection, snapshot reuse, stale-data retention, and poll cancellation. The app shell must stop hidden-window polling when the window is closed; otherwise an apparently idle menu-bar utility can keep rendering and consuming CPU.
+SwiftUI owns the seven dashboard lenses, settings, menu-bar title, quota icon, animation, and lifecycle of the popover and settings window. `DashboardModel` coordinates initial load, lazy hourly and Agents reports, year selection, snapshot reuse, stale-data retention, and poll cancellation. The app shell must stop hidden-window polling when the window is closed; otherwise an apparently idle menu-bar utility can keep rendering and consuming CPU.
 
 `Package.swift` links the Rust static library from `target/release`, so the build must run from the repository root after Rust has produced the library. The Makefile is the local build-order source and contains the stale-executable relink guard for SwiftPM's incomplete static-library dependency tracking.
 
