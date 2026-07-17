@@ -1,18 +1,50 @@
 import Foundation
 
-/// Picks which quota window the menu bar displays. The selection string is
-/// `"auto"` (the tightest window — lowest remaining percent — across every
-/// agent) or `"<clientId>|<windowLabel>"` for an explicit pick.
+/// Picks which quota window the menu bar displays. The canonical selection
+/// string is `"auto"` or `"<clientId>|<cardId>"`. A legacy label in the
+/// second component is migrated when the current payload makes it unique.
 public enum QuotaResolver {
     public static let auto = "auto"
 
+    /// Builds the canonical persisted selection for one quota card.
+    public static func selection(clientId: String, cardId: String) -> String {
+        "\(clientId)|\(cardId)"
+    }
+
+    /// Compatibility spelling for callers that still pass a legacy label.
+    /// Stage 5C2 migrates those callers to `cardId`.
     public static func selection(clientId: String, label: String) -> String {
-        "\(clientId)|\(label)"
+        selection(clientId: clientId, cardId: label)
+    }
+
+    /// Canonicalizes a persisted selection against the current payload.
+    ///
+    /// Empty and `auto` selections normalize to `auto`. Before a payload is
+    /// available, a well-formed explicit selection is preserved so a refresh
+    /// cannot erase an otherwise valid persisted choice. Once a payload exists,
+    /// exact card IDs win; only a unique legacy label can be migrated.
+    public static func canonicalSelection(
+        payload: AgentUsagePayload?, selection: String
+    ) -> String {
+        guard let parsed = parseExplicitSelection(selection) else { return auto }
+        guard let payload else { return selection }
+        guard let agent = payload.agents.first(where: { $0.clientId == parsed.clientId }) else {
+            return auto
+        }
+
+        let windows = agent.uniqueCardWindows
+        if let exact = windows.first(where: { $0.cardId == parsed.value }) {
+            return Self.selection(clientId: agent.clientId, cardId: exact.cardId)
+        }
+
+        let labelMatches = windows.filter { $0.label == parsed.value }
+        guard labelMatches.count == 1, let migrated = labelMatches.first else { return auto }
+        return Self.selection(clientId: agent.clientId, cardId: migrated.cardId)
     }
 
     /// `excluding` is the set of client ids to skip in AUTO mode only (the
     /// user's tab-hidden ∪ limits-hidden clients) — so the menu-bar quota can't
-    /// surface a client the popover hides. An EXPLICIT `clientId|window`
+    /// surface a client the popover hides. An EXPLICIT `clientId|cardId`
     /// selection is always honored, even for an excluded client (the user
     /// deliberately picked it as the tray source). Empty set = pre-hide
     /// behavior, byte-identical.
@@ -20,22 +52,14 @@ public enum QuotaResolver {
         payload: AgentUsagePayload?, selection: String, excluding: Set<String> = []
     ) -> (clientId: String, window: UsageWindow)? {
         guard let payload else { return nil }
-        if selection.isEmpty || selection == Self.auto {
-            var best: (clientId: String, window: UsageWindow)?
-            for agent in payload.agents
-            where agent.error == nil && !excluding.contains(agent.clientId) {
-                for window in agent.windows where window.remainingPercent.isFinite {
-                    if best == nil || window.remainingPercent < best!.window.remainingPercent {
-                        best = (agent.clientId, window)
-                    }
-                }
-            }
-            return best
+        let canonical = canonicalSelection(payload: payload, selection: selection)
+        if canonical == Self.auto {
+            return autoCandidate(payload: payload, excluding: excluding)
         }
-        let parts = selection.split(separator: "|", maxSplits: 1).map(String.init)
-        guard parts.count == 2,
-              let agent = payload.agents.first(where: { $0.clientId == parts[0] }),
-              let window = agent.windows.first(where: { $0.label == parts[1] })
+
+        guard let parsed = parseExplicitSelection(canonical),
+              let agent = payload.agents.first(where: { $0.clientId == parsed.clientId }),
+              let window = agent.uniqueCardWindows.first(where: { $0.cardId == parsed.value })
         else { return nil }
         return (agent.clientId, window)
     }
@@ -51,8 +75,40 @@ public enum QuotaResolver {
     public static func excludedAllCandidates(
         payload: AgentUsagePayload?, selection: String, excluding: Set<String>
     ) -> Bool {
-        guard selection.isEmpty || selection == Self.auto, !excluding.isEmpty else { return false }
-        return resolve(payload: payload, selection: selection, excluding: []) != nil
-            && resolve(payload: payload, selection: selection, excluding: excluding) == nil
+        guard !excluding.isEmpty else { return false }
+        guard let payload,
+              canonicalSelection(payload: payload, selection: selection) == Self.auto
+        else { return false }
+        guard autoCandidate(payload: payload, excluding: []) != nil else { return false }
+        return autoCandidate(payload: payload, excluding: excluding) == nil
+    }
+
+    private static func parseExplicitSelection(
+        _ raw: String
+    ) -> (clientId: String, value: String)? {
+        guard !raw.isEmpty, raw != auto else { return nil }
+        let parts = raw.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return nil }
+        let clientId = String(parts[0])
+        let value = String(parts[1])
+        guard !clientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return (clientId, value)
+    }
+
+    private static func autoCandidate(
+        payload: AgentUsagePayload, excluding: Set<String>
+    ) -> (clientId: String, window: UsageWindow)? {
+        var best: (clientId: String, window: UsageWindow)?
+        for agent in payload.agents
+        where agent.error == nil && !excluding.contains(agent.clientId) {
+            for window in agent.uniqueCardWindows where window.remainingPercent.isFinite {
+                if best == nil || window.remainingPercent < best!.window.remainingPercent {
+                    best = (agent.clientId, window)
+                }
+            }
+        }
+        return best
     }
 }

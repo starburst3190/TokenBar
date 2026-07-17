@@ -1,8 +1,8 @@
 import TokenBarCore
 
-/// Shared quota-selection policy for the tray and Settings preview. Live mode
-/// preserves an explicit persisted selection exactly; demo mode may locally
-/// substitute Auto when a dynamic provider label is absent from its fixture.
+/// Shared quota-selection policy for the tray and Settings preview. Both live
+/// and demo callers use the same payload-aware canonical migration; the
+/// fallback flag remains only until Stage 5C2 removes the dead parameter.
 enum QuotaSelectionPolicy {
     static func effectiveSelection(
         payload: AgentUsagePayload?,
@@ -10,15 +10,7 @@ enum QuotaSelectionPolicy {
         excluding: Set<String>,
         fallbackUnknownExplicit: Bool
     ) -> String {
-        guard fallbackUnknownExplicit,
-              !persistedSelection.isEmpty,
-              persistedSelection != QuotaResolver.auto,
-              QuotaResolver.resolve(
-                  payload: payload, selection: persistedSelection, excluding: excluding) == nil
-        else {
-            return persistedSelection
-        }
-        return QuotaResolver.auto
+        QuotaResolver.canonicalSelection(payload: payload, selection: persistedSelection)
     }
 
     static func resolve(

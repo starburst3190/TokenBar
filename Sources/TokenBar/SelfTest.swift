@@ -453,19 +453,19 @@ enum SelfTest {
         expect(AgentLimitsCard.normalizeTraceClient("codex-cli") == "codex", "limits wrapper applies explicit alias")
         expect(AgentLimitsCard.normalizeTraceClient("antigravity-cli") == "antigravity", "limits wrapper folds generic -cli for quota attribution")
 
-        // Quota resolver: auto picks the tightest window across agents,
-        // erroring agents are skipped, explicit selections parse. The payload
-        // builds via JSON (the snapshot types have no memberwise inits).
+        // Quota resolver: card IDs are explicit and missing paceStatus remains
+        // a valid legacy fixture. Selection tests intentionally read only
+        // identity and percentage fields.
         let quotaJSON = """
         {"generatedAt":"now","agents":[
           {"clientId":"codex","source":"oauth","updatedAt":"now",
-           "windows":[{"label":"Session","usedPercent":20,"remainingPercent":80},
-                      {"label":"Weekly","usedPercent":65,"remainingPercent":35}]},
+           "windows":[{"cardId":"session.v1","label":"Session","usedPercent":20,"remainingPercent":80},
+                      {"cardId":"weekly.v1","label":"Weekly","usedPercent":65,"remainingPercent":35}]},
           {"clientId":"claude","source":"oauth","updatedAt":"now",
-           "windows":[{"label":"Session","usedPercent":88,"remainingPercent":12},
-                      {"label":"Weekly","usedPercent":10,"remainingPercent":90}]},
+           "windows":[{"cardId":"session.v1","label":"Session","usedPercent":88,"remainingPercent":12},
+                      {"cardId":"weekly.v1","label":"Weekly","usedPercent":10,"remainingPercent":90}]},
           {"clientId":"broken","source":"oauth","updatedAt":"now",
-           "windows":[{"label":"Session","usedPercent":99,"remainingPercent":1}],
+           "windows":[{"cardId":"session.v1","label":"Session","usedPercent":99,"remainingPercent":1}],
            "error":"401"}
         ]}
         """
@@ -473,26 +473,94 @@ enum SelfTest {
             AgentUsagePayload.self, from: Data(quotaJSON.utf8))
         let tightest = QuotaResolver.resolve(payload: quotaPayload, selection: "auto")
         expect(
-            tightest?.clientId == "claude" && tightest?.window.label == "Session",
-            "auto resolves the tightest healthy window")
+            tightest?.clientId == "claude" && tightest?.window.cardId == "session.v1",
+            "auto resolves the tightest healthy card")
         expect(
-            QuotaResolver.resolve(payload: quotaPayload, selection: "codex|Weekly")?
-                .window.remainingPercent == 35,
-            "explicit quota selection resolves")
+            QuotaResolver.selection(clientId: "codex", cardId: "weekly.v1") == "codex|weekly.v1",
+            "canonical selection stores cardId")
         expect(
-            QuotaResolver.resolve(payload: quotaPayload, selection: "nope|Session") == nil,
-            "unknown quota selection is nil")
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|Weekly")
+                == "codex|weekly.v1"
+                && QuotaResolver.resolve(payload: quotaPayload, selection: "codex|Weekly")?
+                    .window.cardId == "weekly.v1",
+            "unique legacy label migrates to cardId")
+        expect(
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|stale")
+                == QuotaResolver.auto
+                && QuotaResolver.resolve(payload: quotaPayload, selection: "codex|stale")?.clientId
+                    == tightest?.clientId,
+            "stale explicit selection normalizes to Auto")
+        expect(
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "nope|Session")
+                == QuotaResolver.auto,
+            "unknown client normalizes to Auto")
+        expect(
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|Weekly|extra")
+                == QuotaResolver.auto,
+            "malformed selection normalizes to Auto")
+        expect(
+            QuotaResolver.canonicalSelection(payload: nil, selection: "future|legacy-card.v1")
+                == "future|legacy-card.v1"
+                && QuotaResolver.canonicalSelection(payload: nil, selection: "future|legacy|extra")
+                    == QuotaResolver.auto,
+            "payload nil preserves well-formed explicit selection")
         expect(QuotaResolver.resolve(payload: nil, selection: "auto") == nil, "no payload, no quota")
+
+        let duplicateJSON = """
+        {"generatedAt":"now","agents":[
+          {"clientId":"dupe","source":"fixture","updatedAt":"now",
+           "windows":[
+             {"cardId":"same.v1","label":"Ambiguous","usedPercent":20,"remainingPercent":80},
+             {"cardId":"same.v1","label":"Ambiguous","usedPercent":99,"remainingPercent":1},
+             {"cardId":"other.v1","label":"Ambiguous","usedPercent":70,"remainingPercent":30},
+             {"cardId":"Session","label":"Other","usedPercent":90,"remainingPercent":10},
+             {"cardId":"other-session.v1","label":"Session","usedPercent":75,"remainingPercent":25}
+           ]}
+        ]}
+        """
+        let duplicatePayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data(duplicateJSON.utf8))
+        let duplicateAgent = duplicatePayload.agents[0]
+        expect(
+            duplicateAgent.uniqueCardWindows.map(\.cardId)
+                == ["same.v1", "other.v1", "Session", "other-session.v1"],
+            "unique card view keeps first occurrence order")
+        expect(
+            duplicateAgent.uniqueCardWindows.allSatisfy { $0.cardId != "same.v1" || $0.remainingPercent == 80 }
+                && duplicateAgent.uniqueCardWindows.count == 4,
+            "duplicate card later occurrence fails closed")
+        expect(
+            QuotaResolver.canonicalSelection(payload: duplicatePayload, selection: "dupe|Ambiguous")
+                == QuotaResolver.auto,
+            "duplicate label migration is ambiguous")
+        expect(
+            QuotaResolver.resolve(payload: duplicatePayload, selection: "dupe|Ambiguous")?.window.cardId
+                == "Session",
+            "ambiguous selection follows Auto")
+        expect(
+            QuotaResolver.resolve(payload: duplicatePayload, selection: "dupe|same.v1")?
+                .window.remainingPercent == 80
+                && QuotaResolver.resolve(payload: duplicatePayload, selection: "auto")?.window.cardId
+                    == "Session",
+            "duplicate card is not rendered or considered by Auto")
+        expect(
+            QuotaResolver.canonicalSelection(payload: duplicatePayload, selection: "dupe|Other")
+                == "dupe|Session"
+                && QuotaResolver.canonicalSelection(payload: duplicatePayload, selection: "dupe|Session")
+                    == "dupe|Session",
+            "exact cardId wins over same-named legacy label")
+
         // Auto pick excludes hidden clients (issue #36): hiding the tightest
-        // (claude|Session, 12%) makes auto fall to the next healthy window
+        // (claude|Session, 12%) makes auto fall to the next healthy card
         // (codex|Weekly, 35%); an EXPLICIT pick of a hidden client is honored;
         // empty exclusion is byte-identical to the default.
         let autoExClaude = QuotaResolver.resolve(
             payload: quotaPayload, selection: "auto", excluding: ["claude"])
-        expect(autoExClaude?.clientId == "codex" && autoExClaude?.window.label == "Weekly",
+        expect(autoExClaude?.clientId == "codex" && autoExClaude?.window.cardId == "weekly.v1",
             "auto skips a hidden tightest-window client")
         expect(
-            QuotaResolver.resolve(payload: quotaPayload, selection: "claude|Session", excluding: ["claude"])?
+            QuotaResolver.resolve(
+                payload: quotaPayload, selection: "claude|session.v1", excluding: ["claude"])?
                 .window.remainingPercent == 12,
             "explicit selection of a hidden client still resolves")
         expect(
@@ -512,11 +580,15 @@ enum SelfTest {
                 payload: quotaPayload, selection: "auto", excluding: ["claude"]),
             "excludedAllCandidates false while a visible candidate survives")
         expect(
+            QuotaResolver.excludedAllCandidates(
+                payload: duplicatePayload, selection: "dupe|Ambiguous", excluding: ["dupe"]),
+            "ambiguous Auto obeys exclusion semantics")
+        expect(
             !QuotaResolver.excludedAllCandidates(payload: nil, selection: "auto", excluding: ["claude"]),
             "excludedAllCandidates false with no payload (fetch-failure keeps the cache)")
         expect(
             !QuotaResolver.excludedAllCandidates(
-                payload: quotaPayload, selection: "claude|Session", excluding: ["claude"]),
+                payload: quotaPayload, selection: "claude|session.v1", excluding: ["claude"]),
             "excludedAllCandidates false for an explicit selection")
         expect(
             !QuotaResolver.excludedAllCandidates(payload: quotaPayload, selection: "auto", excluding: []),
@@ -942,19 +1014,21 @@ enum SelfTest {
             persistedSelection: dynamicLabelSelection,
             excluding: [],
             fallbackUnknownExplicit: liveSource.fallsBackUnknownQuotaSelectionToAuto)
+        let demoQuotaValue = QuotaSelectionPolicy.resolve(
+            payload: quota,
+            persistedSelection: dynamicLabelSelection,
+            excluding: [],
+            fallbackUnknownExplicit: true)
+        let liveQuotaValue = QuotaSelectionPolicy.resolve(
+            payload: quota,
+            persistedSelection: dynamicLabelSelection,
+            excluding: [],
+            fallbackUnknownExplicit: false)
         expect(
-            demoQuotaSelection == QuotaResolver.auto && liveQuotaSelection == dynamicLabelSelection
-                && QuotaSelectionPolicy.resolve(
-                    payload: quota,
-                    persistedSelection: dynamicLabelSelection,
-                    excluding: [],
-                    fallbackUnknownExplicit: true) != nil
-                && QuotaSelectionPolicy.resolve(
-                    payload: quota,
-                    persistedSelection: dynamicLabelSelection,
-                    excluding: [],
-                    fallbackUnknownExplicit: false) == nil,
-            "demo unknown quota labels fall back locally while live stays exact")
+            demoQuotaSelection == QuotaResolver.auto && liveQuotaSelection == QuotaResolver.auto
+                && demoQuotaValue?.clientId == liveQuotaValue?.clientId
+                && demoQuotaValue?.window.cardId == liveQuotaValue?.window.cardId,
+            "demo/live fallback flags do not diverge canonical selection")
 
         let modelReport = DemoData.modelReport
         let hourlyReport = DemoData.hourlyReport

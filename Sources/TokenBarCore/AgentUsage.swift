@@ -472,6 +472,14 @@ public struct AgentUsageSnapshot: Decodable, Sendable {
     public let windows: [UsageWindow]
     public let credits: CreditsSnapshot?
     public let error: String?
+
+    /// Order-preserving card view shared by quota resolvers and consumers.
+    /// A duplicate card ID is fail-closed after the first occurrence; labels
+    /// never repair or disambiguate a card collision.
+    public var uniqueCardWindows: [UsageWindow] {
+        var seen = Set<String>()
+        return windows.filter { seen.insert($0.cardId).inserted }
+    }
 }
 
 public struct AgentUsagePayload: Decodable, Sendable {
