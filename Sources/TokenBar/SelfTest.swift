@@ -82,98 +82,165 @@ enum SelfTest {
         let s3 = Streaks.compute(perDayMap: [:], rangeStart: "2026-06-10", rangeEnd: "2026-06-01")
         expect(s3.longest == 0 && s3.current == 0, "inverted range is empty")
 
-        // UsagePace: expected-vs-actual classification, ETA projection, modes.
-        // Fixture: 60-minute window, 30 minutes elapsed (linear expected 50%).
+        // UsagePace: explicit v3 state fixtures, exact duration timing, and
+        // mode/basis policy. No pace assertion uses the legacy constructor.
         let now = Date(timeIntervalSince1970: 1_750_000_000)
-        func window(
-            used: Double, minutes: Int64 = 60, untilReset: TimeInterval = 1800,
-            historicalPace: HistoricalPace? = nil
+        func v3Window(
+            used: Double,
+            durationSeconds: Int64 = 3_600,
+            untilReset: TimeInterval = 1_800,
+            state: UsagePaceState = .learningHistory,
+            historicalPace: HistoricalPace? = nil,
+            windowMinutes: Int64? = nil
         ) -> UsageWindow {
-            UsageWindow(
+            let duration: Int64? = state == .learningDuration || state == .unavailable
+                ? nil : durationSeconds
+            let durationSource: UsagePaceDurationSource? = duration == nil
+                ? (state == .learningDuration ? .observed : nil) : .contract
+            let status = PaceStatus(
+                state: state, windowKey: "session.v3", durationSeconds: duration,
+                durationSource: durationSource,
+                completeCycles: state == .available ? 5 : 0,
+                reason: state == .unavailable ? .nonRecurring : nil)
+            return UsageWindow(
                 label: "Session", usedPercent: used, remainingPercent: 100 - used,
                 resetsAt: ISO8601DateFormatter().string(from: now.addingTimeInterval(untilReset)),
-                windowMinutes: minutes, historicalPace: historicalPace)
+                windowMinutes: windowMinutes ?? duration.map { $0 / 60 },
+                historicalPace: historicalPace,
+                cardId: "session.v3", durationSeconds: duration, paceStatus: status)
         }
-        let onPace = UsagePace.compute(window: window(used: 50), now: now)
-        expect(onPace?.stage == .onTrack && onPace?.label == "On pace", "pace on track at 50%/50%")
-        let ahead = UsagePace.compute(window: window(used: 80), now: now)
-        expect(ahead?.stage == .farAhead && ahead?.label == "30% in deficit", "pace far ahead label")
+
+        let onPace = UsagePace.compute(window: v3Window(used: 50), now: now)
+        expect(onPace?.stage == .onTrack && onPace?.basis == .linear
+            && onPace?.label == "On pace", "pace on track at 50%/50%")
+        let ahead = UsagePace.compute(window: v3Window(used: 80), now: now)
+        expect(ahead?.stage == .farAhead && ahead?.label == "30% in deficit"
+            && ahead?.basis == .linear, "pace far ahead label")
         // 80% in 30min → 100% in 37.5min, before the 30min reset → ETA 7.5min.
         expect(ahead?.willLastToReset == false && abs((ahead?.etaSeconds ?? 0) - 450) < 1, "pace eta 450s")
         expect(ahead?.etaText == "Projected empty in 8m", "pace eta text")
-        let reserve = UsagePace.compute(window: window(used: 40), now: now)
+        let reserve = UsagePace.compute(window: v3Window(used: 40), now: now)
         expect(reserve?.stage == .behind && reserve?.label == "10% in reserve", "pace reserve label")
         expect(reserve?.willLastToReset == true && reserve?.etaText == "Lasts until reset", "slow burn lasts")
-        expect(UsagePace.compute(window: window(used: 50, minutes: 0), now: now) == nil, "no window length, no pace")
-        expect(UsagePace.compute(window: window(used: 50, untilReset: -10), now: now) == nil, "past reset, no pace")
-        // Modes: off → nil; a missing/null historical result falls back to
-        // linear; nested historical values replace only expected/stage/delta
-        // while ETA and lasts-to-reset remain backend-owned.
-        expect(UsagePace.compute(window: window(used: 50), mode: .off, now: now) == nil, "pace mode off")
+        let learningDurationWindow = v3Window(used: 50, state: .learningDuration)
+        expect(UsagePace.compute(window: learningDurationWindow, now: now) == nil,
+            "learning duration has no pace")
+        expect(UsagePace.compute(
+            window: learningDurationWindow, mode: .historical, now: now) == nil,
+            "historical learningDuration has no pace")
+        expect(UsagePace.compute(
+            window: learningDurationWindow, mode: .linear, now: now) == nil,
+            "linear learningDuration has no pace")
+        expect(UsagePace.compute(window: v3Window(used: 50, untilReset: -10), now: now) == nil,
+            "past reset, no pace")
+        expect(UsagePace.compute(window: v3Window(used: 50, untilReset: 3_600), now: now) == nil,
+            "elapsed-zero positive usage has no pace")
+
+        // A non-minute duration proves timing uses exact v3 seconds rather than
+        // the compatibility windowMinutes field.
+        let exactDuration = UsagePace.compute(
+            window: v3Window(used: 50, durationSeconds: 3_601, untilReset: 1_800), now: now)
+        let exactExpected = (Double(3_601 - 1_800) / Double(3_601)) * 100
+        expect(exactDuration?.expectedUsedPercent == exactExpected
+            && exactDuration?.expectedUsedPercent != 50,
+            "pace uses exact duration seconds")
+
         let historicalLasts = HistoricalPace(
             expectedUsedPercent: 80, etaSeconds: nil,
             willLastToReset: true, runOutProbability: nil)
+        let availableWindow = v3Window(
+            used: 50, state: .available, historicalPace: historicalLasts)
         let hist = UsagePace.compute(
-            window: window(used: 50, historicalPace: historicalLasts), mode: .historical, now: now)
-        expect(hist?.expectedUsedPercent == 80 && hist?.stage == .farBehind, "historical expected override")
-        expect(hist?.willLastToReset == true && hist?.etaSeconds == nil, "historical lasts result is trusted")
-        let risky = UsagePace.compute(
-            window: window(
-                used: 90,
-                historicalPace: HistoricalPace(
-                    expectedUsedPercent: 50, etaSeconds: 120,
-                    willLastToReset: false, runOutProbability: 0.8)),
-            mode: .historical, now: now)
-        expect(
-            risky?.willLastToReset == false && risky?.etaSeconds == 120,
-            "historical projected empty trusts backend eta")
+            window: availableWindow, mode: .historical, now: now)
+        expect(hist?.expectedUsedPercent == 80 && hist?.stage == .farBehind
+            && hist?.basis == .historical, "historical available uses backend expected")
+        expect(hist?.willLastToReset == true && hist?.etaSeconds == nil,
+            "historical lasts result is trusted")
+        expect(hist?.isHistoricalDeficit == false, "historical reserve is not a deficit")
+
+        let riskyWindow = v3Window(
+            used: 90, state: .available,
+            historicalPace: HistoricalPace(
+                expectedUsedPercent: 50, etaSeconds: 120,
+                willLastToReset: false, runOutProbability: 0.8))
+        let risky = UsagePace.compute(window: riskyWindow, mode: .historical, now: now)
+        expect(risky?.willLastToReset == false && risky?.etaSeconds == 120
+            && risky?.basis == .historical && risky?.isHistoricalDeficit == true,
+            "historical projected empty trusts backend eta and deficit gate")
         expect(risky?.etaText == "Projected empty in 2m", "historical projected empty text")
-        let fallback = UsagePace.compute(window: window(used: 50), mode: .historical, now: now)
-        expect(fallback?.expectedUsedPercent == 50, "missing historical result falls back to linear")
-        let silentAheadFallback = UsagePace.compute(
-            window: window(used: 80), mode: .historical, now: now)
-        expect(
-            silentAheadFallback?.stage.isDeficit == true,
-            "stage0 swift.color.historical-available-ahead-only captures silent Linear deficit baseline")
-        let linear = UsagePace.compute(
-            window: window(used: 50, historicalPace: historicalLasts), mode: .linear, now: now)
-        expect(linear?.expectedUsedPercent == 50, "linear mode ignores historical")
-        expect(
-            UsagePace.compute(window: window(used: 50, historicalPace: historicalLasts), now: now)?
-                .expectedUsedPercent == 50,
+
+        let learningHistoryWindow = v3Window(used: 80, state: .learningHistory)
+        let learningEstimate = UsagePace.compute(
+            window: learningHistoryWindow, mode: .historical, now: now)
+        expect(learningEstimate?.basis == .linear
+            && learningEstimate?.stage.isDeficit == true
+            && learningEstimate?.isHistoricalDeficit == false,
+            "historical learningHistory is identifiable Linear estimate")
+        expect(learningEstimate?.expectedUsedPercent == 50,
+            "learningHistory historical mode uses Linear estimate")
+
+        expect(UsagePace.compute(window: availableWindow, mode: .off, now: now) == nil,
+            "pace mode off")
+        let linear = UsagePace.compute(window: availableWindow, mode: .linear, now: now)
+        expect(linear?.expectedUsedPercent == 50 && linear?.basis == .linear,
+            "linear mode ignores available historical")
+        expect(UsagePace.compute(window: availableWindow, now: now)?.basis == .linear,
             "direct pace compute stays linear")
-        expect(runOutRiskLabel(window: window(used: 50)) == nil, "missing historical risk is nil")
-        let lastingRisk = HistoricalPace(
-            expectedUsedPercent: 80, etaSeconds: nil,
-            willLastToReset: true, runOutProbability: 0.2)
-        let lastingRiskWindow = window(used: 50, historicalPace: lastingRisk)
+        let unavailableWindow = v3Window(used: 50, state: .unavailable)
+        expect(UsagePace.compute(
+            window: unavailableWindow, mode: .historical, now: now) == nil,
+            "historical unavailable has no silent Linear fallback")
+        expect(UsagePace.compute(
+            window: unavailableWindow, mode: .linear, now: now) == nil,
+            "linear unavailable has no pace")
+
+        // Stage 0 old-fail/new-pass baseline: legacy windowMinutes cannot
+        // restore pace when the typed paceStatus key is absent.
+        let legacyWindow = try? JSONDecoder().decode(
+            UsageWindow.self,
+            from: Data(#"{"label":"Weekly","usedPercent":80,"remainingPercent":20,"windowMinutes":60}"#.utf8))
+        expect(legacyWindow.flatMap {
+            UsagePace.compute(window: $0, mode: .historical, now: now)
+        } == nil, "stage0 legacy payload has no silent historical Linear fallback")
+        expect(legacyWindow.flatMap {
+            UsagePace.compute(window: $0, now: now)
+        } == nil, "legacy windowMinutes cannot revive direct pace")
+
+        let lastingRiskWindow = v3Window(
+            used: 50, state: .available,
+            historicalPace: HistoricalPace(
+                expectedUsedPercent: 80, etaSeconds: nil,
+                willLastToReset: true, runOutProbability: 0.2))
         let lastingRiskPace = UsagePace.compute(
             window: lastingRiskWindow, mode: .historical, now: now)!
         let lastingRiskPresentation = UsagePace.presentation(
             window: lastingRiskWindow, mode: .historical, pace: lastingRiskPace)
-        expect(
-            lastingRiskPace.etaText == "Lasts until reset" &&
-                lastingRiskPresentation.etaText == nil &&
-                lastingRiskPresentation.riskText == "≈ 20% run-out risk",
-            "visible historical risk suppresses lasts text")
-        let lastingNoRiskPresentation = UsagePace.presentation(
-            window: window(used: 50, historicalPace: historicalLasts),
-            mode: .historical, pace: hist!)
-        expect(
-            lastingNoRiskPresentation.etaText == "Lasts until reset" &&
-                lastingNoRiskPresentation.riskText == nil,
-            "historical lasting without risk keeps lasts text")
-        let exhaustedWindow = window(
-            used: 100,
+        expect(lastingRiskPresentation.etaText == nil
+            && lastingRiskPresentation.riskText == "≈ 20% run-out risk",
+            "historical available risk suppresses lasts text")
+        expect(runOutRiskLabel(window: riskyWindow) == "≈ 80% run-out risk",
+            "risk belongs to historical available")
+        expect(runOutRiskLabel(window: riskyWindow, pace: linear) == nil,
+            "Linear basis cannot display nested risk")
+        expect(UsagePace.presentation(
+            window: riskyWindow, mode: .linear, pace: linear!).riskText == nil,
+            "linear presentation cannot display nested risk")
+        expect(UsagePace.presentation(
+            window: learningHistoryWindow, mode: .historical, pace: learningEstimate!).riskText == nil,
+            "learningHistory Linear estimate cannot display nested risk")
+        expect(runOutRiskLabel(window: v3Window(used: 50, state: .learningHistory)) == nil,
+            "learningHistory has no historical risk")
+
+        let exhaustedWindow = v3Window(
+            used: 100, state: .available,
             historicalPace: HistoricalPace(
                 expectedUsedPercent: 80, etaSeconds: 0,
                 willLastToReset: false, runOutProbability: 1))
         let exhausted = UsagePace.compute(
             window: exhaustedWindow, mode: .historical, now: now)
-        expect(
-            exhausted?.etaSeconds == 0 && exhausted?.willLastToReset == false &&
-                exhausted?.etaText == "Projected empty now" &&
-                runOutRiskLabel(window: exhaustedWindow) == "≈ 100% run-out risk",
+        expect(exhausted?.etaSeconds == 0 && exhausted?.willLastToReset == false
+            && exhausted?.etaText == "Projected empty now"
+            && runOutRiskLabel(window: exhaustedWindow) == "≈ 100% run-out risk",
             "historical exhausted result is coherent")
         expect(UsagePace.durationText(130 * 60) == "2h 10m", "duration text h m")
         expect(UsagePace.durationText(26 * 3600) == "1d 2h", "duration text d h")
