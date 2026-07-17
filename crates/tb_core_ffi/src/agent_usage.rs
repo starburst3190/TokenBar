@@ -257,6 +257,26 @@ impl UsageWindow {
         Self::from_provider_used_percent(label, (1.0 - remaining_fraction) * 100.0, resets_at, now)
     }
 
+    pub(crate) fn try_from_provider_used_percent(
+        label: String,
+        used_percent: f64,
+        resets_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        (used_percent.is_finite() && (0.0..=100.0).contains(&used_percent))
+            .then(|| Self::from_provider_used_percent(label, used_percent, resets_at, now))
+    }
+
+    pub(crate) fn try_from_provider_fraction(
+        label: String,
+        remaining_fraction: f64,
+        resets_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        (remaining_fraction.is_finite() && (0.0..=1.0).contains(&remaining_fraction))
+            .then(|| Self::from_provider_fraction(label, remaining_fraction, resets_at, now))
+    }
+
     /// Attach provider-semantic presentation and history identity plus the
     /// frozen provider/contract duration evidence.
     pub(crate) fn with_identity(
@@ -590,9 +610,9 @@ struct CodexUsageResponse {
 
 #[derive(Debug, Deserialize)]
 struct CodexRateLimit {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     primary_window: Option<CodexWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     secondary_window: Option<CodexWindow>,
 }
 
@@ -623,45 +643,45 @@ struct CodexCredits {
 
 #[derive(Debug, Deserialize, Default)]
 struct ClaudeUsageResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     five_hour: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_oauth_apps: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_opus: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_sonnet: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_design: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_claude_design: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     claude_design: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     design: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_omelette: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     omelette: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     omelette_promotional: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_routines: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_claude_routines: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     claude_routines: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     routines: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     routine: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     seven_day_cowork: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     cowork: Option<ClaudeWindow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
     extra_usage: Option<ClaudeExtraUsage>,
 }
 
@@ -671,6 +691,13 @@ struct ClaudeWindow {
     utilization: Option<f64>,
     #[serde(default)]
     resets_at: Option<String>,
+}
+
+impl ClaudeWindow {
+    fn has_valid_utilization(&self) -> bool {
+        self.utilization
+            .is_some_and(|used| used.is_finite() && (0.0..=100.0).contains(&used))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2554,16 +2581,19 @@ fn codex_windows(
             } else {
                 window_key.to_string()
             };
-            if !emitted_card_ids.insert(card_id.clone()) {
-                continue;
-            }
-            windows.push(map_window_with_identity(
+            let Some(mapped) = map_window_with_identity(
                 label,
                 window,
                 now,
-                card_id,
+                card_id.clone(),
                 (!window_key.is_empty()).then(|| window_key.to_string()),
-            ));
+            ) else {
+                continue;
+            };
+            if !emitted_card_ids.insert(card_id) {
+                continue;
+            }
+            windows.push(mapped);
         }
     }
 
@@ -2582,30 +2612,35 @@ fn codex_windows(
         .filter_map(|(slot, window)| window.map(|window| (slot, window)))
         {
             let Some(digest) = digest.as_deref() else {
-                if !anonymous_slots.insert(slot) {
-                    continue;
-                }
-                windows.push(map_window_with_identity(
+                let Some(mapped) = map_window_with_identity(
                     "Unknown",
                     window,
                     now,
                     format!("row.additional.unknown.{slot}.v1"),
                     None,
-                ));
+                ) else {
+                    continue;
+                };
+                if anonymous_slots.insert(slot) {
+                    windows.push(mapped);
+                }
                 continue;
             };
             let label = additional_limit_label(extra);
             let window_key = format!("additional.{digest}.{slot}.v1");
-            if !emitted_card_ids.insert(window_key.clone()) {
-                continue;
-            }
-            windows.push(map_window_with_identity(
+            let Some(mapped) = map_window_with_identity(
                 &label,
                 window,
                 now,
                 window_key.clone(),
-                Some(window_key),
-            ));
+                Some(window_key.clone()),
+            ) else {
+                continue;
+            };
+            if !emitted_card_ids.insert(window_key) {
+                continue;
+            }
+            windows.push(mapped);
         }
     }
     windows
@@ -2688,7 +2723,7 @@ impl ClaudeUsageResponse {
         ]
         .into_iter()
         .flatten()
-        .next()
+        .find(|window| window.has_valid_utilization())
     }
 
     fn routines_window(&self) -> Option<&ClaudeWindow> {
@@ -2703,7 +2738,7 @@ impl ClaudeUsageResponse {
         ]
         .into_iter()
         .flatten()
-        .next()
+        .find(|window| window.has_valid_utilization())
     }
 }
 
@@ -2731,14 +2766,15 @@ fn map_claude_window(
 ) -> Option<UsageWindow> {
     let used = window.utilization?;
     let resets_at = window.resets_at.as_deref().and_then(parse_datetime);
-    Some(
-        UsageWindow::from_provider_used_percent(label.to_string(), used, resets_at, now)
-            .with_identity(
+    UsageWindow::try_from_provider_used_percent(label.to_string(), used, resets_at, now).map(
+        |window| {
+            window.with_identity(
                 window_key,
                 Some(window_key.to_string()),
                 None,
                 Some(contract_duration),
-            ),
+            )
+        },
     )
 }
 
@@ -2798,14 +2834,15 @@ fn unified_ratelimit_window_with_identity(
     let resets_at = reset_epoch_seconds
         .filter(|seconds| *seconds > 0)
         .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single());
-    Some(
-        UsageWindow::from_provider_used_percent(label.to_string(), used, resets_at, now)
-            .with_identity(
+    UsageWindow::try_from_provider_used_percent(label.to_string(), used, resets_at, now).map(
+        |window| {
+            window.with_identity(
                 window_key,
                 Some(window_key.to_string()),
                 None,
                 Some(contract_duration),
-            ),
+            )
+        },
     )
 }
 
@@ -2853,14 +2890,18 @@ fn claude_extra_usage_window(extra: Option<&ClaudeExtraUsage>) -> Option<UsageWi
         )),
         _ => None,
     };
-    let mut window =
-        UsageWindow::from_provider_used_percent("Extra usage".to_string(), used, None, Utc::now())
-            .with_identity(
-                "extra_usage.v1",
-                Some("extra_usage.v1".to_string()),
-                None,
-                None,
-            );
+    let mut window = UsageWindow::try_from_provider_used_percent(
+        "Extra usage".to_string(),
+        used,
+        None,
+        Utc::now(),
+    )?
+    .with_identity(
+        "extra_usage.v1",
+        Some("extra_usage.v1".to_string()),
+        None,
+        None,
+    );
     window.reset_text = reset_text;
     Some(window)
 }
@@ -2937,14 +2978,19 @@ fn map_window_with_identity(
     now: DateTime<Utc>,
     card_id: impl Into<String>,
     window_key: Option<String>,
-) -> UsageWindow {
+) -> Option<UsageWindow> {
     let resets_at = (window.reset_at != 0)
         .then(|| Utc.timestamp_opt(window.reset_at, 0).single())
         .flatten();
     let provider_duration = (window.limit_window_seconds != 0)
         .then(|| DurationEvidence::provider(window.reset_at, window.limit_window_seconds));
-    UsageWindow::from_provider_used_percent(label.to_string(), window.used_percent, resets_at, now)
-        .with_identity(card_id, window_key, provider_duration, None)
+    UsageWindow::try_from_provider_used_percent(
+        label.to_string(),
+        window.used_percent,
+        resets_at,
+        now,
+    )
+    .map(|window| window.with_identity(card_id, window_key, provider_duration, None))
 }
 
 fn additional_limit_source(limit: &CodexAdditionalRateLimit) -> Option<String> {
@@ -3136,6 +3182,15 @@ pub(crate) fn clean_plan(value: impl AsRef<str>) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+pub(crate) fn deserialize_optional_raw<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw = Option::<Box<serde_json::value::RawValue>>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| serde_json::from_str(raw.get()).ok()))
 }
 
 fn deserialize_optional_non_empty_string<'de, D>(
@@ -4452,7 +4507,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_window_sanitizes_invalid_fraction_for_wire() {
+    fn unified_window_rejects_invalid_fraction_before_wire() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let zero = unified_ratelimit_window("Session", Some(0.0), None, now).unwrap();
         assert!((zero.used_percent - 0.0).abs() < 1e-9);
@@ -4461,32 +4516,148 @@ mod tests {
         assert!((full.used_percent - 100.0).abs() < 1e-9);
         assert!((full.remaining_percent - 0.0).abs() < 1e-9);
 
-        let over = unified_ratelimit_window("Session", Some(1.5), None, now).unwrap();
-        assert_eq!(over.used_percent, 100.0);
-        assert_eq!(over.remaining_percent, 0.0);
-        assert_eq!(over.pace_status.reason.as_deref(), Some("invalidEvidence"));
-
-        let windows = parse_unified_ratelimit_windows(
+        assert!(unified_ratelimit_window("Session", Some(1.5), None, now).is_none());
+        assert!(unified_ratelimit_window("Session", Some(f64::NAN), None, now).is_none());
+        assert!(parse_unified_ratelimit_windows(
             &header_map(&[
                 ("anthropic-ratelimit-unified-5h-utilization", "NaN"),
                 ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
             ]),
             now,
-        );
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].used_percent, 0.0);
-        assert_eq!(windows[0].remaining_percent, 100.0);
-        assert_eq!(
-            windows[0].pace_status.reason.as_deref(),
-            Some("invalidEvidence")
-        );
-        let wire = serde_json::to_value(&windows[0]).unwrap();
-        assert_eq!(wire["usedPercent"], 0.0);
-        assert_eq!(wire["remainingPercent"], 100.0);
-        assert_eq!(wire["paceStatus"]["state"], "unavailable");
+        )
+        .is_empty());
 
         // None utilization -> no window
         assert!(unified_ratelimit_window("Session", None, Some(1_783_111_200), now).is_none());
+    }
+
+    #[test]
+    fn provider_adapters_reject_invalid_percentages_before_wire() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        assert!(map_claude_window(
+            "Session",
+            "session.v1",
+            DurationEvidence::contract(300 * 60),
+            &ClaudeWindow {
+                utilization: Some(150.0),
+                resets_at: None,
+            },
+            now,
+        )
+        .is_none());
+        assert!(claude_extra_usage_window(Some(&ClaudeExtraUsage {
+            is_enabled: true,
+            monthly_limit: None,
+            used_credits: None,
+            utilization: Some(f64::NAN),
+            currency: None,
+        }))
+        .is_none());
+        assert!(map_window_with_identity(
+            "Weekly",
+            CodexWindow {
+                used_percent: -1.0,
+                reset_at: 1_700_003_600,
+                limit_window_seconds: 604_800,
+            },
+            now,
+            "main.weekly.v1",
+            Some("main.weekly.v1".to_string()),
+        )
+        .is_none());
+
+        let valid_duplicate = codex_windows(
+            Some(&CodexRateLimit {
+                primary_window: Some(CodexWindow {
+                    used_percent: 150.0,
+                    reset_at: 1_700_003_600,
+                    limit_window_seconds: 18_000,
+                }),
+                secondary_window: Some(CodexWindow {
+                    used_percent: 20.0,
+                    reset_at: 1_700_003_600,
+                    limit_window_seconds: 18_000,
+                }),
+            }),
+            None,
+            now,
+        );
+        assert_eq!(valid_duplicate.len(), 1);
+        assert_eq!(valid_duplicate[0].card_id, "main.session.v1");
+        assert_eq!(valid_duplicate[0].used_percent, 20.0);
+    }
+
+    #[test]
+    fn provider_payloads_isolate_malformed_percentage_rows() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        for invalid in ["1e400", r#""NaN""#] {
+            let codex: CodexUsageResponse = serde_json::from_str(&format!(
+                r#"{{
+                    "rate_limit": {{
+                        "primary_window": {{
+                            "used_percent": {invalid},
+                            "reset_at": 1700003600,
+                            "limit_window_seconds": 18000
+                        }},
+                        "secondary_window": {{
+                            "used_percent": 20,
+                            "reset_at": 1700003600,
+                            "limit_window_seconds": 18000
+                        }}
+                    }}
+                }}"#
+            ))
+            .unwrap();
+            let codex_windows = codex_windows(codex.rate_limit.as_ref(), None, now);
+            assert_eq!(codex_windows.len(), 1);
+            assert_eq!(codex_windows[0].card_id, "main.session.v1");
+            assert_eq!(codex_windows[0].used_percent, 20.0);
+
+            let claude: ClaudeUsageResponse = serde_json::from_str(&format!(
+                r#"{{
+                    "five_hour": {{
+                        "utilization": {invalid},
+                        "resets_at": "2023-11-15T00:13:20Z"
+                    }},
+                    "seven_day": {{
+                        "utilization": 20,
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "seven_day_design": {{
+                        "utilization": {invalid},
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "design": {{
+                        "utilization": 30,
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "seven_day_routines": {{
+                        "utilization": {invalid},
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "routines": {{
+                        "utilization": 40,
+                        "resets_at": "2023-11-21T22:13:20Z"
+                    }},
+                    "extra_usage": {{
+                        "is_enabled": true,
+                        "utilization": {invalid}
+                    }}
+                }}"#
+            ))
+            .unwrap();
+            let claude_windows = claude_windows(&claude, now);
+            assert_eq!(claude_windows.len(), 3);
+            assert!(claude_windows
+                .iter()
+                .any(|window| window.card_id == "weekly.v1" && window.used_percent == 20.0));
+            assert!(claude_windows
+                .iter()
+                .any(|window| window.card_id == "design.weekly.v1" && window.used_percent == 30.0));
+            assert!(claude_windows.iter().any(
+                |window| window.card_id == "routines.weekly.v1" && window.used_percent == 40.0
+            ));
+        }
     }
 
     #[test]

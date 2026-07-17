@@ -101,6 +101,9 @@ public enum QuotaResolver {
         var best: (clientId: String, window: UsageWindow)?
         for agent in payload.agents
         where agent.error == nil && !excluding.contains(agent.clientId) {
+            // Rust omits malformed percentage readings before serialization.
+            // Do not reject every `.invalidEvidence` pace status here: a reset or
+            // duration error can coexist with a valid remaining-percentage gauge.
             for window in agent.uniqueCardWindows where window.remainingPercent.isFinite {
                 if best == nil || window.remainingPercent < best!.window.remainingPercent {
                     best = (agent.clientId, window)

@@ -33,9 +33,15 @@ struct CopilotUser {
 
 #[derive(Debug, Deserialize)]
 struct QuotaSnapshots {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent_usage::deserialize_optional_raw"
+    )]
     premium_interactions: Option<QuotaSnapshot>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent_usage::deserialize_optional_raw"
+    )]
     chat: Option<QuotaSnapshot>,
 }
 
@@ -142,9 +148,13 @@ fn snapshot_window_with_identity(
     {
         return None;
     }
-    let percent_remaining = snapshot.percent_remaining.or_else(|| {
-        (snapshot.entitlement > 0.0).then(|| (snapshot.remaining / snapshot.entitlement) * 100.0)
-    })?;
+    let percent_remaining = snapshot
+        .percent_remaining
+        .or_else(|| {
+            (snapshot.entitlement > 0.0)
+                .then(|| (snapshot.remaining / snapshot.entitlement) * 100.0)
+        })
+        .filter(|percent| percent.is_finite() && (0.0..=100.0).contains(percent))?;
     let contract_duration = resets_at
         .and_then(|reset| copilot_calendar_duration(reset.timestamp()))
         .map(DurationEvidence::contract);
@@ -276,6 +286,62 @@ mod tests {
             None,
             "copilot.premium.observed-fallback"
         );
+    }
+
+    #[test]
+    fn rejects_invalid_remaining_percentages_before_wire() {
+        let now = Utc::now();
+        assert!(snapshot_window(
+            "Premium",
+            Some(QuotaSnapshot {
+                entitlement: 300.0,
+                remaining: 90.0,
+                percent_remaining: Some(101.0),
+            }),
+            None,
+            now,
+        )
+        .is_none());
+        assert!(snapshot_window(
+            "Chat",
+            Some(QuotaSnapshot {
+                entitlement: 100.0,
+                remaining: f64::NAN,
+                percent_remaining: None,
+            }),
+            None,
+            now,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn malformed_snapshot_percentage_does_not_poison_valid_sibling() {
+        let now = Utc.timestamp_opt(1_751_328_000, 0).single().unwrap();
+        for invalid in ["1e400", r#""NaN""#] {
+            let usage: CopilotUser = serde_json::from_str(&format!(
+                r#"{{
+                    "quota_reset_date": "2026-08-01",
+                    "quota_snapshots": {{
+                        "premium_interactions": {{
+                            "entitlement": 300,
+                            "remaining": 90,
+                            "percent_remaining": {invalid}
+                        }},
+                        "chat": {{
+                            "entitlement": 100,
+                            "remaining": 75,
+                            "percent_remaining": 75
+                        }}
+                    }}
+                }}"#
+            ))
+            .unwrap();
+            let (_, windows) = map_user(usage, now);
+            assert_eq!(windows.len(), 1);
+            assert_eq!(windows[0].label_for_test(), "Chat");
+            assert!((windows[0].remaining_for_test() - 75.0).abs() < 0.01);
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::agent_quota_duration::DurationEvidence;
 use crate::agent_usage::{AgentIdentity, UsageWindow};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -83,7 +83,7 @@ struct BillingConfig {
     #[serde(default)]
     current_period: Option<UsagePeriod>,
     #[serde(default)]
-    credit_usage_percent: Option<f64>,
+    credit_usage_percent: Option<Box<RawValue>>,
     #[serde(default)]
     product_usage: Option<Vec<ProductUsage>>,
     #[serde(default)]
@@ -108,7 +108,7 @@ struct ProductUsage {
     #[serde(default)]
     product: Option<String>,
     #[serde(default)]
-    usage_percent: Option<f64>,
+    usage_percent: Option<Box<RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,13 +280,22 @@ fn used_percent_from_config(config: &BillingConfig) -> Option<f64> {
         for product in products {
             let name = product.product.as_deref().unwrap_or("");
             if name.eq_ignore_ascii_case("GrokBuild") {
-                if let Some(pct) = product.usage_percent {
-                    return Some(pct);
+                if let Some(usage_percent) = product.usage_percent.as_deref() {
+                    return valid_percentage(usage_percent);
                 }
             }
         }
     }
-    config.credit_usage_percent
+    config
+        .credit_usage_percent
+        .as_deref()
+        .and_then(valid_percentage)
+}
+
+fn valid_percentage(raw: &RawValue) -> Option<f64> {
+    serde_json::from_str::<f64>(raw.get())
+        .ok()
+        .filter(|pct| pct.is_finite() && (0.0..=100.0).contains(pct))
 }
 
 struct PeriodMeta {
@@ -734,6 +743,44 @@ mod tests {
         )
         .unwrap();
         assert!((used_percent_from_config(&config).unwrap() - 12.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn rejects_invalid_usage_percentages_before_wire() {
+        let invalid_product: BillingConfig = serde_json::from_str(
+            r#"{
+                "creditUsagePercent": 12.5,
+                "productUsage": [
+                    { "product": "GrokBuild", "usagePercent": 150.0 }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(used_percent_from_config(&invalid_product).is_none());
+
+        for invalid in ["1e400", r#""NaN""#] {
+            let malformed_product: BillingConfig = serde_json::from_str(&format!(
+                r#"{{
+                    "creditUsagePercent": 12.5,
+                    "productUsage": [
+                        {{ "product": "GrokBuild", "usagePercent": {invalid} }}
+                    ]
+                }}"#
+            ))
+            .unwrap();
+            assert!(used_percent_from_config(&malformed_product).is_none());
+        }
+
+        let invalid: BillingConfig = serde_json::from_str(
+            r#"{
+                "creditUsagePercent": -1.0,
+                "productUsage": [
+                    { "product": "GrokBuild", "usagePercent": 150.0 }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(used_percent_from_config(&invalid).is_none());
     }
 
     #[test]

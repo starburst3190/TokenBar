@@ -295,10 +295,8 @@ fn quota_window(
     card_id: String,
     window_key: Option<String>,
 ) -> Option<UsageWindow> {
-    valid_remaining_fraction(fraction).then(|| {
-        UsageWindow::from_provider_fraction(label, fraction, reset, now)
-            .with_identity(card_id, window_key, None, None)
-    })
+    UsageWindow::try_from_provider_fraction(label, fraction, reset, now)
+        .map(|window| window.with_identity(card_id, window_key, None, None))
 }
 
 fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> {
