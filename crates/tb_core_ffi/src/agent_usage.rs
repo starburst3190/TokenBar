@@ -3312,19 +3312,23 @@ mod tests {
         let later = now + chrono::Duration::seconds(301);
         assert!(claude_gate_blocked_until(later).is_none());
 
-        // Success caches the snapshot; a later 429 serves it instead.
+        // Success caches the snapshot; a later OAuth 429 serves the display
+        // rows but drops the stale account scope before generic enrichment.
+        let scope = TestRefreshScope::new("claude", "cached-429");
+        let account_scope = scope
+            .resolve_current("fixture", "cached-429", b"cached-429-marker")
+            .unwrap();
         let snapshot = AgentUsageSnapshot {
             client_id: "claude".to_string(),
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity: None,
-            account_scope: Err(AccountScopeError::NoTrustedEvidence),
-            windows: vec![UsageWindow::from_used_percent(
+            account_scope: Ok(account_scope),
+            windows: vec![UsageWindow::from_provider_used_percent(
                 "Session".to_string(),
                 20.0,
-                None,
+                Some(now + chrono::Duration::hours(5)),
                 now,
-                Some(300),
             )
             .with_identity(
                 "session.v1",
@@ -3339,12 +3343,27 @@ mod tests {
         assert!(claude_gate_blocked_until(later).is_none());
         claude_gate_record_rate_limit(Some(later + chrono::Duration::seconds(60)), later);
         let until = claude_gate_blocked_until(later).unwrap();
-        let fallback = claude_gate_fallback(until, later);
+        let mut fallback = claude_gate_fallback(until, later);
         assert!(fallback.error.is_none());
         assert_eq!(fallback.windows.len(), 1);
+        assert!(matches!(
+            &fallback.account_scope,
+            Err(AccountScopeError::NoTrustedEvidence)
+        ));
+        let calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut fallback, later.timestamp(), |_, _, _| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            fallback.windows[0].pace_status.reason.as_deref(),
+            Some("accountScope")
+        );
 
         // Leave the gate clean for any other test touching the static.
         claude_gate_record_success(&snapshot);
+        scope.cleanup();
     }
 
     #[test]
@@ -3904,6 +3923,96 @@ mod tests {
     }
 
     #[test]
+    fn stage4_claude_json_and_headers_share_canonical_duration_contracts() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let reset = Some("2026-07-24T00:00:00Z".to_string());
+        let window = |utilization| ClaudeWindow {
+            utilization: Some(utilization),
+            resets_at: reset.clone(),
+        };
+        let usage = ClaudeUsageResponse {
+            five_hour: Some(window(5.0)),
+            seven_day: Some(window(10.0)),
+            seven_day_oauth_apps: Some(window(15.0)),
+            seven_day_sonnet: Some(window(20.0)),
+            seven_day_opus: Some(window(25.0)),
+            ..Default::default()
+        };
+        let windows = claude_windows(&usage, now);
+        let contracts = windows
+            .iter()
+            .map(|window| {
+                (
+                    window.card_id.as_str(),
+                    window.pace_status.window_key.as_deref(),
+                    window.duration_seconds,
+                    window.duration_source,
+                    window.pace_status.state,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contracts,
+            vec![
+                (
+                    "session.v1",
+                    Some("session.v1"),
+                    Some(18_000),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
+                (
+                    "weekly.v1",
+                    Some("weekly.v1"),
+                    Some(604_800),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
+                (
+                    "oauth_apps.weekly.v1",
+                    Some("oauth_apps.weekly.v1"),
+                    Some(604_800),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
+                (
+                    "sonnet.weekly.v1",
+                    Some("sonnet.weekly.v1"),
+                    Some(604_800),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
+                (
+                    "opus.weekly.v1",
+                    Some("opus.weekly.v1"),
+                    Some(604_800),
+                    Some(DurationSource::Contract),
+                    PaceState::LearningHistory,
+                ),
+            ]
+        );
+
+        let headers = header_map(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.11"),
+            ("anthropic-ratelimit-unified-5h-reset", "1783111200"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.6"),
+            ("anthropic-ratelimit-unified-7d-reset", "1783504800"),
+        ]);
+        let header_windows = parse_unified_ratelimit_windows(&headers, now);
+        assert_eq!(header_windows.len(), 2);
+        for (window, expected_key, expected_duration) in [
+            (&header_windows[0], "session.v1", 18_000),
+            (&header_windows[1], "weekly.v1", 604_800),
+        ] {
+            assert_eq!(window.card_id, expected_key);
+            assert_eq!(window.pace_status.window_key.as_deref(), Some(expected_key));
+            assert_eq!(window.duration_seconds, Some(expected_duration));
+            assert_eq!(window.duration_source, Some(DurationSource::Contract));
+            assert_eq!(window.pace_status.state, PaceState::LearningHistory);
+        }
+    }
+
+    #[test]
     fn decodes_claude_alias_windows_without_duplicate_error() {
         let raw = r#"{
             "five_hour": { "utilization": 5, "resets_at": "2026-05-28T14:00:00Z" },
@@ -3923,7 +4032,7 @@ mod tests {
     }
 
     #[test]
-    fn stage0_freezes_all_claude_weekly_alias_groups() {
+    fn stage4_claude_weekly_alias_groups_share_canonical_contracts() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let design_aliases = [
             "seven_day_design",
@@ -3935,7 +4044,8 @@ mod tests {
             "omelette_promotional",
         ];
         for alias in design_aliases {
-            let raw = format!(r#"{{"{alias}":{{"utilization":12,"resets_at":null}}}}"#);
+            let raw =
+                format!(r#"{{"{alias}":{{"utilization":12,"resets_at":"2026-07-24T00:00:00Z"}}}}"#);
             let usage: ClaudeUsageResponse = serde_json::from_str(&raw).unwrap();
             let windows = claude_windows(&usage, now);
             assert_eq!(windows.len(), 1, "claude.design.aliases: {alias}");
@@ -3943,11 +4053,19 @@ mod tests {
                 windows[0].label, "Designs",
                 "claude.design.aliases: {alias}"
             );
-            assert_eq!(windows[0].window_minutes, None);
+            assert_eq!(windows[0].card_id, "design.weekly.v1", "{alias}");
             assert_eq!(
-                windows[0].pace_status.reason.as_deref(),
-                Some("missingReset")
+                windows[0].pace_status.window_key.as_deref(),
+                Some("design.weekly.v1"),
+                "{alias}"
             );
+            assert_eq!(windows[0].duration_seconds, Some(604_800), "{alias}");
+            assert_eq!(
+                windows[0].duration_source,
+                Some(DurationSource::Contract),
+                "{alias}"
+            );
+            assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
         }
 
         let routines_aliases = [
@@ -3960,7 +4078,8 @@ mod tests {
             "cowork",
         ];
         for alias in routines_aliases {
-            let raw = format!(r#"{{"{alias}":{{"utilization":12,"resets_at":null}}}}"#);
+            let raw =
+                format!(r#"{{"{alias}":{{"utilization":12,"resets_at":"2026-07-24T00:00:00Z"}}}}"#);
             let usage: ClaudeUsageResponse = serde_json::from_str(&raw).unwrap();
             let windows = claude_windows(&usage, now);
             assert_eq!(windows.len(), 1, "claude.routines.aliases: {alias}");
@@ -3968,11 +4087,19 @@ mod tests {
                 windows[0].label, "Daily Routines",
                 "claude.routines.aliases: {alias}"
             );
-            assert_eq!(windows[0].window_minutes, None);
+            assert_eq!(windows[0].card_id, "routines.weekly.v1", "{alias}");
             assert_eq!(
-                windows[0].pace_status.reason.as_deref(),
-                Some("missingReset")
+                windows[0].pace_status.window_key.as_deref(),
+                Some("routines.weekly.v1"),
+                "{alias}"
             );
+            assert_eq!(windows[0].duration_seconds, Some(604_800), "{alias}");
+            assert_eq!(
+                windows[0].duration_source,
+                Some(DurationSource::Contract),
+                "{alias}"
+            );
+            assert_eq!(windows[0].pace_status.state, PaceState::LearningHistory);
         }
     }
 
@@ -4033,7 +4160,7 @@ mod tests {
     }
 
     #[test]
-    fn stage0_freezes_claude_extra_usage_missing_reset_baseline() {
+    fn stage4_claude_extra_usage_is_typed_missing_reset_and_skips_history() {
         let window = claude_extra_usage_window(Some(&ClaudeExtraUsage {
             is_enabled: true,
             monthly_limit: Some(10_000.0),
@@ -4043,13 +4170,47 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(window.label, "Extra usage");
+        assert_eq!(window.card_id, "extra_usage.v1");
         assert_eq!(window.used_percent, 25.0);
-        assert!(
-            window.resets_at.is_none(),
-            "claude.extra-usage.missing-reset"
+        assert!(window.resets_at.is_none());
+        assert_eq!(
+            window.pace_status.window_key.as_deref(),
+            Some("extra_usage.v1")
         );
-        assert!(window.window_minutes.is_none());
+        assert_eq!(window.pace_status.state, PaceState::Unavailable);
+        assert_eq!(window.pace_status.reason.as_deref(), Some("missingReset"));
+        assert!(window.duration_seconds.is_none());
         assert!(window.historical_pace.is_none());
+
+        let scope = TestRefreshScope::new("claude", "extra-usage");
+        let account_scope = scope
+            .resolve_current("fixture", "extra-usage", b"extra-usage-marker")
+            .unwrap();
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "claude".to_string(),
+            source: "oauth".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows: vec![window],
+            credits: None,
+            error: None,
+        };
+        let calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut snapshot, 1_700_000_000, |_, _, _| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::Unavailable
+        );
+        assert_eq!(
+            snapshot.windows[0].pace_status.reason.as_deref(),
+            Some("missingReset")
+        );
+        scope.cleanup();
     }
 
     fn header_map(pairs: &[(&'static str, &'static str)]) -> reqwest::header::HeaderMap {
