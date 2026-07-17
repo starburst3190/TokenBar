@@ -11,14 +11,18 @@
 //   {"ok":false,"err":"..."}       on failure
 // Payload fields use the Tauri frontend's camelCase contract. In particular,
 // AgentUsagePayload is `{generatedAt, agents, opencodeSubscriptions}` (the
-// subscription array is omitted when empty) and each quota window uses
-// `{label, usedPercent, remainingPercent, resetsAt,
-// resetText, windowMinutes, historicalPace}`. When historicalPace is present,
-// it is one nested result with `{expectedUsedPercent, etaSeconds,
-// willLastToReset, runOutProbability}`; missing/null historicalPace means the
-// Swift presentation layer uses its linear pace fallback. The nested result is
-// optional and its ETA/risk fields may be omitted or null. Other report
-// payloads retain their existing camelCase shapes from the Tauri contract.
+// subscription array is omitted when empty) and each v3 quota window uses
+// `{cardId, label, usedPercent, remainingPercent, resetsAt, resetText,
+// windowMinutes, paceStatus, historicalPace}`. `paceStatus` is required and
+// carries `{state, windowKey, durationSeconds, durationSource, completeCycles,
+// reason}`; positive durationSeconds is the pace calculation source of truth,
+// while windowMinutes is compatibility output derived by integer division.
+// historicalPace is present only for `available` and carries one coherent Rust
+// result: `{expectedUsedPercent, etaSeconds, willLastToReset,
+// runOutProbability}`. A legacy payload missing the entire paceStatus key is
+// not eligible for an implicit Linear fallback. ETA/risk remain optional inside
+// an available historical result. Other report payloads retain their existing
+// camelCase shapes from the Tauri contract.
 // tb_probe keeps its Phase 0 shape: {"ok":true,"messages":N} / {"ok":false,...}.
 //
 // `year` parameters may be NULL or "" for the all-time view, otherwise a

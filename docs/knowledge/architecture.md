@@ -4,8 +4,8 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-07-16
-sources: ["Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "Sources/TokenBarCore", "Sources/TokenBar", "vendor/README.md"]
+last_verified: 2026-07-17
+sources: ["Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/TokenBar", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md"]
 ---
 
 # Runtime architecture and data flow
@@ -112,13 +112,14 @@ Pricing and quota are separate flows. Vendored tokscale pricing resolves model c
 | Token counts, model cost, active days | Rust core and FFI reports | Decode and display; do not reprice raw sessions |
 | Price freshness | Vendored pricing service | Show the timestamp supplied by the model report |
 | OAuth or subscription windows | Rust FFI provider modules | Preserve last good data when refresh fails and display an actionable error only when no good value exists |
-| Tray quota selection | Swift `QuotaResolver` | Select from already decoded windows; do not make a second provider request |
-| Linear pace projections | Swift `TokenBarCore` | Derive elapsed／duration fallback from the current provider window |
-| Codex Weekly historical pace | Rust FFI v2 history evaluator | Decode one optional nested expected／ETA／will-last／risk result; derive display stage only, and use Linear when absent |
+| Quota account scope | Rust `agent_account_scope` | Treat the opaque scope as history identity only；do not derive it from labels、paths or token hashes |
+| Duration lifecycle and historical pace | Rust `agent_quota_duration` and `agent_quota_history` | Decode typed `paceStatus` and the optional coherent expected／ETA／will-last／risk result；do not recompute historical output |
+| Tray quota selection | Swift `QuotaResolver` | Select from already decoded windows by `clientId|cardId`；do not make a second provider request |
+| Linear pace policy | Swift `TokenBarCore` | Use Rust-owned positive `durationSeconds` only for explicit Linear mode or `learningHistory`；never revive `learningDuration`、`unavailable` or legacy payloads from `windowMinutes` |
 
 Authoritative provider-reported costs use the vendored cost-provenance contract. The local cache schema must be bumped whenever serialized message output changes, while report-time-only arithmetic changes do not require a cache bump.
 
-Codex Weekly history uses the dedicated `codex-weekly-history-v2.json` store. Rust normalizes and validates raw quota samples, admits only complete account-scoped weeks, and owns the coherent historical projection. The legacy v1 file is not a migration input and remains untouched; during the v2 learning period, Swift receives no historical result and uses the Linear calculation.
+Provider-wide history uses `quota-pace-history-v3.json` keyed by provider、opaque account scope and semantic window key. Rust owns duration evidence、sampling、retention、expected pace、ETA、will-last and risk；Swift owns mode selection、display stage and copy. The installation HMAC key is an exact 32-byte owner-only file in the hardened Application Support directory；the directory is `0700`、the file is `0600`、creation is atomic and cross-process locked、and every resolution reloads the persisted winner without a process cache. The old development Keychain item is ignored. Codex v2 remains read-only migration input for byte-exact current-account matches；v1 is never imported and both legacy files remain untouched.
 
 Pricing metadata is refreshable rather than frozen for the process lifetime; the current refresh cadence is approximately one hour. When provider-hinted lookup selects an entry without cache rates, local cache-rate backfill preserves the correct cache pricing.
 

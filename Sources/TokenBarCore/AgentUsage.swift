@@ -3,6 +3,13 @@ import Foundation
 // OAuth quota cards (`AgentUsagePayload` in the Tauri frontend's
 // src/lib/agentUsage.ts).
 
+private let legacyPacePresentationID = "legacy.missing.v1"
+private let maxPaceDurationSeconds: Int64 = 400 * 86_400
+
+private func paceDataCorrupted(_ decoder: Decoder, _ message: String) -> DecodingError {
+    .dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: message))
+}
+
 public struct AgentIdentity: Decodable, Sendable {
     public let email: String?
     public let plan: String?
@@ -25,38 +32,433 @@ public struct HistoricalPace: Decodable, Sendable {
         willLastToReset: Bool,
         runOutProbability: Double? = nil
     ) {
+        precondition(
+            Self.validationError(
+                expectedUsedPercent: expectedUsedPercent,
+                etaSeconds: etaSeconds,
+                willLastToReset: willLastToReset,
+                runOutProbability: runOutProbability
+            ) == nil,
+            "invalid HistoricalPace"
+        )
         self.expectedUsedPercent = expectedUsedPercent
         self.etaSeconds = etaSeconds
         self.willLastToReset = willLastToReset
         self.runOutProbability = runOutProbability
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case expectedUsedPercent, etaSeconds, willLastToReset, runOutProbability
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let expected = try container.decode(Double.self, forKey: .expectedUsedPercent)
+        let eta = try container.decodeIfPresent(Double.self, forKey: .etaSeconds)
+        let willLast = try container.decode(Bool.self, forKey: .willLastToReset)
+        let probability = try container.decodeIfPresent(Double.self, forKey: .runOutProbability)
+
+        if let message = Self.validationError(
+            expectedUsedPercent: expected,
+            etaSeconds: eta,
+            willLastToReset: willLast,
+            runOutProbability: probability
+        ) {
+            throw paceDataCorrupted(decoder, message)
+        }
+
+        self.expectedUsedPercent = expected
+        self.etaSeconds = eta
+        self.willLastToReset = willLast
+        self.runOutProbability = probability
+    }
+
+    private static func validationError(
+        expectedUsedPercent: Double,
+        etaSeconds: Double?,
+        willLastToReset: Bool,
+        runOutProbability: Double?
+    ) -> String? {
+        guard expectedUsedPercent.isFinite, (0...100).contains(expectedUsedPercent) else {
+            return "historical expectedUsedPercent is out of range"
+        }
+        if let etaSeconds, (!etaSeconds.isFinite || etaSeconds < 0) {
+            return "historical etaSeconds is invalid"
+        }
+        if let runOutProbability, (!runOutProbability.isFinite || !(0...1).contains(runOutProbability)) {
+            return "historical runOutProbability is invalid"
+        }
+        guard (etaSeconds == nil) == willLastToReset else {
+            return "historical etaSeconds and willLastToReset contradict"
+        }
+        return nil
+    }
+}
+
+public enum UsagePaceState: String, Decodable, Sendable, Equatable {
+    case learningDuration
+    case learningHistory
+    case available
+    case unavailable
+    /// Internal marker used only when the complete `paceStatus` key is absent.
+    case legacyMissing
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        guard let value = Self(rawValue: raw), value != .legacyMissing else {
+            throw paceDataCorrupted(decoder, "unknown or internal pace state")
+        }
+        self = value
+    }
+}
+
+public enum UsagePaceDurationSource: String, Decodable, Sendable, Equatable {
+    case provider
+    case contract
+    case observed
+}
+
+public enum UsagePaceUnavailableReason: String, Decodable, Sendable, Equatable {
+    case windowIdentity
+    case missingReset
+    case invalidEvidence
+    case accountScope
+    case storeCapacity
+    case history
+    case nonRecurring
+}
+
+/// The typed Rust v3 pace status nested inside one quota window.
+public struct PaceStatus: Decodable, Sendable, Equatable {
+    public let state: UsagePaceState
+    public let windowKey: String?
+    public let durationSeconds: Int64?
+    public let durationSource: UsagePaceDurationSource?
+    public let completeCycles: Int
+    public let reason: UsagePaceUnavailableReason?
+
+    public init(
+        state: UsagePaceState,
+        windowKey: String? = nil,
+        durationSeconds: Int64? = nil,
+        durationSource: UsagePaceDurationSource? = nil,
+        completeCycles: Int = 0,
+        reason: UsagePaceUnavailableReason? = nil
+    ) {
+        precondition(
+            Self.validationError(
+                state: state,
+                windowKey: windowKey,
+                durationSeconds: durationSeconds,
+                durationSource: durationSource,
+                completeCycles: completeCycles,
+                reason: reason
+            ) == nil,
+            "invalid PaceStatus"
+        )
+        self.state = state
+        self.windowKey = windowKey
+        self.durationSeconds = durationSeconds
+        self.durationSource = durationSource
+        self.completeCycles = completeCycles
+        self.reason = reason
+    }
+
+    public static let legacyMissing = PaceStatus(
+        state: .legacyMissing,
+        completeCycles: 0
+    )
+
+    private enum CodingKeys: String, CodingKey {
+        case state, windowKey, durationSeconds, durationSource, completeCycles, reason
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let state = try container.decode(UsagePaceState.self, forKey: .state)
+        let windowKey = try container.decodeIfPresent(String.self, forKey: .windowKey)
+        let duration = try container.decodeIfPresent(Int64.self, forKey: .durationSeconds)
+        let source = try container.decodeIfPresent(
+            UsagePaceDurationSource.self, forKey: .durationSource)
+        let completeCycles = try container.decode(Int.self, forKey: .completeCycles)
+        let reason = try container.decodeIfPresent(
+            UsagePaceUnavailableReason.self, forKey: .reason)
+
+        if let message = Self.validationError(
+            state: state,
+            windowKey: windowKey,
+            durationSeconds: duration,
+            durationSource: source,
+            completeCycles: completeCycles,
+            reason: reason
+        ) {
+            throw paceDataCorrupted(decoder, message)
+        }
+
+        self.state = state
+        self.windowKey = windowKey
+        self.durationSeconds = duration
+        self.durationSource = source
+        self.completeCycles = completeCycles
+        self.reason = reason
+    }
+
+    private static func validationError(
+        state: UsagePaceState,
+        windowKey: String?,
+        durationSeconds: Int64?,
+        durationSource: UsagePaceDurationSource?,
+        completeCycles: Int,
+        reason: UsagePaceUnavailableReason?
+    ) -> String? {
+        if state == .legacyMissing {
+            return (windowKey == nil && durationSeconds == nil && durationSource == nil
+                && completeCycles == 0 && reason == nil) ? nil : "legacy pace status has fields"
+        }
+        guard completeCycles >= 0 else { return "pace completeCycles must be non-negative" }
+
+        let identityUnavailable = state == .unavailable && reason == .windowIdentity
+        if (windowKey == nil) != identityUnavailable {
+            return "pace windowKey identity invariant failed"
+        }
+        if let windowKey, windowKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "pace windowKey must be non-empty"
+        }
+
+        if let durationSeconds {
+            guard durationSeconds > 0, durationSeconds <= maxPaceDurationSeconds else {
+                return "pace durationSeconds is out of range"
+            }
+            guard durationSource != nil else {
+                return "pace durationSource is required with durationSeconds"
+            }
+        } else if durationSource != nil
+                    && !(state == .learningDuration && durationSource == .observed) {
+            return "pace durationSource requires a duration"
+        }
+
+        switch state {
+        case .learningDuration:
+            guard durationSeconds == nil, reason == nil else {
+                return "learningDuration pace invariant failed"
+            }
+        case .learningHistory:
+            guard durationSeconds != nil, durationSource != nil, reason == nil else {
+                return "learningHistory pace invariant failed"
+            }
+        case .available:
+            guard durationSeconds != nil, durationSource != nil, reason == nil else {
+                return "available pace invariant failed"
+            }
+        case .unavailable:
+            guard reason != nil else { return "unavailable pace requires a reason" }
+            if durationSeconds == nil, durationSource != nil {
+                return "unavailable durationSource requires a duration"
+            }
+        case .legacyMissing:
+            return "legacy pace status is not a v3 wire state"
+        }
+        if state != .unavailable, reason != nil {
+            return "non-unavailable pace cannot have a reason"
+        }
+        return nil
+    }
 }
 
 public struct UsageWindow: Decodable, Sendable {
+    public let cardId: String
     public let label: String
     public let usedPercent: Double
     public let remainingPercent: Double
     public let resetsAt: String?
     public let resetText: String?
-    /// Total window length in minutes; enables pace (expected vs actual).
+    /// Legacy compatibility only. V3 pace calculations use `durationSeconds`.
     public let windowMinutes: Int64?
+    /// Exact v3 quota-window duration. Never inferred from legacy `windowMinutes`.
+    public let durationSeconds: Int64?
+    /// Typed v3 pace state, or the internal marker for an absent whole key.
+    public let paceStatus: PaceStatus
     /// Backend-owned historical projection, present only when enough complete
-    /// weeks exist. Missing or null means Swift uses its linear calculation.
+    /// cycles exist. Missing or null is state-dependent in the v3 contract.
     public let historicalPace: HistoricalPace?
 
-    // Memberwise init so --selftest can build fixture windows.
+    // Defaults preserve existing pure Swift linear fixtures. A v3 status is
+    // validated below; the legacy default deliberately does not derive a
+    // duration from windowMinutes.
     public init(
         label: String, usedPercent: Double, remainingPercent: Double,
         resetsAt: String? = nil, resetText: String? = nil,
-        windowMinutes: Int64? = nil, historicalPace: HistoricalPace? = nil
+        windowMinutes: Int64? = nil, historicalPace: HistoricalPace? = nil,
+        cardId: String? = nil, durationSeconds: Int64? = nil,
+        paceStatus: PaceStatus = .legacyMissing
     ) {
+        precondition(
+            Self.usagePercentageValidationError(
+                usedPercent: usedPercent,
+                remainingPercent: remainingPercent
+            ) == nil,
+            "invalid UsageWindow percentages"
+        )
+        let resolvedCardId = cardId ?? legacyPacePresentationID
+        if paceStatus.state == .legacyMissing {
+            precondition(durationSeconds == nil, "legacy pace cannot carry durationSeconds")
+        } else {
+            precondition(cardId != nil && !resolvedCardId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                        "v3 pace requires a non-empty cardId")
+            let resolvedDuration = durationSeconds ?? paceStatus.durationSeconds
+            precondition(resolvedDuration == paceStatus.durationSeconds,
+                        "top-level and nested durationSeconds differ")
+            precondition(Self.v3ValidationError(
+                paceStatus: paceStatus,
+                windowMinutes: windowMinutes,
+                durationSeconds: resolvedDuration,
+                historicalPace: historicalPace
+            ) == nil, "invalid UsageWindow pace invariants")
+            self.durationSeconds = resolvedDuration
+            self.cardId = resolvedCardId
+            self.label = label
+            self.usedPercent = usedPercent
+            self.remainingPercent = remainingPercent
+            self.resetsAt = resetsAt
+            self.resetText = resetText
+            self.windowMinutes = windowMinutes
+            self.paceStatus = paceStatus
+            self.historicalPace = historicalPace
+            return
+        }
+
+        self.cardId = resolvedCardId
         self.label = label
         self.usedPercent = usedPercent
         self.remainingPercent = remainingPercent
         self.resetsAt = resetsAt
         self.resetText = resetText
         self.windowMinutes = windowMinutes
+        self.durationSeconds = nil
+        self.paceStatus = .legacyMissing
         self.historicalPace = historicalPace
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case cardId, label, usedPercent, remainingPercent, resetsAt, resetText
+        case windowMinutes, paceStatus, historicalPace
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let label = try container.decode(String.self, forKey: .label)
+        let usedPercent = try container.decode(Double.self, forKey: .usedPercent)
+        let remainingPercent = try container.decode(Double.self, forKey: .remainingPercent)
+        let resetsAt = try container.decodeIfPresent(String.self, forKey: .resetsAt)
+        let resetText = try container.decodeIfPresent(String.self, forKey: .resetText)
+        let windowMinutes = try container.decodeIfPresent(Int64.self, forKey: .windowMinutes)
+        let historicalPace = try container.decodeIfPresent(HistoricalPace.self, forKey: .historicalPace)
+
+        if let message = Self.usagePercentageValidationError(
+            usedPercent: usedPercent,
+            remainingPercent: remainingPercent
+        ) {
+            throw paceDataCorrupted(decoder, message)
+        }
+
+        if container.contains(.paceStatus) {
+            let cardId = try container.decode(String.self, forKey: .cardId)
+            guard !cardId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw paceDataCorrupted(decoder, "v3 pace requires a non-empty cardId")
+            }
+            // `decode`, not `decodeIfPresent`, intentionally makes null fail.
+            let paceStatus = try container.decode(PaceStatus.self, forKey: .paceStatus)
+            if let message = Self.v3ValidationError(
+                paceStatus: paceStatus,
+                windowMinutes: windowMinutes,
+                durationSeconds: paceStatus.durationSeconds,
+                historicalPace: historicalPace
+            ) {
+                throw paceDataCorrupted(decoder, message)
+            }
+            self.cardId = cardId
+            self.label = label
+            self.usedPercent = usedPercent
+            self.remainingPercent = remainingPercent
+            self.resetsAt = resetsAt
+            self.resetText = resetText
+            self.windowMinutes = windowMinutes
+            self.durationSeconds = paceStatus.durationSeconds
+            self.paceStatus = paceStatus
+            self.historicalPace = historicalPace
+            return
+        }
+
+        let cardId: String?
+        if container.contains(.cardId) {
+            cardId = try container.decode(String.self, forKey: .cardId)
+            if cardId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+                throw paceDataCorrupted(decoder, "legacy pace cardId must be non-empty")
+            }
+        } else {
+            cardId = nil
+        }
+        self.cardId = cardId ?? legacyPacePresentationID
+        self.label = label
+        self.usedPercent = usedPercent
+        self.remainingPercent = remainingPercent
+        self.resetsAt = resetsAt
+        self.resetText = resetText
+        self.windowMinutes = windowMinutes
+        self.durationSeconds = nil
+        self.paceStatus = .legacyMissing
+        self.historicalPace = historicalPace
+    }
+
+    private static func usagePercentageValidationError(
+        usedPercent: Double,
+        remainingPercent: Double
+    ) -> String? {
+        guard usedPercent.isFinite, remainingPercent.isFinite,
+              (0...100).contains(usedPercent), (0...100).contains(remainingPercent) else {
+            return "usage percentages are out of range"
+        }
+        guard abs(usedPercent + remainingPercent - 100) < 0.000_001 else {
+            return "usage percentages must sum to 100"
+        }
+        return nil
+    }
+
+    private static func v3ValidationError(
+        paceStatus: PaceStatus,
+        windowMinutes: Int64?,
+        durationSeconds: Int64?,
+        historicalPace: HistoricalPace?
+    ) -> String? {
+        if let durationSeconds {
+            guard windowMinutes == durationSeconds / 60 else {
+                return "pace windowMinutes must derive from durationSeconds"
+            }
+        } else if windowMinutes != nil {
+            return "pace windowMinutes requires durationSeconds"
+        }
+
+        switch paceStatus.state {
+        case .available:
+            guard let durationSeconds, durationSeconds > 0, historicalPace != nil else {
+                return "available pace requires duration and historicalPace"
+            }
+        case .learningHistory:
+            guard let durationSeconds, durationSeconds > 0, historicalPace == nil else {
+                return "learningHistory pace invariant failed"
+            }
+        case .learningDuration:
+            guard durationSeconds == nil, historicalPace == nil else {
+                return "learningDuration pace invariant failed"
+            }
+        case .unavailable:
+            guard historicalPace == nil else {
+                return "unavailable pace cannot carry historicalPace"
+            }
+        case .legacyMissing:
+            return "legacy pace status cannot appear in v3 wire"
+        }
+        return nil
     }
 }
 
@@ -73,6 +475,14 @@ public struct AgentUsageSnapshot: Decodable, Sendable {
     public let windows: [UsageWindow]
     public let credits: CreditsSnapshot?
     public let error: String?
+
+    /// Order-preserving card view shared by quota resolvers and consumers.
+    /// A duplicate card ID is fail-closed after the first occurrence; labels
+    /// never repair or disambiguate a card collision.
+    public var uniqueCardWindows: [UsageWindow] {
+        var seen = Set<String>()
+        return windows.filter { seen.insert($0.cardId).inserted }
+    }
 }
 
 public struct AgentUsagePayload: Decodable, Sendable {

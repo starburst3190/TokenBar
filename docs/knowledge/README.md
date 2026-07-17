@@ -4,7 +4,7 @@ id: kb-index
 kind: index
 scope: repository
 read_when: before any TokenBar task or handoff
-last_verified: 2026-07-16
+last_verified: 2026-07-17
 sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swift", ".github/workflows/ci.yml", ".github/workflows/pages.yml", ".github/workflows/release.yml", ".github/workflows/update-install-count.yml"]
 ---
 
@@ -36,7 +36,7 @@ sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swif
 | 架構、FFI、資料流 | [`architecture.md`](architecture.md) | [`verification.md`](verification.md) |
 | 分支、PR、merge、授權 | [`workflow.md`](workflow.md) | [`communication.md`](communication.md) |
 | 測試、fixture、cache、跨語言契約 | [`verification.md`](verification.md) | [`architecture.md`](architecture.md) |
-| Codex Weekly historical pace | [`plans/codex-historical-pace-v2.md`](plans/codex-historical-pace-v2.md) | [`architecture.md`](architecture.md)、[`verification.md`](verification.md) |
+| Provider quota pace／historical calculation | [`plans/provider-quota-pace.md`](plans/provider-quota-pace.md) | [`plans/codex-historical-pace-v2.md`](plans/codex-historical-pace-v2.md)、[`architecture.md`](architecture.md)、[`verification.md`](verification.md) |
 | tokscale sync 或 vendor patch | [`vendor-tokscale.md`](vendor-tokscale.md) | [`vendor/README.md`](../../vendor/README.md) |
 | Sparkle、appcast、Homebrew、Pages | [`release.md`](release.md) | [`workflow.md`](workflow.md) |
 | 維護期優先順序 | [`current-state.md`](current-state.md) | [`history/README.md`](history/README.md) |
@@ -74,6 +74,7 @@ docs/knowledge/
 └── plans/
     ├── README.md
     ├── codex-historical-pace-v2.md
+    ├── provider-quota-pace.md
     └── tokscale-alignment.md
 ```
 

@@ -4,8 +4,8 @@ id: kb-current-state
 kind: canonical
 scope: repository
 read_when: starting work, triaging an issue, or deciding whether an upstream item is urgent
-last_verified: 2026-07-16
-sources: ["public GitHub main history", "public issue #45", "vendor/README.md", "docs/knowledge/history/README.md", "docs/knowledge/plans/tokscale-alignment.md", "docs/knowledge/plans/codex-historical-pace-v2.md"]
+last_verified: 2026-07-17
+sources: ["public GitHub main history", "public issue #45", "vendor/README.md", "docs/knowledge/history/README.md", "docs/knowledge/plans/tokscale-alignment.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "docs/knowledge/plans/provider-quota-pace.md"]
 ---
 
 # Current state
@@ -57,7 +57,7 @@ Setup-token quota fallback is shipped: when profile usage is unavailable, provid
 
 | Workstream | Status | Public surface |
 |---|---|---|
-| Codex historical pace v2 | Native implementation complete: clean v2 history leaves v1 untouched, Rust owns one coherent expected／ETA／will-last／risk result, and Swift falls back to Linear while learning; Windows nested DTO parity remains a downstream handoff | [`plans/codex-historical-pace-v2.md`](plans/codex-historical-pace-v2.md) |
+| Provider-wide quota pace | Mac implementation is complete through Stage 6 on the task branch：provider／contract／observed duration、generic v3 history、five provider adapters、typed Swift lifecycle／card-ID selection／Historical-only deficit presentation，以及 Rust serializer-locked cross-port fixture。Stage 7 live smoke揭露ad-hoc build無法穩定存取legacy Keychain ACL；尚未出貨的account-scope installation key已改為hardened Application Support內的exact 32-byte、directory `0700`／file `0600`、atomic且cross-process locked file，舊開發item只忽略。Security regressions、Rust workspace tests／Clippy、Rust→Swift build、Swift selftest、docs gates、storage fresh verifier與重新授權的monitored live smoke已通過；smoke未顯示authorization UI，live storage metadata為directory `0700`／file `0600`／exact 32 bytes。明示 `FIXTURE` 的 deterministic popover 已完成 Historical／Linear／Off 驗收：learningDuration 與 typed unavailable 不產生 projection、learningHistory 只使用灰色 Linear estimate、只有 available historical deficit 帶橘色 pace marker／文案；quota 長條的低餘額黃色維持獨立健康訊號。最終 post-GUI fresh verifier 已回傳 `CONFIRMED`，Windows port／parity維持 pending | [`plans/provider-quota-pace.md`](plans/provider-quota-pace.md)、[`plans/codex-historical-pace-v2.md`](plans/codex-historical-pace-v2.md) |
 | Copilot upstream follow-up | Assessment complete: merged PR #880 is equivalent to the local M10-E trace-scoped hierarchy and cache invalidation; no additional code or schema port is needed | [issue #879](https://github.com/junhoyeo/tokscale/issues/879), [PR #880](https://github.com/junhoyeo/tokscale/pull/880) |
 | Rolling tokscale alignment | The current correctness batch is integrated through M14; the inventory remains active and future work stays selective, not wholesale | [issue #45](https://github.com/Nanako0129/TokenBar/issues/45), [`plans/tokscale-alignment.md`](plans/tokscale-alignment.md) |
 | Day-bar empty-today behavior | Parked, because changing the right edge changes the visible chart and needs a focused fixture plus UI verification | No public commitment beyond the maintenance note |

@@ -158,7 +158,7 @@ final class TrayAnimator {
     /// Pure read: it updates the in-memory cache but does NOT write
     /// UserDefaults — persisting here (a side effect inside a getter that
     /// renderGaugeIcon / applyTitle call on every observer pass) re-posted
-    /// didChangeNotification and re-entered the observers. `persistRemaining()`
+    /// didChangeNotification and re-entered the observers. `persistQuotaState()`
     /// is called explicitly when fresh quota data arrives instead.
     var quotaRemaining: Double? {
         let persistedSelection = UserDefaults.standard.string(forKey: Self.quotaSourceKey)
@@ -167,8 +167,7 @@ final class TrayAnimator {
         let selection = QuotaSelectionPolicy.effectiveSelection(
             payload: quota,
             persistedSelection: persistedSelection,
-            excluding: excluded,
-            fallbackUnknownExplicit: source.fallsBackUnknownQuotaSelectionToAuto)
+            excluding: excluded)
         if let value = QuotaResolver.resolve(
             payload: quota, selection: selection, excluding: excluded)?
             .window.remainingPercent
@@ -190,16 +189,23 @@ final class TrayAnimator {
         return cachedQuotaRemaining
     }
 
-    /// Persist the last good remaining percent so a live-mode relaunch shows it
-    /// immediately. Demo mode is deliberately process-local and returns before
-    /// touching UserDefaults. Called at quota-arrival points, not from the
-    /// getter. Reads `quotaRemaining` (not `cachedQuotaRemaining`) so it
+    /// Persist a proven legacy-label migration and the last good remaining
+    /// percent when fresh live quota data arrives. Demo mode remains entirely
+    /// process-local. Reads `quotaRemaining` (not `cachedQuotaRemaining`) so it
     /// resolves the fresh value even for cat/parrot styles, where
     /// `renderGaugeIcon()` returns early without touching the cache.
-    private func persistRemaining() {
+    private func persistQuotaState() {
         guard source.allowsQuotaCachePersistence else { return }
+        let defaults = UserDefaults.standard
+        let persistedSelection = defaults.string(forKey: Self.quotaSourceKey)
+            ?? QuotaResolver.auto
+        if let migrated = QuotaSelectionPolicy.migrationToPersist(
+            payload: quota, persistedSelection: persistedSelection)
+        {
+            defaults.set(migrated, forKey: Self.quotaSourceKey)
+        }
         if let value = quotaRemaining {
-            UserDefaults.standard.set(value, forKey: Self.lastRemainingKey)
+            defaults.set(value, forKey: Self.lastRemainingKey)
         }
     }
 
@@ -271,7 +277,7 @@ final class TrayAnimator {
                 if let payload {
                     self.quota = payload
                     self.renderGaugeIcon() // refreshes cachedQuotaRemaining
-                    self.persistRemaining()
+                    self.persistQuotaState()
                     self.onQuotaUpdated?()
                 }
                 try? await Task.sleep(for: .seconds(300))

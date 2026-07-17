@@ -1,11 +1,13 @@
 ---
-status: active
+status: superseded
 id: kb-plan-codex-historical-pace-v2
 kind: plan
 scope: repository
 read_when: implementing or reviewing Codex weekly historical pace v2
-last_verified: 2026-07-16
-sources: ["crates/tb_core_ffi/src/agent_history.rs", "crates/tb_core_ffi/src/agent_usage.rs", "Sources/TokenBarCore/AgentUsage.swift", "Sources/TokenBarCore/UsagePace.swift", "Sources/CrossCheckHarness/main.swift", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public CodexBar PR #901", "public CodexBar PR #1581"]
+last_verified: 2026-07-17
+sources: ["crates/tb_core_ffi/src/agent_history.rs", "crates/tb_core_ffi/src/agent_usage.rs", "Sources/TokenBarCore/AgentUsage.swift", "Sources/TokenBarCore/UsagePace.swift", "Sources/CrossCheckHarness/main.swift", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "docs/knowledge/plans/provider-quota-pace.md", "public CodexBar PR #901", "public CodexBar PR #1581"]
+superseded_by: provider-quota-pace.md
+superseded_on: 2026-07-17
 ---
 
 # Codex historical pace v2 clean-start plan
@@ -13,6 +15,8 @@ sources: ["crates/tb_core_ffi/src/agent_history.rs", "crates/tb_core_ffi/src/age
 ## 文件目的
 
 這份計畫修正 Codex Weekly historical pace 會因不穩定的 reset timestamp 與不完整歷史群組而錯誤顯示 `Lasts until reset` 的問題。實作採用新的 v2 history store，完全不讀取、改寫或刪除既有 v1 history；所有使用者從乾淨資料重新學習，資料不足時自動使用 Linear pace。
+
+> **後續範圍：** 本計畫已成為 Codex Weekly 的 implemented foundation，不是 provider-wide completion。所有 provider quota cards 的 duration、identity、learning state 與 generic v3 history 由 [`provider-quota-pace.md`](provider-quota-pace.md) 接手。
 
 > **已鎖定決策：** v1 不做 migration。v2 只從新版收集的可信 raw samples 建立 historical curve；舊檔保留作為 rollback 與診斷材料，但不再影響新版本的計算。
 

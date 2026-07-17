@@ -4,8 +4,8 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-07-16
-sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "crates/tb_core_ffi/src/agent_history.rs", "docs/knowledge/plans/codex-historical-pace-v2.md", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
+last_verified: 2026-07-17
+sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_history.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
 # Verification contract
@@ -49,7 +49,8 @@ sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "scripts/bund
 | Sibling-only write | 預設 fingerprint 不失效；完整 fingerprint、mtime probe、prune 都失效 |
 | Provider cost | 缺失成本可估算；明確 provider-reported 成本不可被 stale pricing 覆蓋 |
 | Hidden client | non-empty partial selection 在 Rust fold 前排除未選 client；`nil`／empty clients 依 C ABI contract 代表 all clients；all-hidden 由 Swift lens strict membership 阻擋 |
-| Quota history | Reset jitter、floating zero、partial／future-reset weeks、account isolation、corrupt recovery 與 current-actual shift 都以 temporary v2 store 驗證；live provider refresh 只作 smoke |
+| Quota account scope | 以temporary Application Support驗證exact 32-byte key、directory `0700`／file `0600`、每次reload、cross-process winner、symlink／non-regular／inode swap fail-closed、key-loss orphan recovery、atomic failure與raw-value scan；不得呼叫真實Keychain或provider credential |
+| Quota history | Reset jitter、floating zero、duration lifecycle、partial／future-reset cycles、active-series capacity、account isolation、corrupt recovery與current-actual shift都以temporary v3 store驗證；Codex v2只驗byte-exact current-account migration，live provider refresh只作smoke |
 | Overflow input | old arithmetic fails or wraps in the targeted site；new saturating path remains bounded |
 | Cache schema | 舊版本 cache 不被當成新 layout 靜默接受；新 layout 可重建並 reload |
 
@@ -79,12 +80,15 @@ swift run TokenBar --smoke
 
 `cargo test` and `cargo clippy --workspace --all-targets` are local full code-change gates; this document does not claim that the current CI workflow runs them. The `--all-targets` flag is required because `vendor/tokscale-core/src/lib.rs` declares `#![deny(clippy::all)]`, so a test-only lint can fail the gate even when the library target itself is clean.
 
+Live account-scope smoke必須在hermetic security suite通過後才執行，且每次重新執行都需要當次明確授權。若出現任何Keychain或credential授權視窗，立即停止process並把smoke判為失敗；不得要求輸入登入密碼、讀取secret或用真實credential診斷。
+
 | Gate | Expected evidence |
 |---|---|
 | Rust | Release static library builds from the current source |
 | Swift | SwiftPM links against the freshly built library from repository root |
 | Selftest | UI-free TokenBarCore assertions pass |
-| Smoke | Every C ABI entry point decodes or reports an intentional error envelope |
+| Smoke | Every C ABI entry point decodes or reports an intentional error envelope；account-scope path不得存取Keychain或顯示credential authorization UI |
+| Account-scope storage | Hermetic security tests先證明permission、path、locking、atomicity與recovery；live smoke只驗證shipping data flow不彈授權UI，不取代fixture correctness |
 | Relink safety | If Rust changed without Swift source changes, the stale executable is removed before linking |
 | Rust format | For Rust changes, run `cargo fmt --all -- --check` on the touched scope; vendor formatting policy may be intentionally separate |
 | Local Rust tests | `cargo test` passes across workspace crates and test targets |
@@ -93,6 +97,8 @@ swift run TokenBar --smoke
 ## Local build and UX acceptance
 
 不需要 `.app` bundle 語意的人工 UI 檢查，優先從 repository root 執行 `swift run TokenBar --open-popover`。只有 icon、`Info.plist`、`LSUIElement`、Sparkle、autostart 或安裝路徑等 bundle-only 行為，才以 `make bundle` 產生的 `dist/TokenBar.app` 驗收。
+
+Provider quota pace 以 `swift run TokenBar --demo --open-popover` 提供 deterministic 人工驗收面；snapshot badge 明示 `FIXTURE`，且 `DemoUsageDataSource` 不呼叫 live FFI、不讀寫 quota cache。Historical／Linear／Off 都要實際呈現；驗收時必須區分低 remaining 觸發的 quota 長條黃／紅健康色，與只有 `available` historical deficit 才可使用的 pace marker／footer 橘色。
 
 > **本機 bundle 邊界：** `dist/TokenBar.app` 是暫時的驗收產物，不是第二份安裝。日常使用與正式更新的 source of truth 仍是 `/Applications/TokenBar.app`。
 
@@ -147,7 +153,7 @@ A source reader that consumes secondary files must be verified as one unit. The 
 | Client filter | Non-empty selected IDs reach Rust before mixed buckets are folded; `nil`／empty client lists mean all clients per `ctb.h`; the Swift lens strict-membership check blocks all-hidden views |
 | Arithmetic | Rust report totals, FFI mappers, Swift models, and live-rate consumers use bounded arithmetic where required |
 | Stale-data policy | A failed refresh retains the last good value instead of blanking a working card |
-| Historical pace | Rust 的 optional nested result 同時擁有 expected、ETA、will-last 與 risk；Swift 只能導出 stage／文字，result 缺席時才使用 Linear |
+| Historical pace | Rust 的 typed `paceStatus` 擁有 lifecycle／duration，optional nested result 同時擁有 expected、ETA、will-last 與 risk；Swift 只能導出 mode policy、stage 與文字。只有 `learningHistory` 可明示使用 exact-duration Linear estimate，`learningDuration`／`unavailable`／legacy 不得 silent fallback |
 | Lifecycle | Closing a popover or settings window cancels its tasks and stops background rendering |
 
 ## Cross-port fixture cross-check
@@ -156,14 +162,16 @@ Windows port（[Nanako0129/TokenBar-Windows](https://github.com/Nanako0129/Token
 
 | 項目 | 內容 |
 |---|---|
-| Swift harness | [`Sources/CrossCheckHarness/main.swift`](../../Sources/CrossCheckHarness/main.swift)，`TZ=Asia/Taipei swift run crosscheck-harness <fixtures> <out>`；經 symlink 編入 app target 的 `Format.swift`，測的是 shipping 程式碼 |
-| 契約與 fixture | Windows repo 的 `crosscheck/`（README＝schema 契約；fixture 以 FFI wire 編碼，兩邊都用 production decoder，無自製映射） |
+| Swift harness | [`Sources/CrossCheckHarness/main.swift`](../../Sources/CrossCheckHarness/main.swift)，`TZ=Asia/Taipei swift run crosscheck-harness <fixtures> <out> [usage-pace|format|provider-quota-pace-v3]`；selector 省略時維持 legacy complete run，所有路徑使用 shipping 程式碼 |
+| 契約與 fixture | Windows repo 的 legacy `crosscheck/` 保留既有 116-case reference；provider v3 handoff 由 Mac-owned [`provider-quota-pace-v3.json`](../../Fixtures/CrossCheck/provider-quota-pace-v3.json) 提供，Rust production serializer 鎖定 payload，Swift／未來 Windows 都必須用 production decoder，無自製 wire mapping |
 | 比對 | Windows repo 的 `crosscheck/diff.py`：字串逐 byte、數字 epsilon 1e-9、缺鍵視同 null |
 | 執行時機 | `Sources/TokenBarCore` 邏輯或 `Format` 語意變更後；Windows repo 每次 re-sync 或 delta 移植後 |
 
 > 首輪實績（2026-07-16）：首跑 115 案例抓到 4 條 printf 捨入 seam 的真實漂移——C# 側以 `Math.Round` 預捨入模擬 `%.nf` 會把非 midpoint 的近半值重新量化；printf 對二進位真值做正確捨入。教訓：**模擬 printf 的中介捨入層一律可疑**。修正與後續 comparator 強化（整數精確比對、bool 嚴格比對、Int64 邊界案例——fixture 現為 116 案）都記錄在 Windows repo。
 
 > Historical pace v2 checkpoint（2026-07-16）：116-case legacy baseline 已重跑，非 historical cases 全數一致。27 個 field differences 只分布在 9 個使用舊 top-level historical scalars 的 cases：`historical-expected-clamped`、`historical-runout-exact-half`、`historical-runout-high-keeps-eta`、`historical-runout-low-forces-lasts`、`historical-with-expected`、`runout-risk-certain`、`runout-risk-clamped-above-one`、`runout-risk-half-percent-rounds-up`、`runout-risk-thirty`。這些是 nested contract 取代 scalar contract 的 intended mismatch；Windows 新增 nested fixture／DTO 並完成 semantic port 前，不得宣稱 historical parity。
+>
+> Provider-wide v3 checkpoint（2026-07-17）：no-selector Mac harness 以 production decoder 完整產生 42 pace＋74 format cases，不再因單一 malformed legacy row 中止。Format 74 cases 與現有 C# reference 零差異；pace 有 43 個 field differences，分布在 28／42 cases。差異來自三個 intended contract 變更：整個 `paceStatus` 缺失不再以 `windowMinutes` 恢復 Linear、舊 top-level historical／risk scalars 不再驅動結果，以及 2 個越界百分比 rows 現在明示 `rejected: true`。Mac-owned v3 fixture 另有 7 張 lifecycle windows 與 12 個 projection／selection／legacy／malformed cases，payload 已由 Rust serializer test 鎖定；Windows DTO／state machine／selection／presentation port 完成前，狀態維持 **port/parity pending**。
 
 ## Documentation checks
 

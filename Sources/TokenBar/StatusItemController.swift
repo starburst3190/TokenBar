@@ -179,8 +179,11 @@ final class StatusItemController: NSObject {
     /// couple of seconds.
     private func showQuotaMenu() {
         let menu = NSMenu()
-        let current = UserDefaults.standard.string(forKey: TrayAnimator.quotaSourceKey)
+        let payload = quotaPayloadProvider?()
+        let persistedSelection = UserDefaults.standard.string(forKey: TrayAnimator.quotaSourceKey)
             ?? QuotaResolver.auto
+        let current = QuotaResolver.canonicalSelection(
+            payload: payload, selection: persistedSelection)
 
         let header = NSMenuItem(title: "Menu bar tracks", action: nil, keyEquivalent: "")
         header.isEnabled = false
@@ -196,20 +199,22 @@ final class StatusItemController: NSObject {
         }
         add("Auto (tightest window)", selection: QuotaResolver.auto)
 
-        if let payload = quotaPayloadProvider?() {
-            for agent in payload.agents where agent.error == nil && !agent.windows.isEmpty {
+        if let payload {
+            for agent in payload.agents where agent.error == nil {
+                let windows = agent.uniqueCardWindows
+                guard !windows.isEmpty else { continue }
                 menu.addItem(.separator())
                 let name = NSMenuItem(
                     title: ClientRegistry.style(agent.clientId).displayName,
                     action: nil, keyEquivalent: "")
                 name.isEnabled = false
                 menu.addItem(name)
-                for window in agent.windows {
+                for window in windows {
                     let left = "\(Int(min(100, max(0, window.remainingPercent)).rounded()))% left"
                     add(
                         "\(window.label) — \(left)",
                         selection: QuotaResolver.selection(
-                            clientId: agent.clientId, label: window.label))
+                            clientId: agent.clientId, cardId: window.cardId))
                 }
             }
         } else {
