@@ -17,12 +17,13 @@ guard ProcessInfo.processInfo.environment["TZ"] == "Asia/Taipei" else {
 }
 
 let args = CommandLine.arguments
-guard args.count == 3 else {
-    FileHandle.standardError.write(Data("usage: crosscheck-harness <fixtures-dir> <out-dir>\n".utf8))
+guard (3...4).contains(args.count) else {
+    FileHandle.standardError.write(Data("usage: crosscheck-harness <fixtures-dir> <out-dir> [format|usage-pace|provider-quota-pace-v3]\n".utf8))
     exit(2)
 }
 let fixturesDir = URL(fileURLWithPath: args[1], isDirectory: true)
 let outDir = URL(fileURLWithPath: args[2], isDirectory: true)
+let selector = args.count == 4 ? args[3] : "all"
 try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
 // Harness-side strict RFC3339 parser for `now` (NOT the module under test — the
@@ -71,32 +72,49 @@ func write(_ obj: [String: Any], to name: String) throws {
 }
 
 // ---------------- usage-pace.json ----------------
-struct PaceCase: Decodable {
-    let name: String
-    let kind: String
-    let mode: String?
-    let now: String?
-    let window: UsageWindow // production DTO, production decoder
-}
-struct PaceFile: Decodable { let cases: [PaceCase] }
-
 func runUsagePace() throws {
     let data = try Data(contentsOf: fixturesDir.appendingPathComponent("usage-pace.json"))
-    let file = try decoder.decode(PaceFile.self, from: data)
+    guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let cases = root["cases"] as? [[String: Any]]
+    else {
+        throw NSError(domain: "CrossCheckHarness", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "usage-pace.json must contain a cases array"
+        ])
+    }
+
     var out: [String: Any] = [:]
-    for c in file.cases {
-        switch c.kind {
+    for (index, c) in cases.enumerated() {
+        guard let name = c["name"] as? String,
+              let kind = c["kind"] as? String,
+              let windowObject = c["window"],
+              JSONSerialization.isValidJSONObject(windowObject)
+        else {
+            out["invalid-case-\(index)"] = ["error": "invalid case metadata"]
+            continue
+        }
+        let windowData = try JSONSerialization.data(withJSONObject: windowObject)
+        guard let window = try? decoder.decode(UsageWindow.self, from: windowData) else {
+            // Preserve the complete legacy baseline run while using the current
+            // production decoder: old payloads that are now invalid are explicit
+            // intended mismatches until the Windows v3 wire port lands.
+            out[name] = ["rejected": true]
+            continue
+        }
+
+        switch kind {
         case "compute":
-            guard let modeRaw = c.mode, let mode = PaceMode(rawValue: modeRaw) else {
-                out[c.name] = ["error": "unknown pace mode \(c.mode ?? "nil")"]; continue
+            let modeRaw = c["mode"] as? String
+            guard let modeRaw, let mode = PaceMode(rawValue: modeRaw) else {
+                out[name] = ["error": "unknown pace mode \(modeRaw ?? "nil")"]; continue
             }
-            guard let nowRaw = c.now, let now = parseNow(nowRaw) else {
-                out[c.name] = ["error": "unparseable now \(c.now ?? "nil")"]; continue
+            let nowRaw = c["now"] as? String
+            guard let nowRaw, let now = parseNow(nowRaw) else {
+                out[name] = ["error": "unparseable now \(nowRaw ?? "nil")"]; continue
             }
-            guard let pace = UsagePace.compute(window: c.window, mode: mode, now: now) else {
-                out[c.name] = NSNull(); continue
+            guard let pace = UsagePace.compute(window: window, mode: mode, now: now) else {
+                out[name] = NSNull(); continue
             }
-            out[c.name] = [
+            out[name] = [
                 "stage": stageName(pace.stage),
                 "deltaPercent": pace.deltaPercent,
                 "expectedUsedPercent": pace.expectedUsedPercent,
@@ -107,9 +125,9 @@ func runUsagePace() throws {
                 "etaText": pace.etaText.map { $0 as Any } ?? NSNull(),
             ]
         case "runOutRisk":
-            out[c.name] = runOutRiskLabel(window: c.window).map { $0 as Any } ?? NSNull()
+            out[name] = runOutRiskLabel(window: window).map { $0 as Any } ?? NSNull()
         default:
-            out[c.name] = ["error": "unknown kind \(c.kind)"]
+            out[name] = ["error": "unknown kind \(kind)"]
         }
     }
     try write(out, to: "usage-pace.actual.json")
@@ -167,5 +185,185 @@ func runFormat() throws {
     print("format.actual.json: \(out.count) cases")
 }
 
-try runUsagePace()
-try runFormat()
+// ---------------- provider-quota-pace-v3.json ----------------
+struct ProviderQuotaPaceCase: Decodable {
+    let name: String
+    let kind: String
+    let clientId: String?
+    let cardId: String?
+    let mode: String?
+    let now: String?
+    let selection: String?
+    let rawWindow: String?
+}
+
+struct ProviderQuotaPaceFile: Decodable {
+    let schemaVersion: Int
+    let payload: AgentUsagePayload // production DTO, production decoder
+    let cases: [ProviderQuotaPaceCase]
+}
+
+func paceStateName(_ state: UsagePaceState) -> String {
+    state.rawValue
+}
+
+func durationSourceName(_ source: UsagePaceDurationSource?) -> Any {
+    source?.rawValue ?? NSNull()
+}
+
+func basisName(_ basis: UsagePaceBasis) -> String {
+    switch basis {
+    case .linear: return "linear"
+    case .historical: return "historical"
+    }
+}
+
+func quotaWindow(
+    payload: AgentUsagePayload, clientId: String, cardId: String
+) -> UsageWindow? {
+    payload.agents.first(where: { $0.clientId == clientId })?
+        .uniqueCardWindows.first(where: { $0.cardId == cardId })
+}
+
+func lifecycleRows(_ payload: AgentUsagePayload) -> [[String: Any]] {
+    payload.agents.flatMap { agent in
+        agent.windows.map { window in
+            [
+                "clientId": agent.clientId,
+                "cardId": window.cardId,
+                "label": window.label,
+                "state": paceStateName(window.paceStatus.state),
+                "reason": window.paceStatus.reason.map { $0.rawValue as Any } ?? NSNull(),
+                "durationSeconds": window.paceStatus.durationSeconds.map { NSNumber(value: $0) } ?? NSNull(),
+                "durationSource": durationSourceName(window.paceStatus.durationSource),
+                "completeCycles": window.paceStatus.completeCycles,
+                "hasHistorical": window.historicalPace != nil,
+            ]
+        }
+    }
+}
+
+func paceOutput(
+    window: UsageWindow, mode: PaceMode, pace: UsagePace
+) -> [String: Any] {
+    let presentation = UsagePace.presentation(window: window, mode: mode, pace: pace)
+    return [
+        "basis": basisName(pace.basis),
+        "stage": stageName(pace.stage),
+        "deltaPercent": pace.deltaPercent,
+        "expectedUsedPercent": pace.expectedUsedPercent,
+        "actualUsedPercent": pace.actualUsedPercent,
+        "etaSeconds": pace.etaSeconds.map { NSNumber(value: $0) } ?? NSNull(),
+        "willLastToReset": pace.willLastToReset,
+        "label": pace.label,
+        "etaText": presentation.etaText.map { $0 as Any } ?? NSNull(),
+        "riskText": presentation.riskText.map { $0 as Any } ?? NSNull(),
+        "isHistoricalDeficit": pace.isHistoricalDeficit,
+    ]
+}
+
+func decodeRawWindow(_ raw: String) throws -> UsageWindow {
+    try decoder.decode(UsageWindow.self, from: Data(raw.utf8))
+}
+
+func runProviderQuotaPaceV3() throws {
+    let data = try Data(contentsOf: fixturesDir.appendingPathComponent("provider-quota-pace-v3.json"))
+    let file = try decoder.decode(ProviderQuotaPaceFile.self, from: data)
+    guard file.schemaVersion == 3 else {
+        throw NSError(domain: "CrossCheckHarness", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "provider-quota-pace-v3 schemaVersion must be 3"
+        ])
+    }
+
+    var casesOut: [String: Any] = [:]
+    for c in file.cases {
+        switch c.kind {
+        case "pace":
+            guard let clientId = c.clientId,
+                  let cardId = c.cardId,
+                  let modeRaw = c.mode,
+                  let mode = PaceMode(rawValue: modeRaw),
+                  let nowRaw = c.now,
+                  let now = parseNow(nowRaw),
+                  let window = quotaWindow(payload: file.payload, clientId: clientId, cardId: cardId)
+            else {
+                casesOut[c.name] = ["error": "invalid pace case metadata"]
+                continue
+            }
+            guard let pace = UsagePace.compute(window: window, mode: mode, now: now) else {
+                casesOut[c.name] = NSNull()
+                continue
+            }
+            casesOut[c.name] = paceOutput(window: window, mode: mode, pace: pace)
+
+        case "selection":
+            guard let selection = c.selection else {
+                casesOut[c.name] = ["error": "selection case needs selection"]
+                continue
+            }
+            let canonical = QuotaResolver.canonicalSelection(
+                payload: file.payload, selection: selection)
+            let resolved = QuotaResolver.resolve(payload: file.payload, selection: selection)
+            casesOut[c.name] = [
+                "selection": selection,
+                "canonicalSelection": canonical,
+                "resolvedClientId": resolved.map { $0.clientId as Any } ?? NSNull(),
+                "resolvedCardId": resolved.map { $0.window.cardId as Any } ?? NSNull(),
+            ]
+
+        case "legacy":
+            guard let raw = c.rawWindow, let nowRaw = c.now, let now = parseNow(nowRaw) else {
+                casesOut[c.name] = ["error": "legacy case needs rawWindow and now"]
+                continue
+            }
+            do {
+                let window = try decodeRawWindow(raw)
+                casesOut[c.name] = [
+                    "rejected": false,
+                    "state": paceStateName(window.paceStatus.state),
+                    "reason": window.paceStatus.reason.map { $0.rawValue as Any } ?? NSNull(),
+                    "durationSeconds": window.paceStatus.durationSeconds.map { NSNumber(value: $0) } ?? NSNull(),
+                    "durationSource": durationSourceName(window.paceStatus.durationSource),
+                    "completeCycles": window.paceStatus.completeCycles,
+                    "windowMinutes": window.windowMinutes.map { NSNumber(value: $0) } ?? NSNull(),
+                    "historicalPace": UsagePace.compute(window: window, mode: .historical, now: now) != nil,
+                    "linearPace": UsagePace.compute(window: window, mode: .linear, now: now) != nil,
+                ]
+            } catch {
+                casesOut[c.name] = ["rejected": true]
+            }
+
+        case "malformed":
+            guard let raw = c.rawWindow else {
+                casesOut[c.name] = ["error": "malformed case needs rawWindow"]
+                continue
+            }
+            casesOut[c.name] = ["rejected": (try? decodeRawWindow(raw)) == nil]
+
+        default:
+            casesOut[c.name] = ["error": "unknown kind \(c.kind)"]
+        }
+    }
+
+    try write([
+        "schemaVersion": file.schemaVersion,
+        "lifecycle": lifecycleRows(file.payload),
+        "cases": casesOut,
+    ], to: "provider-quota-pace-v3.actual.json")
+    print("provider-quota-pace-v3.actual.json: \(casesOut.count) cases")
+}
+
+switch selector {
+case "all":
+    try runUsagePace()
+    try runFormat()
+case "usage-pace":
+    try runUsagePace()
+case "format":
+    try runFormat()
+case "provider-quota-pace-v3":
+    try runProviderQuotaPaceV3()
+default:
+    FileHandle.standardError.write(Data("error: unknown selector \(selector)\n".utf8))
+    exit(2)
+}

@@ -5468,4 +5468,172 @@ mod tests {
         window.historical_pace = None;
         assert!(serde_json::to_value(&window).is_err());
     }
+
+    #[test]
+    fn provider_quota_pace_v3_fixture_locks_production_serializer() {
+        fn window(
+            card_id: &str,
+            label: &str,
+            used_percent: f64,
+            resets_at: Option<&str>,
+            window_key: Option<&str>,
+            state: PaceState,
+            duration_seconds: Option<i64>,
+            duration_source: Option<DurationSource>,
+            complete_cycles: usize,
+            reason: Option<&str>,
+            historical_pace: Option<HistoricalPacePayload>,
+        ) -> UsageWindow {
+            UsageWindow {
+                card_id: card_id.to_string(),
+                label: label.to_string(),
+                used_percent,
+                remaining_percent: 100.0 - used_percent,
+                resets_at: resets_at.map(|value| value.to_string()),
+                reset_text: None,
+                window_minutes: duration_seconds.map(|seconds| seconds / 60),
+                window_key: window_key.map(|value| value.to_string()),
+                duration_seconds,
+                duration_source,
+                provider_duration: None,
+                contract_duration: None,
+                pace_status: PaceStatusPayload {
+                    state,
+                    window_key: window_key.map(|value| value.to_string()),
+                    duration_seconds,
+                    duration_source,
+                    complete_cycles,
+                    reason: reason.map(|value| value.to_string()),
+                },
+                historical_pace,
+            }
+        }
+
+        let payload = AgentUsagePayload {
+            generated_at: "2026-07-10T12:00:00.000Z".to_string(),
+            agents: vec![AgentUsageSnapshot {
+                client_id: "provider-fixture.invalid".to_string(),
+                source: "fixture.invalid".to_string(),
+                updated_at: "2026-07-10T12:00:00.000Z".to_string(),
+                identity: None,
+                account_scope: Err(AccountScopeError::NoTrustedEvidence),
+                windows: vec![
+                    window(
+                        "ahead.invalid",
+                        "Ahead quota",
+                        72.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.ahead.invalid"),
+                        PaceState::Available,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        5,
+                        None,
+                        Some(HistoricalPacePayload {
+                            expected_used_percent: 32.0,
+                            eta_seconds: Some(3_600.0),
+                            will_last_to_reset: false,
+                            run_out_probability: Some(0.75),
+                        }),
+                    ),
+                    window(
+                        "behind.invalid",
+                        "Behind quota",
+                        28.0,
+                        Some("2026-07-15T12:00:00Z"),
+                        Some("quota.behind.invalid"),
+                        PaceState::Available,
+                        Some(604_800),
+                        Some(DurationSource::Contract),
+                        7,
+                        None,
+                        Some(HistoricalPacePayload {
+                            expected_used_percent: 56.0,
+                            eta_seconds: None,
+                            will_last_to_reset: true,
+                            run_out_probability: Some(0.2),
+                        }),
+                    ),
+                    window(
+                        "learning-history.invalid",
+                        "Learning history",
+                        40.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.learning-history.invalid"),
+                        PaceState::LearningHistory,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        2,
+                        None,
+                        None,
+                    ),
+                    window(
+                        "learning-duration.invalid",
+                        "Learning duration",
+                        40.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.learning-duration.invalid"),
+                        PaceState::LearningDuration,
+                        None,
+                        Some(DurationSource::Observed),
+                        0,
+                        None,
+                        None,
+                    ),
+                    window(
+                        "missing-reset.invalid",
+                        "Missing reset",
+                        50.0,
+                        None,
+                        Some("quota.missing-reset.invalid"),
+                        PaceState::Unavailable,
+                        None,
+                        None,
+                        0,
+                        Some("missingReset"),
+                        None,
+                    ),
+                    window(
+                        "shared-first.invalid",
+                        "Shared label",
+                        10.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.shared-first.invalid"),
+                        PaceState::LearningHistory,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        2,
+                        None,
+                        None,
+                    ),
+                    window(
+                        "shared-second.invalid",
+                        "Shared label",
+                        20.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.shared-second.invalid"),
+                        PaceState::LearningHistory,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        2,
+                        None,
+                        None,
+                    ),
+                ],
+                credits: None,
+                error: None,
+            }],
+            opencode_subscriptions: Vec::new(),
+        };
+
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Fixtures/CrossCheck/provider-quota-pace-v3.json");
+        let fixture: Value = serde_json::from_str(
+            &fs::read_to_string(&fixture_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", fixture_path.display())),
+        )
+        .unwrap_or_else(|error| panic!("decode {}: {error}", fixture_path.display()));
+        assert_eq!(fixture["schemaVersion"], 3);
+        assert_eq!(fixture["payload"], serde_json::to_value(payload).unwrap());
+    }
 }
