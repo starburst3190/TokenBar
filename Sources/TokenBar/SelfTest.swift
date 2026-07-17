@@ -178,35 +178,138 @@ enum SelfTest {
         expect(UsagePace.durationText(130 * 60) == "2h 10m", "duration text h m")
         expect(UsagePace.durationText(26 * 3600) == "1d 2h", "duration text d h")
 
-        // Production decoder shape: nested result decodes as one object;
-        // missing/null historicalPace stays nil, and legacy top-level scalar
-        // fields are ignored rather than becoming a second source of truth.
-        let nestedWindowJSON = """
-        {"label":"Weekly","usedPercent":50,"remainingPercent":50,
-         "resetsAt":"2025-05-15T01:13:20Z","windowMinutes":60,
-         "historicalPace":{"expectedUsedPercent":80,"etaSeconds":120,
-         "willLastToReset":false,"runOutProbability":0.8}}
+        // Stage 5A production decoder: v3 pace states are typed and strict;
+        // only an entirely missing paceStatus key takes the internal legacy path.
+        func decodeWindow(_ json: String) -> UsageWindow? {
+            try? JSONDecoder().decode(UsageWindow.self, from: Data(json.utf8))
+        }
+        let learningDurationJSON = """
+        {"cardId":"session.v1","label":"Session","usedPercent":20,"remainingPercent":80,
+         "resetsAt":"2026-07-17T05:00:00Z",
+         "paceStatus":{"state":"learningDuration","windowKey":"session.v1",
+         "durationSource":"observed","completeCycles":0}}
         """
-        let nestedDecoded = try! JSONDecoder().decode(
-            UsageWindow.self, from: Data(nestedWindowJSON.utf8))
+        let learningHistoryJSON = """
+        {"cardId":"weekly.v1","label":"Weekly","usedPercent":35,"remainingPercent":65,
+         "resetsAt":"2026-07-24T00:00:00Z","windowMinutes":300,
+         "paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+         "durationSeconds":18000,"durationSource":"contract","completeCycles":2}}
+        """
+        let availableJSON = """
+        {"cardId":"daily.v1","label":"Daily","usedPercent":60,"remainingPercent":40,
+         "resetsAt":"2026-07-24T00:00:00Z","windowMinutes":300,
+         "paceStatus":{"state":"available","windowKey":"daily.v1",
+         "durationSeconds":18000,"durationSource":"contract","completeCycles":4},
+         "historicalPace":{"expectedUsedPercent":55,"etaSeconds":900,
+         "willLastToReset":false,"runOutProbability":0.25}}
+        """
+        let unavailableJSON = """
+        {"cardId":"extra_usage.v1","label":"Extra usage","usedPercent":70,"remainingPercent":30,
+         "paceStatus":{"state":"unavailable","windowKey":"extra_usage.v1",
+         "completeCycles":0,"reason":"nonRecurring"}}
+        """
+        let learningDuration = decodeWindow(learningDurationJSON)
+        let learningHistory = decodeWindow(learningHistoryJSON)
+        let available = decodeWindow(availableJSON)
+        let unavailable = decodeWindow(unavailableJSON)
         expect(
-            nestedDecoded.historicalPace?.expectedUsedPercent == 80 &&
-                nestedDecoded.historicalPace?.etaSeconds == 120 &&
-                nestedDecoded.historicalPace?.willLastToReset == false &&
-                nestedDecoded.historicalPace?.runOutProbability == 0.8,
-            "nested historical pace decodes")
-        let missingDecoded = try! JSONDecoder().decode(
-            UsageWindow.self,
-            from: Data("{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50}".utf8))
-        let nullDecoded = try! JSONDecoder().decode(
-            UsageWindow.self,
-            from: Data("{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50,\"historicalPace\":null}".utf8))
-        let legacyDecoded = try! JSONDecoder().decode(
-            UsageWindow.self,
-            from: Data("{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50,\"historicalExpectedPercent\":80,\"runOutProbability\":0.8}".utf8))
-        expect(missingDecoded.historicalPace == nil, "missing historical pace decodes as nil")
-        expect(nullDecoded.historicalPace == nil, "null historical pace decodes as nil")
-        expect(legacyDecoded.historicalPace == nil, "legacy scalar fields are not a fallback")
+            learningDuration?.paceStatus.state == UsagePaceState.learningDuration &&
+                learningDuration?.durationSeconds == nil &&
+                learningDuration?.paceStatus.durationSource == .observed,
+            "v3 learningDuration decodes with observed source")
+        expect(
+            learningHistory?.paceStatus.state == UsagePaceState.learningHistory &&
+                learningHistory?.durationSeconds == 18_000 &&
+                learningHistory?.historicalPace == nil,
+            "v3 learningHistory decodes with exact duration")
+        expect(
+            available?.paceStatus.state == UsagePaceState.available &&
+                available?.durationSeconds == 18_000 &&
+                available?.historicalPace?.expectedUsedPercent == 55,
+            "v3 available decodes with historical result")
+        expect(
+            unavailable?.paceStatus.state == UsagePaceState.unavailable &&
+                unavailable?.paceStatus.reason == .nonRecurring &&
+                unavailable?.durationSeconds == nil,
+            "v3 unavailable decodes with typed reason")
+
+        let legacyDecoded = decodeWindow(
+            "{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50,\"windowMinutes\":60}")
+        expect(
+            legacyDecoded?.paceStatus.state == UsagePaceState.legacyMissing &&
+                legacyDecoded?.cardId == "legacy.missing.v1" &&
+                legacyDecoded?.durationSeconds == nil && legacyDecoded?.windowMinutes == 60,
+            "missing whole paceStatus uses fixed legacy identity without duration inference")
+
+        let invalidFixtures: [(String, String)] = [
+            ("present null paceStatus", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":null}
+             """),
+            ("unknown state", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"futureState","windowKey":"weekly.v1","completeCycles":0}}
+             """),
+            ("unknown source", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"calendar","completeCycles":0}}
+             """),
+            ("unknown reason", """
+             {"cardId":"extra_usage.v1","label":"Extra usage","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"unavailable","windowKey":"extra_usage.v1",
+              "completeCycles":0,"reason":"unsupported"}}
+             """),
+            ("missing cardId", """
+             {"label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"learningDuration","windowKey":"weekly.v1","completeCycles":0}}
+             """),
+            ("available without historicalPace", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "windowMinutes":300,"paceStatus":{"state":"available","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"contract","completeCycles":0}}
+             """),
+            ("learningHistory with historicalPace", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "windowMinutes":300,"paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"contract","completeCycles":0},
+              "historicalPace":{"expectedUsedPercent":50,"willLastToReset":true}}
+             """),
+            ("windowKey and reason contradiction", """
+             {"cardId":"unknown.v1","label":"Unknown","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"unavailable","windowKey":null,"completeCycles":0,
+              "reason":"accountScope"}}
+             """),
+            ("duration and windowMinutes contradiction", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "windowMinutes":301,"paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"contract","completeCycles":0}}
+             """),
+            ("duration without derived windowMinutes", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"contract","completeCycles":0}}
+             """),
+        ]
+        for (label, json) in invalidFixtures {
+            expect(decodeWindow(json) == nil, "v3 rejects \(label)")
+        }
+
+        let productionPayloadJSON = """
+        {"generatedAt":"2026-07-17T00:00:00Z","agents":[
+          {"clientId":"codex","source":"oauth","updatedAt":"2026-07-17T00:00:00Z",
+           "identity":{"email":"fixture@example.invalid","plan":"plus"},
+           "windows":[\(learningDurationJSON),\(learningHistoryJSON),\(availableJSON),\(unavailableJSON)],
+           "credits":{"remaining":12.5,"unlimited":false},"error":null}
+        ],"opencodeSubscriptions":["Codex"]}
+        """
+        let productionPayload = try? JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data(productionPayloadJSON.utf8))
+        expect(
+            productionPayload?.agents.count == 1 &&
+                productionPayload?.agents.first?.windows.count == 4 &&
+                productionPayload?.agents.first?.windows[2].paceStatus.state == .available,
+            "complete AgentUsagePayload v3 shape decodes")
 
         // Contribution grid: GitHub layout, col 0 row 0 = Sunday on/before
         // Jan 1; out-of-year cells are never active; max tracks active only.
