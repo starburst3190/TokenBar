@@ -1,8 +1,8 @@
 //! Opaque account identity for provider quota history.
 //!
-//! The installation key lives in the non-synchronizing macOS Keychain. Raw
-//! provider identifiers and credential markers are reduced to domain-separated
-//! HMACs before authenticated metadata is persisted. Provider adapters only get
+//! The installation key lives in an owner-only binary file beside the authenticated
+//! metadata. Raw provider identifiers and credential markers are reduced to
+//! domain-separated HMACs before metadata is persisted. Provider adapters only get
 //! an opaque scope or a typed failure; no raw identity crosses into history.
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -21,8 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const KEYCHAIN_SERVICE: &str = "com.nyanako.tokenbar.account-scope.v1";
-const KEYCHAIN_ACCOUNT: &str = "installation-key";
+const INSTALLATION_KEY_FILE: &str = "quota-account-scope-installation-key-v1.bin";
 const METADATA_FILE: &str = "quota-account-scope-v1.json";
 const METADATA_LOCK_FILE: &str = "quota-account-scope-v1.lock";
 const V3_HISTORY_FILE: &str = "quota-pace-history-v3.json";
@@ -30,11 +29,8 @@ const METADATA_SCHEMA_VERSION: u32 = 1;
 const INSTALLATION_KEY_BYTES: usize = 32;
 const LINEAGE_ID_BYTES: usize = 16;
 const DIGEST_BYTES: usize = 32;
-const ERR_SEC_SUCCESS: i32 = 0;
-const ERR_SEC_DUPLICATE_ITEM: i32 = -25_299;
-const ERR_SEC_ITEM_NOT_FOUND: i32 = -25_300;
 
-static METADATA_PROCESS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static ACCOUNT_SCOPE_PROCESS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static CODEX_REFRESH_LOCK: Mutex<()> = Mutex::new(());
 static CLAUDE_REFRESH_LOCK: Mutex<()> = Mutex::new(());
 static GROK_REFRESH_LOCK: Mutex<()> = Mutex::new(());
@@ -76,8 +72,9 @@ pub(crate) enum AccountScopeError {
     NoTrustedEvidence,
     InvalidEvidence,
     UnsupportedPlatform,
-    KeychainUnavailable,
+    InstallationKeyRead,
     InvalidInstallationKey,
+    InstallationKeyWrite,
     OrphanedArtifacts,
     RandomUnavailable,
     StorageUnavailable,
@@ -95,8 +92,9 @@ impl std::fmt::Display for AccountScopeError {
             Self::NoTrustedEvidence => "no trusted account evidence",
             Self::InvalidEvidence => "invalid account evidence",
             Self::UnsupportedPlatform => "secure account scope is unavailable on this platform",
-            Self::KeychainUnavailable => "installation key is unavailable",
-            Self::InvalidInstallationKey => "installation key has an invalid length",
+            Self::InstallationKeyRead => "installation key could not be read",
+            Self::InvalidInstallationKey => "installation key failed validation",
+            Self::InstallationKeyWrite => "installation key could not be saved",
             Self::OrphanedArtifacts => "account-scope artifacts were orphaned after key loss",
             Self::RandomUnavailable => "secure randomness is unavailable",
             Self::StorageUnavailable => "account-scope storage is unavailable",
@@ -114,15 +112,12 @@ impl std::fmt::Display for AccountScopeError {
 impl std::error::Error for AccountScopeError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyAddOutcome {
-    Added,
-    AlreadyExists,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FsOperation {
     CreateDirectory,
+    ReadInstallationKey,
+    ValidateInstallationKey,
     InspectArtifacts,
+    InspectOrphanedMetadata,
     OpenMetadataLock,
     AcquireMetadataLock,
     ReadMetadata,
@@ -130,15 +125,13 @@ enum FsOperation {
     CreateTemp,
     WriteTemp,
     SyncTemp,
-    ReplaceMetadata,
+    ReplaceFile,
     SyncDirectory,
     OpenRefreshLock,
     AcquireRefreshLock,
 }
 
 trait Backend {
-    fn keychain_read(&self) -> Result<Option<Vec<u8>>, AccountScopeError>;
-    fn keychain_add_if_absent(&self, key: &[u8]) -> Result<KeyAddOutcome, AccountScopeError>;
     fn random_bytes(&self, length: usize) -> Result<Vec<u8>, AccountScopeError>;
     fn storage_dir(&self) -> Result<PathBuf, AccountScopeError>;
     fn now_seconds(&self) -> i64;
@@ -150,130 +143,7 @@ trait Backend {
 #[derive(Debug, Clone, Copy)]
 struct SystemBackend;
 
-#[cfg(target_os = "macos")]
-fn installation_key_item_query(
-    keychain: &security_framework::os::macos::keychain::SecKeychain,
-    value: Option<&[u8]>,
-) -> core_foundation::dictionary::CFDictionary {
-    use core_foundation::array::CFArray;
-    use core_foundation::base::{TCFType as _, ToVoid as _};
-    use core_foundation::boolean::CFBoolean;
-    use core_foundation::data::CFData;
-    use core_foundation::dictionary::CFMutableDictionary;
-    use core_foundation::string::{CFString, CFStringRef};
-    use security_framework_sys::item::{
-        kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecClass,
-        kSecClassGenericPassword, kSecMatchSearchList, kSecReturnData, kSecUseAuthenticationUI,
-        kSecUseKeychain, kSecValueData,
-    };
-
-    extern "C" {
-        #[link_name = "kSecUseAuthenticationUIFail"]
-        static K_SEC_USE_AUTHENTICATION_UI_FAIL: CFStringRef;
-    }
-
-    let service = CFString::new(KEYCHAIN_SERVICE);
-    let account = CFString::new(KEYCHAIN_ACCOUNT);
-    let mut query: CFMutableDictionary = CFMutableDictionary::new();
-    unsafe {
-        query.add(&kSecClass.to_void(), &kSecClassGenericPassword.to_void());
-        query.add(&kSecAttrService.to_void(), &service.to_void());
-        query.add(&kSecAttrAccount.to_void(), &account.to_void());
-        query.add(
-            &kSecAttrSynchronizable.to_void(),
-            &CFBoolean::false_value().to_void(),
-        );
-        // Per-operation failure is required here: the menu app must never allow
-        // Security.framework to display authentication or legacy ACL UI.
-        query.add(
-            &kSecUseAuthenticationUI.to_void(),
-            &K_SEC_USE_AUTHENTICATION_UI_FAIL.to_void(),
-        );
-        match value {
-            Some(value) => {
-                let data = CFData::from_buffer(value);
-                query.add(&kSecUseKeychain.to_void(), &keychain.as_CFType().to_void());
-                query.add(&kSecValueData.to_void(), &data.to_void());
-            }
-            None => {
-                let search_list = CFArray::from_CFTypes(std::slice::from_ref(keychain));
-                query.add(
-                    &kSecMatchSearchList.to_void(),
-                    &search_list.as_CFType().to_void(),
-                );
-                query.add(
-                    &kSecReturnData.to_void(),
-                    &CFBoolean::true_value().to_void(),
-                );
-            }
-        }
-    }
-    query.to_immutable()
-}
-
 impl Backend for SystemBackend {
-    #[cfg(target_os = "macos")]
-    fn keychain_read(&self) -> Result<Option<Vec<u8>>, AccountScopeError> {
-        use core_foundation::base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType as _};
-        use core_foundation::data::CFData;
-        use security_framework::os::macos::keychain::SecKeychain;
-        use security_framework_sys::keychain_item::SecItemCopyMatching;
-
-        let keychain =
-            SecKeychain::default().map_err(|_| AccountScopeError::KeychainUnavailable)?;
-        let query = installation_key_item_query(&keychain, None);
-        let mut result: CFTypeRef = std::ptr::null();
-        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
-        if status != ERR_SEC_SUCCESS {
-            if !result.is_null() {
-                unsafe { CFRelease(result) };
-            }
-            return if status == ERR_SEC_ITEM_NOT_FOUND {
-                Ok(None)
-            } else {
-                Err(AccountScopeError::KeychainUnavailable)
-            };
-        }
-        if result.is_null() {
-            return Err(AccountScopeError::KeychainUnavailable);
-        }
-        if unsafe { CFGetTypeID(result) } != CFData::type_id() {
-            unsafe { CFRelease(result) };
-            return Err(AccountScopeError::KeychainUnavailable);
-        }
-        let data = unsafe { CFData::wrap_under_create_rule(result.cast()) };
-        Ok(Some(data.bytes().to_vec()))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn keychain_read(&self) -> Result<Option<Vec<u8>>, AccountScopeError> {
-        Err(AccountScopeError::UnsupportedPlatform)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn keychain_add_if_absent(&self, key: &[u8]) -> Result<KeyAddOutcome, AccountScopeError> {
-        use core_foundation::base::TCFType as _;
-        use security_framework::os::macos::keychain::SecKeychain;
-        use security_framework_sys::keychain_item::SecItemAdd;
-
-        // SecItemAdd remains add-only and targets the explicit default file
-        // keychain. A duplicate is never updated, so concurrent creators cannot
-        // replace the winner's installation key.
-        let keychain =
-            SecKeychain::default().map_err(|_| AccountScopeError::KeychainUnavailable)?;
-        let query = installation_key_item_query(&keychain, Some(key));
-        match unsafe { SecItemAdd(query.as_concrete_TypeRef(), std::ptr::null_mut()) } {
-            ERR_SEC_SUCCESS => Ok(KeyAddOutcome::Added),
-            ERR_SEC_DUPLICATE_ITEM => Ok(KeyAddOutcome::AlreadyExists),
-            _ => Err(AccountScopeError::KeychainUnavailable),
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn keychain_add_if_absent(&self, _key: &[u8]) -> Result<KeyAddOutcome, AccountScopeError> {
-        Err(AccountScopeError::UnsupportedPlatform)
-    }
-
     #[cfg(target_os = "macos")]
     fn random_bytes(&self, length: usize) -> Result<Vec<u8>, AccountScopeError> {
         let mut bytes = vec![0_u8; length];
@@ -333,7 +203,7 @@ pub(crate) fn resolve_authoritative(
 ) -> Result<AccountScope, AccountScopeError> {
     resolve_authoritative_with(
         &SystemBackend,
-        &METADATA_PROCESS_LOCK,
+        &ACCOUNT_SCOPE_PROCESS_LOCK,
         provider,
         kind,
         identifier,
@@ -348,7 +218,7 @@ pub(crate) fn resolve_credential(
 ) -> Result<AccountScope, AccountScopeError> {
     resolve_credential_with(
         &SystemBackend,
-        &METADATA_PROCESS_LOCK,
+        &ACCOUNT_SCOPE_PROCESS_LOCK,
         provider,
         semantic_source,
         canonical_location,
@@ -444,11 +314,21 @@ fn ensure_installation_key<B: Backend>(
     backend: &B,
     process_lock: &Mutex<()>,
 ) -> Result<[u8; INSTALLATION_KEY_BYTES], AccountScopeError> {
-    if let Some(bytes) = backend.keychain_read()? {
-        return installation_key_from_bytes(&bytes);
+    let directory = ensure_storage_dir(backend)?;
+    with_metadata_lock(backend, process_lock, &directory, || {
+        ensure_installation_key_locked(backend, &directory)
+    })
+}
+
+fn ensure_installation_key_locked<B: Backend>(
+    backend: &B,
+    directory: &Path,
+) -> Result<[u8; INSTALLATION_KEY_BYTES], AccountScopeError> {
+    let key_path = directory.join(INSTALLATION_KEY_FILE);
+    if let Some(key) = read_installation_key(backend, &key_path)? {
+        return Ok(key);
     }
 
-    let directory = ensure_storage_dir(backend)?;
     backend
         .before_fs(FsOperation::InspectArtifacts)
         .map_err(|_| AccountScopeError::StorageUnavailable)?;
@@ -458,60 +338,24 @@ fn ensure_installation_key<B: Backend>(
         .map_err(|_| AccountScopeError::StorageUnavailable)?;
     let history_exists = regular_artifact_exists(&history_path)
         .map_err(|_| AccountScopeError::StorageUnavailable)?;
-    let had_artifacts = metadata_exists || history_exists;
+    let orphaned_metadata_exists = orphaned_metadata_artifact_exists(backend, directory)
+        .map_err(|_| AccountScopeError::StorageUnavailable)?;
+    let had_artifacts = metadata_exists || history_exists || orphaned_metadata_exists;
 
+    let generated = installation_key_from_bytes(&backend.random_bytes(INSTALLATION_KEY_BYTES)?)?;
     if metadata_exists {
-        // Another process may have won the add-only Keychain race and persisted
-        // metadata after this process's initial missing read. Re-read the winner
-        // outside the metadata lock, then authenticate the observed metadata with
-        // that key before treating it as orphaned.
-        if let Some(winner) = backend.keychain_read()? {
-            let winner = installation_key_from_bytes(&winner)?;
-            let metadata_is_valid = with_metadata_lock(backend, process_lock, &directory, || {
-                if !regular_artifact_exists(&metadata_path)
-                    .map_err(|_| AccountScopeError::MetadataRead)?
-                {
-                    return Ok(false);
-                }
-                load_metadata(backend, &directory, &winner)?;
-                Ok(true)
-            })?;
-            if metadata_is_valid {
-                return Ok(winner);
-            }
-            return Err(AccountScopeError::OrphanedArtifacts);
-        }
-
-        with_metadata_lock(backend, process_lock, &directory, || {
-            if regular_artifact_exists(&metadata_path)
-                .map_err(|_| AccountScopeError::QuarantineFailed)?
-            {
-                quarantine_metadata(backend, &metadata_path, "orphaned")?;
-            }
-            Ok(())
-        })?;
+        quarantine_metadata(backend, &metadata_path, "orphaned")?;
     }
-
-    let generated = backend.random_bytes(INSTALLATION_KEY_BYTES)?;
-    let generated = installation_key_from_bytes(&generated)?;
-    match backend.keychain_add_if_absent(&generated)? {
-        KeyAddOutcome::Added => {}
-        KeyAddOutcome::AlreadyExists => {
-            let winner = backend
-                .keychain_read()?
-                .ok_or(AccountScopeError::KeychainUnavailable)?;
-            let _ = installation_key_from_bytes(&winner)?;
-        }
-    }
+    save_atomic(backend, directory, &key_path, &generated)
+        .map_err(|_| AccountScopeError::InstallationKeyWrite)?;
+    let winner =
+        read_installation_key(backend, &key_path)?.ok_or(AccountScopeError::InstallationKeyRead)?;
 
     if had_artifacts {
-        return Err(AccountScopeError::OrphanedArtifacts);
+        Err(AccountScopeError::OrphanedArtifacts)
+    } else {
+        Ok(winner)
     }
-
-    let winner = backend
-        .keychain_read()?
-        .ok_or(AccountScopeError::KeychainUnavailable)?;
-    installation_key_from_bytes(&winner)
 }
 
 fn installation_key_from_bytes(
@@ -520,6 +364,68 @@ fn installation_key_from_bytes(
     bytes
         .try_into()
         .map_err(|_| AccountScopeError::InvalidInstallationKey)
+}
+
+fn read_installation_key<B: Backend>(
+    backend: &B,
+    path: &Path,
+) -> Result<Option<[u8; INSTALLATION_KEY_BYTES]>, AccountScopeError> {
+    backend
+        .before_fs(FsOperation::ReadInstallationKey)
+        .map_err(|_| AccountScopeError::InstallationKeyRead)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(AccountScopeError::InvalidInstallationKey),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(AccountScopeError::InstallationKeyRead),
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|_| AccountScopeError::InstallationKeyRead)?;
+    backend
+        .before_fs(FsOperation::ValidateInstallationKey)
+        .map_err(|_| AccountScopeError::InstallationKeyRead)?;
+    verify_installation_key_file(path, &file)?;
+
+    let mut key = [0_u8; INSTALLATION_KEY_BYTES];
+    match file.read_exact(&mut key) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(AccountScopeError::InvalidInstallationKey)
+        }
+        Err(_) => return Err(AccountScopeError::InstallationKeyRead),
+    }
+    let mut trailing = [0_u8; 1];
+    if file
+        .read(&mut trailing)
+        .map_err(|_| AccountScopeError::InstallationKeyRead)?
+        != 0
+    {
+        return Err(AccountScopeError::InvalidInstallationKey);
+    }
+    verify_installation_key_file(path, &file)?;
+    Ok(Some(key))
+}
+
+fn verify_installation_key_file(path: &Path, file: &File) -> Result<(), AccountScopeError> {
+    verify_open_regular_file(path, file).map_err(|_| AccountScopeError::InvalidInstallationKey)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if file
+            .metadata()
+            .map_err(|_| AccountScopeError::InstallationKeyRead)?
+            .permissions()
+            .mode()
+            & 0o7777
+            != 0o600
+        {
+            return Err(AccountScopeError::InvalidInstallationKey);
+        }
+    }
+    Ok(())
 }
 
 fn bind_current_credential<B: Backend>(
@@ -725,6 +631,7 @@ fn save_metadata<B: Backend>(
     let bytes =
         serde_json::to_vec_pretty(&envelope).map_err(|_| AccountScopeError::MetadataWrite)?;
     save_atomic(backend, directory, &directory.join(METADATA_FILE), &bytes)
+        .map_err(|_| AccountScopeError::MetadataWrite)
 }
 
 fn validate_payload(payload: &MetadataPayload) -> Result<(), AccountScopeError> {
@@ -870,16 +777,18 @@ fn save_atomic<B: Backend>(
     directory: &Path,
     path: &Path,
     bytes: &[u8],
-) -> Result<(), AccountScopeError> {
+) -> io::Result<()> {
+    let target_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing target filename"))?
+        .to_string_lossy();
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp = directory.join(format!(
-        ".{METADATA_FILE}.tmp-{}-{counter}",
+        ".{target_name}.tmp-{}-{counter}",
         std::process::id()
     ));
-    let staged = (|| -> Result<(), AccountScopeError> {
-        backend
-            .before_fs(FsOperation::CreateTemp)
-            .map_err(|_| AccountScopeError::MetadataWrite)?;
+    let staged = (|| -> io::Result<()> {
+        backend.before_fs(FsOperation::CreateTemp)?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -887,27 +796,16 @@ fn save_atomic<B: Backend>(
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let mut file = options
-            .open(&temp)
-            .map_err(|_| AccountScopeError::MetadataWrite)?;
-        backend
-            .before_fs(FsOperation::WriteTemp)
-            .map_err(|_| AccountScopeError::MetadataWrite)?;
-        file.write_all(bytes)
-            .map_err(|_| AccountScopeError::MetadataWrite)?;
-        file.flush().map_err(|_| AccountScopeError::MetadataWrite)?;
-        backend
-            .before_fs(FsOperation::SyncTemp)
-            .map_err(|_| AccountScopeError::MetadataWrite)?;
-        file.sync_all()
-            .map_err(|_| AccountScopeError::MetadataWrite)?;
+        let mut file = secure_open_regular_file(&temp, options.open(&temp)?)?;
+        backend.before_fs(FsOperation::WriteTemp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        backend.before_fs(FsOperation::SyncTemp)?;
+        file.sync_all()?;
         drop(file);
-        backend
-            .before_fs(FsOperation::ReplaceMetadata)
-            .map_err(|_| AccountScopeError::MetadataWrite)?;
-        tokscale_core::fs_atomic::replace_file(&temp, path)
-            .map_err(|_| AccountScopeError::MetadataWrite)?;
-        sync_directory(backend, directory).map_err(|_| AccountScopeError::MetadataWrite)
+        backend.before_fs(FsOperation::ReplaceFile)?;
+        tokscale_core::fs_atomic::replace_file(&temp, path)?;
+        sync_directory(backend, directory)
     })();
     if staged.is_err() {
         let _ = fs::remove_file(&temp);
@@ -1054,6 +952,51 @@ fn regular_artifact_exists(path: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn orphaned_metadata_artifact_exists<B: Backend>(
+    backend: &B,
+    directory: &Path,
+) -> io::Result<bool> {
+    backend.before_fs(FsOperation::InspectOrphanedMetadata)?;
+    let mut found = false;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_orphaned_metadata_name(name) {
+            continue;
+        }
+        require_regular_file_path(&entry.path())?;
+        found = true;
+    }
+    Ok(found)
+}
+
+fn is_orphaned_metadata_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("quota-account-scope-v1.orphaned-")
+        .and_then(|name| name.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    let mut parts = stem.split('.');
+    let Some(timestamp) = parts
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+    else {
+        return false;
+    };
+    let Some(suffix) = parts.next() else {
+        return timestamp.to_string() == stem;
+    };
+    let Some(suffix) = suffix.parse::<u32>().ok().filter(|value| *value > 0) else {
+        return false;
+    };
+    parts.next().is_none() && format!("{timestamp}.{suffix}") == stem
 }
 
 fn secure_open_regular_file(path: &Path, file: File) -> io::Result<File> {
@@ -1279,10 +1222,10 @@ pub(crate) fn begin_refresh(
     provider: &'static str,
 ) -> Result<RefreshTransaction, AccountScopeError> {
     let backend = SystemBackend;
-    // The installation-key read (and any key-loss recovery) must complete before
-    // the provider refresh lock is acquired. No Keychain call occurs below this
-    // point while the refresh transaction is alive.
-    let key = ensure_installation_key(&backend, &METADATA_PROCESS_LOCK);
+    // Installation-key read or key-loss recovery completes before the provider
+    // refresh lock is acquired. The refresh transaction keeps the existing
+    // refresh-lock -> metadata-lock ordering below this point.
+    let key = ensure_installation_key(&backend, &ACCOUNT_SCOPE_PROCESS_LOCK);
     let directory = ensure_storage_dir(&backend)?;
     let process_guard = refresh_process_lock(provider)?
         .lock()
@@ -1307,7 +1250,7 @@ impl RefreshTransaction {
         let key = self.key.as_ref().map_err(|error| *error)?;
         bind_current_credential(
             &SystemBackend,
-            &METADATA_PROCESS_LOCK,
+            &ACCOUNT_SCOPE_PROCESS_LOCK,
             key,
             self.provider,
             semantic_source,
@@ -1326,7 +1269,7 @@ impl RefreshTransaction {
         let key = self.key.as_ref().map_err(|error| *error)?;
         transfer_credential_with(
             &SystemBackend,
-            &METADATA_PROCESS_LOCK,
+            &ACCOUNT_SCOPE_PROCESS_LOCK,
             key,
             self.provider,
             semantic_source,
@@ -1384,21 +1327,18 @@ fn refresh_process_lock(provider: &str) -> Result<&'static Mutex<()>, AccountSco
 pub(crate) mod test_support {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
 
     #[derive(Clone)]
     pub(super) struct TestBackend {
         pub(super) directory: PathBuf,
         pub(super) state: Arc<Mutex<TestState>>,
-        pub(super) missing_read_barrier: Option<Arc<Barrier>>,
-        pub(super) inspect_artifacts_barrier: Option<Arc<Barrier>>,
     }
 
     pub(super) struct TestState {
-        pub(super) key: Result<Option<Vec<u8>>, AccountScopeError>,
         pub(super) random: VecDeque<Vec<u8>>,
         pub(super) fail_fs_once: Option<FsOperation>,
-        pub(super) key_adds: usize,
+        pub(super) replace_installation_key_on_validate: Option<Vec<u8>>,
         pub(super) events: Vec<&'static str>,
         pub(super) now: i64,
     }
@@ -1414,7 +1354,6 @@ pub(crate) mod test_support {
             Self {
                 directory,
                 state: Arc::new(Mutex::new(TestState {
-                    key: Ok(None),
                     random: VecDeque::from([
                         vec![0x11; INSTALLATION_KEY_BYTES],
                         vec![0x21; LINEAGE_ID_BYTES],
@@ -1423,22 +1362,38 @@ pub(crate) mod test_support {
                         vec![0x24; LINEAGE_ID_BYTES],
                     ]),
                     fail_fs_once: None,
-                    key_adds: 0,
+                    replace_installation_key_on_validate: None,
                     events: Vec::new(),
                     now: 1_752_710_400,
                 })),
-                missing_read_barrier: None,
-                inspect_artifacts_barrier: None,
             }
         }
 
-        pub(super) fn with_key(self, key: Vec<u8>) -> Self {
-            self.state.lock().unwrap().key = Ok(Some(key));
+        pub(super) fn with_installation_key(self, key: Vec<u8>) -> Self {
+            self.write_installation_key(&key);
             self
+        }
+
+        pub(super) fn write_installation_key(&self, key: &[u8]) {
+            ensure_real_directory(&self.directory).unwrap();
+            let path = self.directory.join(INSTALLATION_KEY_FILE);
+            fs::write(&path, key).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
         }
 
         pub(super) fn fail_fs(&self, operation: FsOperation) {
             self.state.lock().unwrap().fail_fs_once = Some(operation);
+        }
+
+        pub(super) fn replace_installation_key_on_validate(&self, key: Vec<u8>) {
+            self.state
+                .lock()
+                .unwrap()
+                .replace_installation_key_on_validate = Some(key);
         }
 
         pub(super) fn cleanup(&self) {
@@ -1447,29 +1402,6 @@ pub(crate) mod test_support {
     }
 
     impl Backend for TestBackend {
-        fn keychain_read(&self) -> Result<Option<Vec<u8>>, AccountScopeError> {
-            let result = self.state.lock().unwrap().key.clone();
-            if matches!(result, Ok(None)) {
-                if let Some(barrier) = &self.missing_read_barrier {
-                    barrier.wait();
-                }
-            }
-            result
-        }
-
-        fn keychain_add_if_absent(&self, key: &[u8]) -> Result<KeyAddOutcome, AccountScopeError> {
-            let mut state = self.state.lock().unwrap();
-            state.key_adds += 1;
-            match &state.key {
-                Ok(None) => {
-                    state.key = Ok(Some(key.to_vec()));
-                    Ok(KeyAddOutcome::Added)
-                }
-                Ok(Some(_)) => Ok(KeyAddOutcome::AlreadyExists),
-                Err(error) => Err(*error),
-            }
-        }
-
         fn random_bytes(&self, length: usize) -> Result<Vec<u8>, AccountScopeError> {
             let mut state = self.state.lock().unwrap();
             let index = state
@@ -1492,11 +1424,14 @@ pub(crate) mod test_support {
         }
 
         fn before_fs(&self, operation: FsOperation) -> io::Result<()> {
-            {
+            let replacement = {
                 let mut state = self.state.lock().unwrap();
                 state.events.push(match operation {
                     FsOperation::CreateDirectory => "create-directory",
+                    FsOperation::ReadInstallationKey => "read-installation-key",
+                    FsOperation::ValidateInstallationKey => "validate-installation-key",
                     FsOperation::InspectArtifacts => "inspect-artifacts",
+                    FsOperation::InspectOrphanedMetadata => "inspect-orphaned-metadata",
                     FsOperation::OpenMetadataLock => "open-metadata-lock",
                     FsOperation::AcquireMetadataLock => "acquire-metadata-lock",
                     FsOperation::ReadMetadata => "read-metadata",
@@ -1504,7 +1439,7 @@ pub(crate) mod test_support {
                     FsOperation::CreateTemp => "create-temp",
                     FsOperation::WriteTemp => "write-temp",
                     FsOperation::SyncTemp => "sync-temp",
-                    FsOperation::ReplaceMetadata => "replace-metadata",
+                    FsOperation::ReplaceFile => "replace-file",
                     FsOperation::SyncDirectory => "sync-directory",
                     FsOperation::OpenRefreshLock => "open-refresh-lock",
                     FsOperation::AcquireRefreshLock => "acquire-refresh-lock",
@@ -1513,11 +1448,21 @@ pub(crate) mod test_support {
                     state.fail_fs_once = None;
                     return Err(io::Error::other("injected failure"));
                 }
-            }
-            if operation == FsOperation::InspectArtifacts {
-                if let Some(barrier) = &self.inspect_artifacts_barrier {
-                    barrier.wait();
+                if operation == FsOperation::ValidateInstallationKey {
+                    state.replace_installation_key_on_validate.take()
+                } else {
+                    None
                 }
+            };
+            if let Some(bytes) = replacement {
+                let replacement_path = self.directory.join(".installation-key-replacement");
+                fs::write(&replacement_path, bytes)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o600))?;
+                }
+                fs::rename(replacement_path, self.directory.join(INSTALLATION_KEY_FILE))?;
             }
             Ok(())
         }
@@ -1532,7 +1477,8 @@ pub(crate) mod test_support {
     impl TestRefreshScope {
         pub(crate) fn new(provider: &'static str, tag: &str) -> Self {
             Self {
-                backend: TestBackend::new(tag).with_key(vec![0x11; INSTALLATION_KEY_BYTES]),
+                backend: TestBackend::new(tag)
+                    .with_installation_key(vec![0x11; INSTALLATION_KEY_BYTES]),
                 process_lock: Mutex::new(()),
                 provider,
             }
@@ -1547,7 +1493,7 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn fail_metadata_save(&self) {
-            self.backend.fail_fs(FsOperation::ReplaceMetadata);
+            self.backend.fail_fs(FsOperation::ReplaceFile);
         }
 
         pub(crate) fn cleanup(&self) {
@@ -1579,11 +1525,7 @@ pub(crate) mod test_support {
             old_marker: &[u8],
             new_marker: &[u8],
         ) -> Result<AccountScope, AccountScopeError> {
-            let key_bytes = self
-                .backend
-                .keychain_read()?
-                .ok_or(AccountScopeError::KeychainUnavailable)?;
-            let key = installation_key_from_bytes(&key_bytes)?;
+            let key = ensure_installation_key(&self.backend, &self.process_lock)?;
             transfer_credential_with(
                 &self.backend,
                 &self.process_lock,
@@ -1624,6 +1566,16 @@ mod tests {
 
     fn metadata_bytes(backend: &TestBackend) -> Vec<u8> {
         fs::read(backend.directory.join(METADATA_FILE)).unwrap()
+    }
+
+    fn installation_key(backend: &TestBackend) -> [u8; INSTALLATION_KEY_BYTES] {
+        read_installation_key(backend, &backend.directory.join(INSTALLATION_KEY_FILE))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn installation_key_path(backend: &TestBackend) -> PathBuf {
+        backend.directory.join(INSTALLATION_KEY_FILE)
     }
 
     #[cfg(unix)]
@@ -1764,8 +1716,7 @@ mod tests {
         let backend = TestBackend::new("refresh-crashes");
         let lock = Mutex::new(());
         let old = resolve_test(&backend, &lock, b"old-refresh").unwrap();
-        let key = installation_key_from_bytes(backend.keychain_read().unwrap().as_deref().unwrap())
-            .unwrap();
+        let key = installation_key(&backend);
 
         // Crash before metadata save: credentials are still old and metadata is unchanged.
         let before = metadata_bytes(&backend);
@@ -1806,8 +1757,7 @@ mod tests {
             b"new-refresh",
         )
         .unwrap();
-        let key = installation_key_from_bytes(backend.keychain_read().unwrap().as_deref().unwrap())
-            .unwrap();
+        let key = installation_key(&backend);
 
         let transferred = transfer_credential_with(
             &backend,
@@ -1843,9 +1793,8 @@ mod tests {
         let lock = Mutex::new(());
         let old = resolve_test(&backend, &lock, b"old").unwrap();
         let before = metadata_bytes(&backend);
-        let key = installation_key_from_bytes(backend.keychain_read().unwrap().as_deref().unwrap())
-            .unwrap();
-        backend.fail_fs(FsOperation::ReplaceMetadata);
+        let key = installation_key(&backend);
+        backend.fail_fs(FsOperation::ReplaceFile);
         assert_eq!(
             transfer_credential_with(
                 &backend,
@@ -1871,7 +1820,7 @@ mod tests {
             FsOperation::CreateTemp,
             FsOperation::WriteTemp,
             FsOperation::SyncTemp,
-            FsOperation::ReplaceMetadata,
+            FsOperation::ReplaceFile,
         ] {
             let backend = TestBackend::new("atomic-failure-point");
             let lock = Mutex::new(());
@@ -1884,12 +1833,7 @@ mod tests {
             );
             assert_eq!(metadata_bytes(&backend), before);
             assert_eq!(resolve_test(&backend, &lock, b"old").unwrap(), old);
-            decode_metadata(
-                &installation_key_from_bytes(backend.keychain_read().unwrap().as_deref().unwrap())
-                    .unwrap(),
-                &metadata_bytes(&backend),
-            )
-            .unwrap();
+            decode_metadata(&installation_key(&backend), &metadata_bytes(&backend)).unwrap();
             backend.cleanup();
         }
     }
@@ -1922,7 +1866,7 @@ mod tests {
         let old_scope = resolve_test(&backend, &lock, b"same-marker").unwrap();
         let old_metadata = metadata_bytes(&backend);
 
-        backend.state.lock().unwrap().key = Ok(None);
+        fs::remove_file(installation_key_path(&backend)).unwrap();
         assert_eq!(
             resolve_test(&backend, &lock, b"same-marker"),
             Err(AccountScopeError::OrphanedArtifacts)
@@ -1949,67 +1893,55 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_first_creation_uses_the_keychain_winner() {
-        let barrier = Arc::new(Barrier::new(2));
-        let mut backend = TestBackend::new("concurrent-key");
-        backend.missing_read_barrier = Some(barrier);
+    fn concurrent_first_creation_persists_one_winner_under_the_file_lock() {
+        let backend = TestBackend::new("concurrent-key");
         backend.state.lock().unwrap().random = VecDeque::from([
             vec![0x31; INSTALLATION_KEY_BYTES],
-            vec![0x41; LINEAGE_ID_BYTES],
             vec![0x32; INSTALLATION_KEY_BYTES],
-            vec![0x42; LINEAGE_ID_BYTES],
         ]);
-        let process_one = Arc::new(Mutex::new(()));
-        let process_two = Arc::new(Mutex::new(()));
+        let start = Arc::new(Barrier::new(3));
         let one_backend = backend.clone();
+        let one_start = start.clone();
+        let one = thread::spawn(move || {
+            one_start.wait();
+            ensure_installation_key(&one_backend, &Mutex::new(()))
+        });
         let two_backend = backend.clone();
-        let one = thread::spawn(move || resolve_test(&one_backend, &process_one, b"same-marker"));
-        let two = thread::spawn(move || resolve_test(&two_backend, &process_two, b"same-marker"));
+        let two_start = start.clone();
+        let two = thread::spawn(move || {
+            two_start.wait();
+            ensure_installation_key(&two_backend, &Mutex::new(()))
+        });
+        start.wait();
+
         let one = one.join().unwrap().unwrap();
         let two = two.join().unwrap().unwrap();
         assert_eq!(one, two);
-        assert_eq!(backend.state.lock().unwrap().key_adds, 2);
+        assert_eq!(fs::read(installation_key_path(&backend)).unwrap(), one);
+        assert_eq!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| **event == "replace-file")
+                .count(),
+            1
+        );
         backend.cleanup();
     }
 
     #[test]
-    fn concurrent_loser_validates_winner_metadata_before_orphan_recovery() {
-        let first_reads = Arc::new(Barrier::new(2));
-        let release_loser_inspect = Arc::new(Barrier::new(2));
-        let backend = TestBackend::new("concurrent-key-metadata");
-        backend.state.lock().unwrap().random = VecDeque::from([
-            vec![0x31; INSTALLATION_KEY_BYTES],
-            vec![0x41; LINEAGE_ID_BYTES],
-            vec![0x32; INSTALLATION_KEY_BYTES],
-            vec![0x42; LINEAGE_ID_BYTES],
-        ]);
+    fn existing_installation_key_is_reloaded_on_every_call_without_a_process_cache() {
+        let backend = TestBackend::new("key-reload");
+        let first = ensure_installation_key(&backend, &Mutex::new(())).unwrap();
+        assert_eq!(first, [0x11; INSTALLATION_KEY_BYTES]);
 
-        let mut winner_backend = backend.clone();
-        winner_backend.missing_read_barrier = Some(first_reads.clone());
-        let mut loser_backend = backend.clone();
-        loser_backend.missing_read_barrier = Some(first_reads);
-        loser_backend.inspect_artifacts_barrier = Some(release_loser_inspect.clone());
-
-        let winner =
-            thread::spawn(move || resolve_test(&winner_backend, &Mutex::new(()), b"same-marker"));
-        let loser =
-            thread::spawn(move || resolve_test(&loser_backend, &Mutex::new(()), b"same-marker"));
-
-        let winner_scope = winner.join().unwrap().unwrap();
-        let winner_metadata = metadata_bytes(&backend);
-        release_loser_inspect.wait();
-        let loser_scope = loser.join().unwrap().unwrap();
-
-        assert_eq!(loser_scope, winner_scope);
-        assert_eq!(metadata_bytes(&backend), winner_metadata);
-        assert_eq!(backend.state.lock().unwrap().key_adds, 1);
-        assert!(!fs::read_dir(&backend.directory).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains(".orphaned-")
-        }));
+        backend.write_installation_key(&[0x52; INSTALLATION_KEY_BYTES]);
+        let second = ensure_installation_key(&backend, &Mutex::new(())).unwrap();
+        assert_eq!(second, [0x52; INSTALLATION_KEY_BYTES]);
+        assert_ne!(first, second);
         backend.cleanup();
     }
 
@@ -2024,8 +1956,7 @@ mod tests {
             resolve_credential_with(&backend, &setup_lock, "claude", "file", "slot-b", b"old-b")
                 .unwrap();
         assert_ne!(scope_a, scope_b);
-        let key = installation_key_from_bytes(backend.keychain_read().unwrap().as_deref().unwrap())
-            .unwrap();
+        let key = installation_key(&backend);
         let one_backend = backend.clone();
         let two_backend = backend.clone();
         let one = thread::spawn(move || {
@@ -2065,31 +1996,414 @@ mod tests {
     }
 
     #[test]
-    fn keychain_denial_and_invalid_key_never_touch_metadata() {
-        for (tag, key, expected) in [
-            (
-                "keychain-denied",
-                Err(AccountScopeError::KeychainUnavailable),
-                AccountScopeError::KeychainUnavailable,
-            ),
-            (
-                "keychain-short",
-                Ok(Some(vec![7; INSTALLATION_KEY_BYTES - 1])),
-                AccountScopeError::InvalidInstallationKey,
-            ),
+    fn installation_key_round_trip_is_exact_and_owner_only() {
+        let backend = TestBackend::new("installation-key-round-trip");
+        let first = ensure_installation_key(&backend, &Mutex::new(())).unwrap();
+        let second = ensure_installation_key(&backend, &Mutex::new(())).unwrap();
+        assert_eq!(first, [0x11; INSTALLATION_KEY_BYTES]);
+        assert_eq!(second, first);
+        assert_eq!(fs::read(installation_key_path(&backend)).unwrap(), first);
+        #[cfg(unix)]
+        {
+            assert_eq!(unix_mode(&backend.directory), 0o700);
+            assert_eq!(unix_mode(&installation_key_path(&backend)), 0o600);
+        }
+        backend.cleanup();
+    }
+
+    #[test]
+    fn installation_key_read_failure_and_invalid_lengths_preserve_artifacts() {
+        let read_failure = TestBackend::new("installation-key-read-failure")
+            .with_installation_key(vec![0x61; INSTALLATION_KEY_BYTES]);
+        let metadata = b"metadata-read-failure";
+        let history = b"history-read-failure";
+        fs::write(read_failure.directory.join(METADATA_FILE), metadata).unwrap();
+        fs::write(read_failure.directory.join(V3_HISTORY_FILE), history).unwrap();
+        read_failure.fail_fs(FsOperation::ReadInstallationKey);
+        assert_eq!(
+            ensure_installation_key(&read_failure, &Mutex::new(())),
+            Err(AccountScopeError::InstallationKeyRead)
+        );
+        assert_eq!(metadata_bytes(&read_failure), metadata);
+        assert_eq!(
+            fs::read(read_failure.directory.join(V3_HISTORY_FILE)).unwrap(),
+            history
+        );
+        read_failure.cleanup();
+
+        for (tag, length) in [
+            ("installation-key-short", 31),
+            ("installation-key-long", 33),
         ] {
-            let backend = TestBackend::new(tag);
-            backend.state.lock().unwrap().key = key;
+            let backend = TestBackend::new(tag).with_installation_key(vec![0x62; length]);
+            let metadata = b"metadata-invalid-key";
+            let history = b"history-invalid-key";
+            fs::write(backend.directory.join(METADATA_FILE), metadata).unwrap();
+            fs::write(backend.directory.join(V3_HISTORY_FILE), history).unwrap();
+            let original_key = fs::read(installation_key_path(&backend)).unwrap();
+
+            assert_eq!(
+                ensure_installation_key(&backend, &Mutex::new(())),
+                Err(AccountScopeError::InvalidInstallationKey),
+                "{tag}"
+            );
+            assert_eq!(
+                fs::read(installation_key_path(&backend)).unwrap(),
+                original_key
+            );
+            assert_eq!(metadata_bytes(&backend), metadata);
+            assert_eq!(
+                fs::read(backend.directory.join(V3_HISTORY_FILE)).unwrap(),
+                history
+            );
+            backend.cleanup();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installation_key_path_attacks_fail_closed_without_mutating_artifacts() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        for case in ["symlink", "dangling", "non-regular", "mode"] {
+            let backend = TestBackend::new(case);
+            ensure_real_directory(&backend.directory).unwrap();
+            let key_path = installation_key_path(&backend);
+            let external = backend.directory.with_extension(format!("{case}-external"));
+            match case {
+                "symlink" => {
+                    fs::write(&external, [0x71; INSTALLATION_KEY_BYTES]).unwrap();
+                    fs::set_permissions(&external, fs::Permissions::from_mode(0o600)).unwrap();
+                    symlink(&external, &key_path).unwrap();
+                }
+                "dangling" => symlink(&external, &key_path).unwrap(),
+                "non-regular" => fs::create_dir(&key_path).unwrap(),
+                "mode" => {
+                    fs::write(&key_path, [0x72; INSTALLATION_KEY_BYTES]).unwrap();
+                    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o640)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let metadata = format!("metadata-{case}").into_bytes();
+            let history = format!("history-{case}").into_bytes();
+            fs::write(backend.directory.join(METADATA_FILE), &metadata).unwrap();
+            fs::write(backend.directory.join(V3_HISTORY_FILE), &history).unwrap();
+
+            assert_eq!(
+                ensure_installation_key(&backend, &Mutex::new(())),
+                Err(AccountScopeError::InvalidInstallationKey),
+                "{case}"
+            );
+            assert_eq!(metadata_bytes(&backend), metadata, "{case}");
+            assert_eq!(
+                fs::read(backend.directory.join(V3_HISTORY_FILE)).unwrap(),
+                history,
+                "{case}"
+            );
+            match case {
+                "symlink" => {
+                    assert_eq!(fs::read(&external).unwrap(), [0x71; INSTALLATION_KEY_BYTES]);
+                    assert!(fs::symlink_metadata(&key_path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink());
+                }
+                "dangling" => {
+                    assert!(fs::symlink_metadata(&key_path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink());
+                    assert!(!external.exists());
+                }
+                "non-regular" => assert!(key_path.is_dir()),
+                "mode" => {
+                    assert_eq!(fs::read(&key_path).unwrap(), [0x72; INSTALLATION_KEY_BYTES]);
+                    assert_eq!(unix_mode(&key_path), 0o640);
+                }
+                _ => unreachable!(),
+            }
+
+            backend.cleanup();
+            if external.exists() {
+                fs::remove_file(external).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installation_key_inode_replacement_fails_closed() {
+        let backend = TestBackend::new("installation-key-inode-swap")
+            .with_installation_key(vec![0x73; INSTALLATION_KEY_BYTES]);
+        let metadata = b"metadata-inode-swap";
+        let history = b"history-inode-swap";
+        fs::write(backend.directory.join(METADATA_FILE), metadata).unwrap();
+        fs::write(backend.directory.join(V3_HISTORY_FILE), history).unwrap();
+        backend.replace_installation_key_on_validate(vec![0x74; INSTALLATION_KEY_BYTES]);
+
+        assert_eq!(
+            ensure_installation_key(&backend, &Mutex::new(())),
+            Err(AccountScopeError::InvalidInstallationKey)
+        );
+        assert_eq!(metadata_bytes(&backend), metadata);
+        assert_eq!(
+            fs::read(backend.directory.join(V3_HISTORY_FILE)).unwrap(),
+            history
+        );
+        assert_eq!(
+            fs::read(installation_key_path(&backend)).unwrap(),
+            [0x74; INSTALLATION_KEY_BYTES]
+        );
+        backend.cleanup();
+    }
+
+    #[test]
+    fn atomic_installation_key_failures_leave_no_partial_file_or_temp() {
+        for operation in [
+            FsOperation::CreateTemp,
+            FsOperation::WriteTemp,
+            FsOperation::SyncTemp,
+            FsOperation::ReplaceFile,
+            FsOperation::SyncDirectory,
+        ] {
+            let backend = TestBackend::new("installation-key-atomic-failure");
+            backend.fail_fs(operation);
+            assert_eq!(
+                ensure_installation_key(&backend, &Mutex::new(())),
+                Err(AccountScopeError::InstallationKeyWrite),
+                "{operation:?}"
+            );
+            let key_path = installation_key_path(&backend);
+            if key_path.exists() {
+                assert_eq!(fs::read(&key_path).unwrap(), [0x11; INSTALLATION_KEY_BYTES]);
+                #[cfg(unix)]
+                assert_eq!(unix_mode(&key_path), 0o600);
+                assert_eq!(
+                    ensure_installation_key(&backend, &Mutex::new(())).unwrap(),
+                    [0x11; INSTALLATION_KEY_BYTES]
+                );
+            }
+            let temp_prefix = format!(".{INSTALLATION_KEY_FILE}.tmp-");
+            assert!(!fs::read_dir(&backend.directory).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&temp_prefix)
+            }));
+            backend.cleanup();
+        }
+    }
+
+    #[test]
+    fn metadata_only_orphan_recovery_key_write_failures_preserve_evidence_and_defer_scope() {
+        for operation in [
+            FsOperation::CreateTemp,
+            FsOperation::WriteTemp,
+            FsOperation::SyncTemp,
+            FsOperation::ReplaceFile,
+        ] {
+            let backend = TestBackend::new("metadata-only-orphan-key-write-failure");
+            backend.state.lock().unwrap().random = VecDeque::from([
+                vec![0x11; INSTALLATION_KEY_BYTES],
+                vec![0x12; INSTALLATION_KEY_BYTES],
+                vec![0x21; LINEAGE_ID_BYTES],
+            ]);
             fs::create_dir_all(&backend.directory).unwrap();
-            let original = b"fixture metadata";
-            fs::write(backend.directory.join(METADATA_FILE), original).unwrap();
+            let metadata = b"orphan-metadata-before-key-write";
+            let orphaned = backend
+                .directory
+                .join("quota-account-scope-v1.orphaned-1752710400.json");
+            fs::write(backend.directory.join(METADATA_FILE), metadata).unwrap();
+            backend.fail_fs(operation);
+
             assert_eq!(
                 resolve_test(&backend, &Mutex::new(()), b"marker"),
-                Err(expected)
+                Err(AccountScopeError::InstallationKeyWrite),
+                "{operation:?}"
             );
-            assert_eq!(metadata_bytes(&backend), original);
-            assert_eq!(backend.state.lock().unwrap().key_adds, 0);
+            assert!(!installation_key_path(&backend).exists());
+            assert!(!backend.directory.join(METADATA_FILE).exists());
+            assert_eq!(fs::read(&orphaned).unwrap(), metadata);
+            assert!(!backend.directory.join(V3_HISTORY_FILE).exists());
+            let temp_prefix = format!(".{INSTALLATION_KEY_FILE}.tmp-");
+            assert!(!fs::read_dir(&backend.directory).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&temp_prefix)
+            }));
+
+            assert_eq!(
+                resolve_test(&backend, &Mutex::new(()), b"marker"),
+                Err(AccountScopeError::OrphanedArtifacts)
+            );
+            assert_eq!(fs::read(&orphaned).unwrap(), metadata);
+            assert!(!backend.directory.join(METADATA_FILE).exists());
+            let winner = installation_key(&backend);
+            let scope = resolve_test(&backend, &Mutex::new(()), b"marker").unwrap();
+            assert_eq!(installation_key(&backend), winner);
+            assert_eq!(
+                resolve_test(&backend, &Mutex::new(()), b"marker").unwrap(),
+                scope
+            );
+            assert_eq!(installation_key(&backend), winner);
             backend.cleanup();
+        }
+    }
+
+    #[test]
+    fn orphaned_metadata_name_accepts_only_production_canonical_numbers() {
+        for (name, expected) in [
+            ("quota-account-scope-v1.orphaned-0.json", true),
+            ("quota-account-scope-v1.orphaned-0.1.json", true),
+            (
+                "quota-account-scope-v1.orphaned-9223372036854775807.4294967295.json",
+                true,
+            ),
+            ("quota-account-scope-v1.orphaned--1.json", false),
+            ("quota-account-scope-v1.orphaned-+1.json", false),
+            ("quota-account-scope-v1.orphaned-01.json", false),
+            (
+                "quota-account-scope-v1.orphaned-9223372036854775808.json",
+                false,
+            ),
+            ("quota-account-scope-v1.orphaned-1.1.2.json", false),
+            ("quota-account-scope-v1.orphaned-1.0.json", false),
+            ("quota-account-scope-v1.orphaned-1.+1.json", false),
+            ("quota-account-scope-v1.orphaned-1.01.json", false),
+            ("quota-account-scope-v1.orphaned-1.4294967296.json", false),
+            ("quota-account-scope-v1.orphaned-1.-1.json", false),
+        ] {
+            assert_eq!(is_orphaned_metadata_name(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn forged_negative_timestamp_orphan_does_not_defer_first_scope() {
+        let backend = TestBackend::new("forged-negative-orphan");
+        ensure_real_directory(&backend.directory).unwrap();
+        let forged = backend
+            .directory
+            .join("quota-account-scope-v1.orphaned--1.json");
+        let evidence = b"forged-negative-orphan-evidence";
+        fs::write(&forged, evidence).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&forged, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        assert!(!installation_key_path(&backend).exists());
+        assert!(!backend.directory.join(METADATA_FILE).exists());
+        assert!(!backend.directory.join(V3_HISTORY_FILE).exists());
+
+        let scope = resolve_test(&backend, &Mutex::new(()), b"marker").unwrap();
+
+        assert!(installation_key_path(&backend).exists());
+        assert!(backend.directory.join(METADATA_FILE).exists());
+        assert!(!backend.directory.join(V3_HISTORY_FILE).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(unix_mode(&forged), 0o000);
+            fs::set_permissions(&forged, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(fs::read(&forged).unwrap(), evidence);
+        assert_eq!(
+            resolve_test(&backend, &Mutex::new(()), b"marker").unwrap(),
+            scope
+        );
+        assert_eq!(fs::read(&forged).unwrap(), evidence);
+        backend.cleanup();
+    }
+
+    #[test]
+    fn orphaned_metadata_inspection_failure_fails_closed_without_creating_key() {
+        let backend = TestBackend::new("orphan-inspection-failure");
+        ensure_real_directory(&backend.directory).unwrap();
+        let orphaned = backend
+            .directory
+            .join("quota-account-scope-v1.orphaned-1752710400.json");
+        let evidence = b"preserved-orphan-evidence";
+        fs::write(&orphaned, evidence).unwrap();
+        backend.fail_fs(FsOperation::InspectOrphanedMetadata);
+
+        assert_eq!(
+            resolve_test(&backend, &Mutex::new(()), b"marker"),
+            Err(AccountScopeError::StorageUnavailable)
+        );
+        assert_eq!(fs::read(&orphaned).unwrap(), evidence);
+        assert!(!installation_key_path(&backend).exists());
+        assert!(!backend.directory.join(METADATA_FILE).exists());
+        assert!(!backend
+            .state
+            .lock()
+            .unwrap()
+            .events
+            .contains(&"create-temp"));
+
+        assert_eq!(
+            resolve_test(&backend, &Mutex::new(()), b"marker"),
+            Err(AccountScopeError::OrphanedArtifacts)
+        );
+        assert_eq!(fs::read(&orphaned).unwrap(), evidence);
+        backend.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_metadata_non_regular_entries_fail_closed_without_touching_targets() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        for case in ["symlink", "directory"] {
+            let backend = TestBackend::new(&format!("orphan-{case}"));
+            ensure_real_directory(&backend.directory).unwrap();
+            let orphaned = backend
+                .directory
+                .join("quota-account-scope-v1.orphaned-1752710400.json");
+            let external = backend.directory.with_extension(format!("{case}-target"));
+            let target_bytes = b"external-orphan-target";
+            match case {
+                "symlink" => {
+                    fs::write(&external, target_bytes).unwrap();
+                    fs::set_permissions(&external, fs::Permissions::from_mode(0o640)).unwrap();
+                    symlink(&external, &orphaned).unwrap();
+                }
+                "directory" => fs::create_dir(&orphaned).unwrap(),
+                _ => unreachable!(),
+            }
+
+            assert_eq!(
+                resolve_test(&backend, &Mutex::new(()), b"marker"),
+                Err(AccountScopeError::StorageUnavailable),
+                "{case}"
+            );
+            assert!(!installation_key_path(&backend).exists(), "{case}");
+            assert!(!backend.directory.join(METADATA_FILE).exists(), "{case}");
+            assert!(!backend
+                .state
+                .lock()
+                .unwrap()
+                .events
+                .contains(&"create-temp"));
+            match case {
+                "symlink" => {
+                    assert_eq!(fs::read(&external).unwrap(), target_bytes);
+                    assert_eq!(unix_mode(&external), 0o640);
+                    assert!(fs::symlink_metadata(&orphaned)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink());
+                }
+                "directory" => assert!(orphaned.is_dir()),
+                _ => unreachable!(),
+            }
+
+            backend.cleanup();
+            if external.exists() {
+                fs::remove_file(external).unwrap();
+            }
         }
     }
 
@@ -2101,7 +2415,7 @@ mod tests {
             resolve_test(&backend, &Mutex::new(()), b"marker"),
             Err(AccountScopeError::RandomUnavailable)
         );
-        assert_eq!(backend.keychain_read().unwrap(), None);
+        assert!(!installation_key_path(&backend).exists());
         assert!(!backend.directory.join(METADATA_FILE).exists());
         backend.cleanup();
     }
@@ -2131,7 +2445,9 @@ mod tests {
             .unwrap(),
             metadata
         );
+        let winner = installation_key(&backend);
         assert!(resolve_test(&backend, &Mutex::new(()), b"marker").is_ok());
+        assert_eq!(installation_key(&backend), winner);
         backend.cleanup();
     }
 
@@ -2149,7 +2465,9 @@ mod tests {
             fs::read(backend.directory.join(V3_HISTORY_FILE)).unwrap(),
             history
         );
+        let winner = installation_key(&backend);
         assert!(resolve_test(&backend, &Mutex::new(()), b"marker").is_ok());
+        assert_eq!(installation_key(&backend), winner);
         backend.cleanup();
     }
 
@@ -2209,15 +2527,14 @@ mod tests {
             Err(AccountScopeError::QuarantineFailed)
         );
         assert_eq!(metadata_bytes(&backend), original);
-        assert_eq!(backend.state.lock().unwrap().key_adds, 0);
-        assert_eq!(backend.keychain_read().unwrap(), None);
+        assert!(!installation_key_path(&backend).exists());
         backend.cleanup();
     }
 
     #[test]
     fn corrupt_quarantine_failure_preserves_authenticated_recovery_evidence() {
         let backend = TestBackend::new("corrupt-quarantine-failure")
-            .with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+            .with_installation_key(vec![0x11; INSTALLATION_KEY_BYTES]);
         fs::create_dir_all(&backend.directory).unwrap();
         let corrupt = b"corrupt-but-preserved";
         fs::write(backend.directory.join(METADATA_FILE), corrupt).unwrap();
@@ -2255,7 +2572,8 @@ mod tests {
                 br#"{"schemaVersion":2,"payloadBytesBase64":"e30=","payloadMac":"bad"}"#.as_slice(),
             ),
         ] {
-            let backend = TestBackend::new(tag).with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+            let backend =
+                TestBackend::new(tag).with_installation_key(vec![0x11; INSTALLATION_KEY_BYTES]);
             fs::create_dir_all(&backend.directory).unwrap();
             let metadata_path = backend.directory.join(METADATA_FILE);
             fs::write(&metadata_path, bytes).unwrap();
@@ -2284,7 +2602,7 @@ mod tests {
         }
 
         let backend = TestBackend::new("authoritative-corrupt-quarantine-failure")
-            .with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+            .with_installation_key(vec![0x11; INSTALLATION_KEY_BYTES]);
         fs::create_dir_all(&backend.directory).unwrap();
         let metadata_path = backend.directory.join(METADATA_FILE);
         let original = b"corrupt-authoritative-metadata";
@@ -2316,7 +2634,8 @@ mod tests {
                 br#"{"schemaVersion":2,"payloadBytesBase64":"e30=","payloadMac":"bad"}"#.as_slice(),
             ),
         ] {
-            let backend = TestBackend::new(tag).with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+            let backend =
+                TestBackend::new(tag).with_installation_key(vec![0x11; INSTALLATION_KEY_BYTES]);
             fs::create_dir_all(&backend.directory).unwrap();
             fs::write(backend.directory.join(METADATA_FILE), bytes).unwrap();
             assert_eq!(
@@ -2335,11 +2654,10 @@ mod tests {
 
     #[test]
     fn authenticated_payload_with_missing_schema_fields_is_quarantined() {
-        let backend =
-            TestBackend::new("missing-payload-field").with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+        let backend = TestBackend::new("missing-payload-field")
+            .with_installation_key(vec![0x11; INSTALLATION_KEY_BYTES]);
         fs::create_dir_all(&backend.directory).unwrap();
-        let key = installation_key_from_bytes(backend.keychain_read().unwrap().as_deref().unwrap())
-            .unwrap();
+        let key = installation_key(&backend);
         let payload_bytes = br#"{"bindings":[]}"#;
         let metadata_key = metadata_mac_key(&key).unwrap();
         let mac = hmac_digest(&metadata_key, &[payload_bytes.as_slice()]).unwrap();
@@ -2387,8 +2705,8 @@ mod tests {
     fn metadata_lock_symlink_fails_closed_before_lock_acquisition() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-        let backend =
-            TestBackend::new("metadata-lock-symlink").with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+        let backend = TestBackend::new("metadata-lock-symlink")
+            .with_installation_key(vec![0x11; INSTALLATION_KEY_BYTES]);
         fs::create_dir_all(&backend.directory).unwrap();
         let target = backend.directory.with_extension("external-metadata-lock");
         let lock_path = backend.directory.join(METADATA_LOCK_FILE);
@@ -2424,8 +2742,8 @@ mod tests {
     fn active_metadata_symlink_fails_closed_without_touching_target() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-        let backend =
-            TestBackend::new("metadata-symlink").with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+        let backend = TestBackend::new("metadata-symlink")
+            .with_installation_key(vec![0x11; INSTALLATION_KEY_BYTES]);
         fs::create_dir_all(&backend.directory).unwrap();
         let target = backend.directory.with_extension("external-metadata");
         let metadata_path = backend.directory.join(METADATA_FILE);
@@ -2484,11 +2802,11 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
-        assert_eq!(backend.keychain_read().unwrap(), None);
-        assert_eq!(backend.state.lock().unwrap().key_adds, 0);
+        assert!(!installation_key_path(&backend).exists());
         let events = backend.state.lock().unwrap().events.clone();
+        assert!(events.contains(&"open-metadata-lock"));
+        assert!(events.contains(&"acquire-metadata-lock"));
         assert!(events.contains(&"inspect-artifacts"));
-        assert!(!events.contains(&"open-metadata-lock"));
         assert!(!events.contains(&"quarantine-metadata"));
 
         backend.cleanup();
@@ -2500,8 +2818,7 @@ mod tests {
     fn account_final_directory_symlink_fails_before_chmod_or_artifact_creation() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-        let backend =
-            TestBackend::new("directory-symlink").with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+        let backend = TestBackend::new("directory-symlink");
         let target = backend.directory.with_extension("external-directory");
         fs::create_dir(&target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2522,7 +2839,6 @@ mod tests {
         assert!(events.contains(&"create-directory"));
         assert!(!events.contains(&"open-metadata-lock"));
         assert!(!events.contains(&"create-temp"));
-        assert_eq!(backend.state.lock().unwrap().key_adds, 0);
 
         fs::remove_file(&backend.directory).unwrap();
         fs::remove_dir(target).unwrap();
@@ -2626,8 +2942,8 @@ mod tests {
     fn dangling_metadata_quarantine_collision_is_not_overwritten() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-        let backend =
-            TestBackend::new("dangling-quarantine").with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+        let backend = TestBackend::new("dangling-quarantine")
+            .with_installation_key(vec![0x11; INSTALLATION_KEY_BYTES]);
         fs::create_dir_all(&backend.directory).unwrap();
         let metadata_path = backend.directory.join(METADATA_FILE);
         let corrupt = b"corrupt-metadata-with-dangling-collision";
@@ -2656,7 +2972,6 @@ mod tests {
         assert_eq!(fs::read(&quarantined).unwrap(), corrupt);
         assert_eq!(unix_mode(&quarantined), 0o600);
         assert!(!metadata_path.exists());
-        assert_eq!(backend.state.lock().unwrap().key_adds, 0);
         assert!(!backend
             .state
             .lock()
@@ -2678,8 +2993,7 @@ mod tests {
         let metadata_path = backend.directory.join(METADATA_FILE);
         let bytes = fs::read(&metadata_path).unwrap();
         fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o644)).unwrap();
-        let key = installation_key_from_bytes(backend.keychain_read().unwrap().as_deref().unwrap())
-            .unwrap();
+        let key = installation_key(&backend);
 
         let payload = load_metadata(&backend, &backend.directory, &key).unwrap();
         assert_eq!(payload.bindings.len(), 1);
@@ -2694,8 +3008,7 @@ mod tests {
     fn symlinked_ancestor_is_allowed_when_final_account_directory_is_real() {
         use std::os::unix::fs::symlink;
 
-        let mut backend =
-            TestBackend::new("ancestor-symlink").with_key(vec![0x11; INSTALLATION_KEY_BYTES]);
+        let mut backend = TestBackend::new("ancestor-symlink");
         let seed = backend.directory.clone();
         let real_parent = seed.with_extension("real-parent");
         let linked_parent = seed.with_extension("linked-parent");
@@ -2777,8 +3090,7 @@ mod tests {
         let backend = TestBackend::new("binding-conflict");
         let lock = Mutex::new(());
         resolve_test(&backend, &lock, b"old").unwrap();
-        let key = installation_key_from_bytes(backend.keychain_read().unwrap().as_deref().unwrap())
-            .unwrap();
+        let key = installation_key(&backend);
         let directory = backend.directory.clone();
         let mut payload = decode_metadata(&key, &metadata_bytes(&backend)).unwrap();
         let mut duplicate = payload.bindings[0].clone();
@@ -2857,26 +3169,31 @@ mod tests {
         );
         fs::write(backend.directory.join(V3_HISTORY_FILE), history).unwrap();
         let metadata = metadata_bytes(&backend);
-        let key = installation_key_from_bytes(backend.keychain_read().unwrap().as_deref().unwrap())
-            .unwrap();
+        let key = installation_key(&backend);
         decode_metadata(&key, &metadata).unwrap();
         let envelope: MetadataEnvelope = serde_json::from_slice(&metadata).unwrap();
         let decoded_payload = STANDARD
             .decode(envelope.payload_bytes_base64.as_bytes())
             .unwrap();
         let files = [
+            fs::read(installation_key_path(&backend)).unwrap(),
             metadata,
             decoded_payload,
             fs::read(backend.directory.join(V3_HISTORY_FILE)).unwrap(),
         ];
         for bytes in files {
-            let text = String::from_utf8(bytes).unwrap();
             for raw in raw_values {
-                assert!(!text.contains(raw));
                 let digest = Sha256::digest(raw.as_bytes());
-                assert!(!text.contains(&format!("{digest:x}")));
-                assert!(!text.contains(&STANDARD.encode(digest)));
-                assert!(!text.contains(&URL_SAFE_NO_PAD.encode(digest)));
+                for forbidden in [
+                    raw.as_bytes().to_vec(),
+                    format!("{digest:x}").into_bytes(),
+                    STANDARD.encode(digest).into_bytes(),
+                    URL_SAFE_NO_PAD.encode(digest).into_bytes(),
+                ] {
+                    assert!(!bytes
+                        .windows(forbidden.len())
+                        .any(|window| window == forbidden));
+                }
             }
         }
         #[cfg(unix)]
@@ -2891,6 +3208,7 @@ mod tests {
                 0o700
             );
             for path in [
+                backend.directory.join(INSTALLATION_KEY_FILE),
                 backend.directory.join(METADATA_FILE),
                 backend.directory.join(METADATA_LOCK_FILE),
             ] {
@@ -2911,5 +3229,24 @@ mod tests {
         let second = resolve_test(&restarted, &Mutex::new(()), b"marker").unwrap();
         assert_eq!(first, second);
         backend.cleanup();
+    }
+
+    #[test]
+    fn account_scope_source_has_no_legacy_installation_key_query() {
+        let source = include_str!("agent_account_scope.rs");
+        for forbidden in [
+            ["com.nyanako.tokenbar.account-scope.", "v1"].concat(),
+            ["SecItem", "CopyMatching"].concat(),
+            ["SecItem", "Add"].concat(),
+        ] {
+            assert!(!source.contains(&forbidden), "{forbidden}");
+        }
+        let manifest = include_str!("../Cargo.toml");
+        for forbidden in [
+            ["core-", "foundation"].concat(),
+            ["security-framework", "-sys"].concat(),
+        ] {
+            assert!(!manifest.contains(&forbidden), "{forbidden}");
+        }
     }
 }

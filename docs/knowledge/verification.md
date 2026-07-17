@@ -4,8 +4,8 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-07-16
-sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "crates/tb_core_ffi/src/agent_history.rs", "docs/knowledge/plans/codex-historical-pace-v2.md", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
+last_verified: 2026-07-17
+sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_history.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
 # Verification contract
@@ -49,7 +49,8 @@ sources: [".github/workflows/ci.yml", "Makefile", "Package.swift", "scripts/bund
 | Sibling-only write | 預設 fingerprint 不失效；完整 fingerprint、mtime probe、prune 都失效 |
 | Provider cost | 缺失成本可估算；明確 provider-reported 成本不可被 stale pricing 覆蓋 |
 | Hidden client | non-empty partial selection 在 Rust fold 前排除未選 client；`nil`／empty clients 依 C ABI contract 代表 all clients；all-hidden 由 Swift lens strict membership 阻擋 |
-| Quota history | Reset jitter、floating zero、partial／future-reset weeks、account isolation、corrupt recovery 與 current-actual shift 都以 temporary v2 store 驗證；live provider refresh 只作 smoke |
+| Quota account scope | 以temporary Application Support驗證exact 32-byte key、directory `0700`／file `0600`、每次reload、cross-process winner、symlink／non-regular／inode swap fail-closed、key-loss orphan recovery、atomic failure與raw-value scan；不得呼叫真實Keychain或provider credential |
+| Quota history | Reset jitter、floating zero、duration lifecycle、partial／future-reset cycles、active-series capacity、account isolation、corrupt recovery與current-actual shift都以temporary v3 store驗證；Codex v2只驗byte-exact current-account migration，live provider refresh只作smoke |
 | Overflow input | old arithmetic fails or wraps in the targeted site；new saturating path remains bounded |
 | Cache schema | 舊版本 cache 不被當成新 layout 靜默接受；新 layout 可重建並 reload |
 
@@ -79,12 +80,15 @@ swift run TokenBar --smoke
 
 `cargo test` and `cargo clippy --workspace --all-targets` are local full code-change gates; this document does not claim that the current CI workflow runs them. The `--all-targets` flag is required because `vendor/tokscale-core/src/lib.rs` declares `#![deny(clippy::all)]`, so a test-only lint can fail the gate even when the library target itself is clean.
 
+Live account-scope smoke必須在hermetic security suite通過後才執行，且每次重新執行都需要當次明確授權。若出現任何Keychain或credential授權視窗，立即停止process並把smoke判為失敗；不得要求輸入登入密碼、讀取secret或用真實credential診斷。
+
 | Gate | Expected evidence |
 |---|---|
 | Rust | Release static library builds from the current source |
 | Swift | SwiftPM links against the freshly built library from repository root |
 | Selftest | UI-free TokenBarCore assertions pass |
-| Smoke | Every C ABI entry point decodes or reports an intentional error envelope |
+| Smoke | Every C ABI entry point decodes or reports an intentional error envelope；account-scope path不得存取Keychain或顯示credential authorization UI |
+| Account-scope storage | Hermetic security tests先證明permission、path、locking、atomicity與recovery；live smoke只驗證shipping data flow不彈授權UI，不取代fixture correctness |
 | Relink safety | If Rust changed without Swift source changes, the stale executable is removed before linking |
 | Rust format | For Rust changes, run `cargo fmt --all -- --check` on the touched scope; vendor formatting policy may be intentionally separate |
 | Local Rust tests | `cargo test` passes across workspace crates and test targets |

@@ -3,9 +3,9 @@ status: active
 id: kb-release
 kind: canonical
 scope: repository
-read_when: changing release scripts, appcast, Sparkle, Homebrew, Pages, or post-release notes
-last_verified: 2026-07-14
-sources: [".github/workflows/release.yml", ".github/workflows/pages.yml", ".github/workflows/update-install-count.yml", "appcast.xml", "Makefile", "public release history"]
+read_when: changing release scripts, code signing, appcast, Sparkle, Homebrew, Pages, or post-release notes
+last_verified: 2026-07-17
+sources: [".github/workflows/release.yml", ".github/workflows/pages.yml", ".github/workflows/update-install-count.yml", "scripts/bundle.sh", "appcast.xml", "Makefile", "docs/knowledge/plans/provider-quota-pace.md", "public release history"]
 ---
 
 # Release and delivery
@@ -18,6 +18,7 @@ sources: [".github/workflows/release.yml", ".github/workflows/pages.yml", ".gith
 
 - [Delivery map](#delivery-map)
 - [Application release](#application-release)
+- [Code signing and local secret storage](#code-signing-and-local-secret-storage)
 - [Sparkle and appcast](#sparkle-and-appcast)
 - [Migration principle](#migration-principle)
 - [Legacy and beta migration](#legacy-and-beta-migration)
@@ -56,6 +57,12 @@ The release workflow is tag-driven. It validates and bundles the native app, pro
 | Install count | `update-install-count.yml` | Orphan badge branch contains the current filtered asset count |
 
 > **授權邊界：** 發版是不可逆的公開狀態變更。除非使用者明確要求，不能自行 tag、push appcast、改 Release body、更新 cask 或發佈 asset。
+
+## Code signing and local secret storage
+
+目前SwiftPM與release bundle都是ad-hoc signed；這能驗證bundle完整性流程，但不提供跨rebuild／update穩定的Developer ID designated requirement。因此provider pace的account-scope installation key不得依賴restrictive Keychain ACL，現行source of truth是hardened Application Support目錄內的exact 32-byte owner-only file（directory `0700`、file `0600`）。既有開發用Keychain item不讀取、不刪除、不更新、不遷移。
+
+若未來release chain採用穩定Developer ID signing，可將「Developer ID-gated account-scope Keychain migration」由parked狀態另立plan。Migration必須先匯入並驗證與file完全相同的32 bytes，成功前file仍是source of truth；不得生成新key，否則既有`accountScope`與quota history會斷代。採用Developer ID本身不自動授權實作、發版或刪除舊storage。
 
 ## Sparkle and appcast
 

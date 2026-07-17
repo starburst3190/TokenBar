@@ -18,7 +18,7 @@ sources: ["crates/tb_core_ffi/src/agent_history.rs", "crates/tb_core_ffi/src/age
 
 > **核心結果：** pace duration 屬於 quota window，不屬於 provider 特例。任何已顯示、具有 recurring percentage quota 語意的 card，都必須走同一個 duration lifecycle；無法證明 duration 時，UI 必須明示原因，而不是顯示看似真實的 pace。
 >
-> **Implementation checkpoint（2026-07-17）：** Mac Stages 0–6 已在任務分支落地：secure account scope、duration lifecycle、generic v3 history、五個 provider adapters、typed Swift lifecycle／selection／presentation，以及 Rust serializer 鎖定的跨語言 fixture 均已通過各自的 hermetic gate。Stage 7 repository-wide 與人工 live UX gate 尚未結案；Windows port／parity 仍是 pending，本 checkpoint 沒有寫入 Windows repository。
+> **Implementation checkpoint（2026-07-17）：** Mac Stages 0–6 已在任務分支落地：secure account scope、duration lifecycle、generic v3 history、五個 provider adapters、typed Swift lifecycle／selection／presentation，以及 Rust serializer 鎖定的跨語言 fixture 均已通過各自的 hermetic gate。Stage 7 首次 live smoke 揭露 legacy file-Keychain ACL 在 ad-hoc rebuild 下仍會顯示授權 UI；使用者因此核准把尚未出貨的 installation key改為 hardened owner-only file。0600 storage security regressions、完整 Rust workspace tests／Clippy、Rust→Swift build、Swift selftest、docs gates與fresh verifier均已通過；full workspace `cargo fmt --all -- --check`仍只命中既有out-of-scope `hourly_report.rs`、`model_report.rs`與vendor formatting。重新授權的monitored live smoke與人工UX gate尚未結案；Windows port／parity維持pending，本checkpoint沒有寫入Windows repository。
 
 ## 目錄
 
@@ -91,7 +91,7 @@ History series 使用 `SeriesKey { providerId, accountScope, windowKey }`。Dura
 
 ### Account scope resolver
 
-Security review 已把 Mac protocol 鎖定如下。Implementation 不得自行換成 token hash、path／slot-only identity或額外 provider endpoint；這個 trust-boundary stage 只能交給 `security-executor`。
+Security review 與 2026-07-17 live prompt 後的修訂已把 Mac protocol 鎖定如下。Implementation 不得自行換成 token hash、path／slot-only identity、account-scope Keychain或額外 provider endpoint；這個 trust-boundary stage只能交給 `security-executor`。
 
 | Priority | Evidence | `accountScope` | Failure behavior |
 |---|---|---|---|
@@ -114,9 +114,9 @@ Antigravity local IDE 的 email 來自 authenticated `GetUserStatus`，可走 au
 
 | Item | Frozen behavior |
 |---|---|
-| Key generation | `SecRandomCopyBytes` 產生 32 bytes；concurrent first creation採 add-if-absent，loser重新讀取 winner |
-| Key storage | Non-synchronizing generic-password Keychain item；service `com.nyanako.tokenbar.account-scope.v1`、account `installation-key` |
-| API boundary | 直接使用 Security.framework；不得把 key或 metadata傳給 `security -w`／process argv |
+| Key generation | `SecRandomCopyBytes` 產生 32 bytes；concurrent first creation在 account-scope process mutex與 `fs2` file lock內完成，所有 caller重新讀取並驗證同一 persisted winner |
+| Key storage | Application Support 的 `quota-account-scope-installation-key-v1.bin`；exact 32-byte binary、directory mode `0700`、file mode `0600`、write／`sync_all`／atomic replace後 sync parent directory |
+| API boundary | Account-scope不使用 Keychain、`security` CLI或process argv；既有開發用 `com.nyanako.tokenbar.account-scope.v1` item只忽略，不讀取、刪除、更新或遷移 |
 | HMAC | HMAC-SHA256，完整 32-byte output以 unpadded base64url保存；不得截短到 128 bits以下 |
 | Authoritative scope | `HMAC(K, encode("scope-id-v1", provider, kind, normalizedIdentifier))` |
 | Credential fingerprint | `HMAC(K, encode("credential-v1", provider, rawCredentialMarker))` |
@@ -126,7 +126,7 @@ Antigravity local IDE 的 email 來自 authenticated `GetUserStatus`，可走 au
 
 `encode` 對每個 byte field 依序寫入 unsigned 32-bit big-endian length，再寫 exact bytes；domain 也是第一個 length-prefixed field。Text fields 先轉 UTF-8；credential marker 與 random lineage 保留 raw bytes。這個 encoding 套用到所有 HMAC 與 known vectors，不使用分隔字串或無長度 concatenation。
 
-Raw identifier 與 credential marker 只在記憶體短暫存在。Email normalization 是 trim 加 ASCII lowercase；opaque provider ID 只 trim，保留 byte case。History 只保存最後的 `accountScope`；low-entropy email 不能在缺少 installation key 時離線猜回。
+Raw identifier 與 credential marker只在記憶體短暫存在。Email normalization是 trim加 ASCII lowercase；opaque provider ID只 trim，保留 byte case。History只保存最後的 `accountScope`；單獨取得metadata／history而未取得installation-key file時，不能對low-entropy email做離線猜測。`0600`／`0700`邊界保護其他本機使用者；已能以相同UID任意讀取Application Support的惡意程式不在此權限模型內。
 
 #### Credential markers and secure metadata
 
@@ -160,13 +160,13 @@ payload.currentFingerprintBySlot
 
 Metadata 不保存 raw token、email、account ID、path、display label或 plain SHA-256。Fingerprint binding immutable；相同 provider credential出現在另一個 source可重用 lineage；同 slot出現未知 fingerprint會建立新 lineage。Any conflicting existing binding fails closed，不自動 merge。
 
-Metadata 的 load → MAC verify → mutate → atomic save 使用獨立 process mutex 與 `fs2` exclusive lock；temp file mode `0600`，write／`sync_all`／atomic rename 後 sync parent directory。不得同時持有 metadata lock 與 v3 history lock；network 與 Keychain call 不得在 metadata／v3 lock 內執行。Provider refresh lock 是唯一可跨 network request 持有的 file lock。順序固定為：先讀 Keychain key，refresh 若需要則完成下列 refresh transaction，完成並釋放 metadata transaction，最後才取得 v3 lock 寫 history。
+Installation-key 的 read／first-create／key-loss recovery與metadata的 load → MAC verify → mutate → atomic save共用 account-scope process mutex與 `fs2` exclusive lock；temp file mode `0600`，write／`sync_all`／atomic replace後 sync parent directory。每次scope resolution都從persisted key file重讀，不使用process cache。不得同時持有account-scope lock與v3 history lock；network不得在account-scope／v3 lock內執行。Provider refresh lock是唯一可跨network request持有的file lock。順序固定為：先完成installation-key transaction並釋放account-scope lock；refresh若需要則依下列refresh lock → metadata lock順序完成lineage transfer；最後才取得v3 lock寫history。
 
 #### Refresh transaction and recovery
 
 App-controlled refresh 的 cross-process lock 固定為 Application Support 的 `quota-auth-refresh-<provider>.lock`，以 owner-only mode 開啟。Lock ordering 只能是 refresh lock → metadata lock；不得在持有 metadata／v3 lock 時反向取得 refresh lock。流程固定依序：
 
-1. 先從 Keychain 讀 installation key，再取得 provider refresh process／file lock。
+1. 先在account-scope lock內讀取或recover installation-key file並釋放該lock，再取得provider refresh process／file lock；key error保留為typed unavailable，但不得阻止既有credential refresh本身。
 2. 取得 refresh lock 後重新載入 exact current auth record並計算 `F_old`。
 3. 持有 refresh lock 執行既有 refresh request，從回傳 credential 計算 `F_new`；此時不持有 metadata／v3 lock。
 4. 在 metadata transaction 內確認 `F_old` lineage 無 conflict，並把 `F_old`、`F_new` 綁到同一 lineage；persist 後立即釋放 metadata lock。
@@ -177,19 +177,22 @@ Crash before metadata save不會以 new credential寫 history；crash between me
 
 | Failure／restore | Required result |
 |---|---|
-| Keychain denied／locked 或 existing item 長度不是 32 bytes | Typed unavailable；不得 replace key、quarantine metadata 或讀寫 history |
-| Key item not found，且沒有 metadata／v3 artifacts | Add-if-absent 建立 key；concurrent loser 重讀 winner；可在同一 poll 建立 metadata |
-| Key item not found，但 metadata 或 v3 已存在 | 若 metadata 存在，先 byte-preserving rename 到 unique `.orphaned-<seconds>[.<n>].json`；成功後才 add-if-absent 建立 key；v3 原位保留為 orphaned scopes；該 poll unavailable，下一 poll 建立 fresh metadata |
-| Metadata syntax／schema／MAC invalid | 使用 existing valid key 先 byte-preserving rename 到 unique `.corrupt-<seconds>[.<n>].json`；該 poll unavailable；下一 poll 建立 fresh metadata |
-| Any quarantine failure | 不建立／replace key，不建立／overwrite metadata，不讀寫 v3 |
-| Metadata lock／save failure 或 binding conflict | Typed unavailable；保留最後有效 metadata 與 history |
-| Normal app reinstall | Keychain 與 Application Support 仍在時恢復同 scopes |
-| Consistent full restore | Key、metadata、v3 三者一致才恢復 |
-| Explicit full purge | 必須一起刪除 Keychain key、metadata、v3 與 legacy v2；本 Plan 不新增 purge UI，也不宣稱 APFS secure erase |
+| Existing key無法讀取、不是real regular file、mode不是exact `0600`、inode在驗證期間被替換，或長度不是exact 32 bytes | Typed unavailable；不得replace key、quarantine metadata或讀寫history |
+| Key file不存在，且沒有metadata／v3 artifacts | 在account-scope lock內建立owner-only key並atomic replace；重新讀取persisted winner後可在同一poll建立metadata |
+| Key file不存在，但canonical metadata、既有`.orphaned-*` metadata evidence或v3已存在 | 若canonical metadata存在，先byte-preserving rename到unique `.orphaned-<seconds>[.<n>].json`；既有orphaned evidence只作保守存在性判定，不讀取、覆寫或刪除；成功後才建立key；v3原位保留為orphaned scopes；建立並重讀winner後，first poll回`unavailable(accountScope)`，下一poll建立fresh metadata |
+| Metadata syntax／schema／MAC invalid | 使用existing valid key先byte-preserving rename到unique `.corrupt-<seconds>[.<n>].json`；該poll unavailable；下一poll建立fresh metadata |
+| Any quarantine failure | 不建立或replace key，不建立／overwrite metadata，不讀寫v3；保留原始或已rollback的證據 |
+| Key atomic-write failure | Replace前不得留下partial key或temp；replace後的parent-directory sync failure可留下exact `0600` winner，但本poll仍typed unavailable，下一次resolution重新讀取並驗證該winner；不得讀寫v3 |
+| Account-scope lock／metadata save failure或binding conflict | Typed unavailable；保留最後有效metadata與history |
+| Normal app reinstall | Application Support仍在時恢復同installation key、metadata與scopes；若Application Support被移除則視為新installation |
+| Consistent full restore | Installation key、metadata、v3三者一致才恢復 |
+| Explicit full purge | 必須一起刪除installation-key file、metadata、v3與legacy v2；本Plan不新增purge UI，也不宣稱APFS secure erase |
 
 Retained v2 仍含 legacy raw Codex account key，因此分類為 legacy-sensitive rollback data；「沒有 raw identifier」只適用新 metadata與 v3。這份 Plan保留 v2 bytes／mtime／path，不隱瞞或假稱已清除；v2 retirement必須是 rollback window結束後的獨立明確決策。
 
-Security fixtures 必須覆蓋 HMAC known vectors／domain separation、different-installation unlinkability、各 credential source、refresh每一步 crash injection、same-slot replacement、two-process create／transfer conflict、Keychain／MAC／lock／quarantine failures、Antigravity stale active-email mismatch，以及 metadata／v3 byte scan不含 fixture raw values或其 plain SHA-256。
+Security fixtures必須覆蓋HMAC known vectors／domain separation、different-installation unlinkability、各credential source、refresh每一步crash injection、same-slot replacement、two-process create／transfer conflict、key exact-length／mode／symlink／non-regular／inode-replacement防護、key-loss orphan recovery、MAC／lock／atomic-write／quarantine failures、Antigravity stale active-email mismatch，以及metadata／v3 byte scan不含fixture raw values或其plain SHA-256。
+
+現行release是ad-hoc signed，因此restrictive Keychain ACL沒有跨rebuild／update的stable code identity。未來只有在release chain採用穩定Developer ID signing後，才可另立migration plan評估升級回Keychain；migration必須匯入並驗證與現有file完全相同的32 bytes，成功前file維持source of truth，絕不能生成新key造成`accountScope`與history斷代。舊開發用Keychain item不屬於migration input。
 
 ### Stable window keys
 
@@ -429,7 +432,7 @@ Stage 0 no longer discovers mappings。It turns every row and every reject rule 
 | Stage | Exclusive ownership and primary files | Work | Exit gate |
 |---|---|---|---|
 | 0. Freeze capability fixtures | Main session；provider modules與 dedicated fixtures | 把 frozen source-field matrix、aliases、unknown-key rejects與 current silent-fallback behavior變成 old-fail fixtures | Matrix每一列與 reject rule都有 case ID；本階段不再做 product discovery |
-| 1. Secure account scope | `security-executor`；new account-scope module與 provider auth hooks | 實作 Keychain installation key、HMAC、authenticated metadata、lineage transfer與 fail-closed recovery | Approved security protocol逐項有 fixture；Antigravity stale email不能 scope／label remote quota |
+| 1. Secure account scope | `security-executor`；new account-scope module與provider auth hooks | 實作owner-only installation-key file、HMAC、authenticated metadata、lineage transfer與fail-closed recovery | Approved security protocol逐項有fixture；storage path／permission attacks fail closed；Antigravity stale email不能scope／label remote quota |
 | 2. V3 shell and duration lifecycle | `executor`；new duration／v3 store modules、provider-neutral `UsageWindow` internals | 建立 locked atomic `SeriesState` store，實作 provider／contract／observed resolver與 durable rollover state | Restart／corruption／account-isolation加5h／7d／monthly／missed-boundary fixtures綠燈 |
 | 3. Generic history and migration | `executor`；v3 store／evaluator modules與 legacy `agent_history.rs` reader | 加 cycle-aware sampling／retention／confidence、current-account-only v2 import與 coherent evaluator | Exact migration collision matrix與5h／7d／monthly evaluator fixtures綠燈；v1／v2 unchanged proofs成立 |
 | 4. Provider adapters | `executor`；`agent_usage.rs`、Antigravity／Copilot／Grok modules | 為每個 card 注入 account scope、stable key、duration與 v3 enrichment | Provider matrix逐列有 serialized fixture；Codex 不再是特殊 enrichment entry point |
