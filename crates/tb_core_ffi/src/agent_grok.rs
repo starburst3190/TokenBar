@@ -318,17 +318,14 @@ fn period_details(config: &BillingConfig) -> PeriodMeta {
     let start = start_raw.and_then(parse_timestamp);
     let end = end_raw.and_then(parse_timestamp);
     let (duration, invalid_evidence) = match (start_raw, end_raw, start, end) {
-        (Some(_), Some(_), Some(start), Some(end)) => {
-            // Preserve contradictory provider evidence; never reinterpret it as
-            // an observed duration.
-            (
-                Some(DurationEvidence::provider(
-                    end.timestamp(),
-                    (end - start).num_seconds(),
-                )),
-                false,
-            )
-        }
+        (Some(_), Some(_), Some(start), Some(end)) if end > start => (
+            Some(DurationEvidence::provider(
+                end.timestamp(),
+                (end - start).num_seconds(),
+            )),
+            false,
+        ),
+        (Some(_), Some(_), Some(_), Some(_)) => (None, true),
         (Some(_), Some(_), _, _) => (None, true),
         (Some(_), None, _, _) => (None, false),
         (None, Some(_), _, Some(_)) => (None, false),
@@ -341,22 +338,6 @@ fn period_details(config: &BillingConfig) -> PeriodMeta {
         duration,
         invalid_evidence,
     }
-}
-
-#[cfg(test)]
-fn period_meta(config: &BillingConfig) -> (String, Option<DateTime<Utc>>, Option<i64>) {
-    let details = period_details(config);
-    (
-        details
-            .kind
-            .map(|(label, _)| label.to_string())
-            .unwrap_or_else(|| "Unknown".to_string()),
-        details.end,
-        details
-            .duration
-            .filter(|evidence| evidence.duration_seconds > 0)
-            .map(|evidence| evidence.duration_seconds / 60),
-    )
 }
 
 fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -806,67 +787,127 @@ mod tests {
     }
 
     #[test]
-    fn stage0_freezes_grok_period_routes_and_unknown_baseline() {
-        let monthly: BillingConfig = serde_json::from_str(
-            r#"{
-                "currentPeriod": {
+    fn stage4_grok_period_routes_are_exact_and_fail_closed() {
+        let credentials = GrokCredentials {
+            auth_path: PathBuf::from("/tmp/unused"),
+            entry_key: "k".into(),
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            client_id: "c".into(),
+            expires_at: None,
+            email: None,
+            raw_json: Value::Object(Default::default()),
+        };
+        let map = |period: Value, now: DateTime<Utc>| {
+            let body = serde_json::json!({
+                "config": {
+                    "currentPeriod": period,
+                    "creditUsagePercent": 12.0
+                }
+            })
+            .to_string();
+            map_billing(
+                &body,
+                &credentials,
+                now,
+                Err(AccountScopeError::NoTrustedEvidence),
+            )
+            .unwrap()
+            .windows
+            .into_iter()
+            .next()
+            .unwrap()
+        };
+
+        for (label, start, end, days) in [
+            ("28-day", "2023-02-01T00:00:00Z", "2023-03-01T00:00:00Z", 28),
+            ("29-day", "2024-02-01T00:00:00Z", "2024-03-01T00:00:00Z", 29),
+            ("30-day", "2024-04-01T00:00:00Z", "2024-05-01T00:00:00Z", 30),
+            ("31-day", "2024-05-01T00:00:00Z", "2024-06-01T00:00:00Z", 31),
+        ] {
+            let now = parse_timestamp(start).unwrap() + chrono::Duration::days(1);
+            let window = map(
+                serde_json::json!({
                     "type": "USAGE_PERIOD_TYPE_MONTHLY",
-                    "start": "2024-02-01T00:00:00Z",
-                    "end": "2024-03-01T00:00:00Z"
-                }
-            }"#,
-        )
-        .unwrap();
-        let (label, end, minutes) = period_meta(&monthly);
-        assert_eq!(label, "Monthly", "grok.monthly.provider-bounds");
-        assert!(end.is_some());
-        assert_eq!(minutes, Some(29 * 24 * 60));
+                    "start": start,
+                    "end": end
+                }),
+                now,
+            );
+            let wire = serde_json::to_value(&window).unwrap();
+            assert_eq!(wire["cardId"], "billing.monthly.v1", "{label}");
+            assert_eq!(
+                wire["paceStatus"]["windowKey"], "billing.monthly.v1",
+                "{label}"
+            );
+            assert_eq!(
+                wire["paceStatus"]["durationSeconds"],
+                days * 86_400,
+                "{label}"
+            );
+            assert_eq!(wire["paceStatus"]["durationSource"], "provider", "{label}");
+            assert_eq!(wire["paceStatus"]["state"], "learningHistory", "{label}");
+        }
 
-        let end_only: BillingConfig = serde_json::from_str(
-            r#"{
-                "currentPeriod": {
-                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
-                    "end": "2026-07-14T00:00:00Z"
-                }
-            }"#,
-        )
-        .unwrap();
-        let (label, end, minutes) = period_meta(&end_only);
-        assert_eq!(label, "Weekly", "grok.weekly.observed-fallback");
-        assert!(end.is_some());
-        assert_eq!(minutes, None);
-
-        let unknown: BillingConfig = serde_json::from_str(
-            r#"{
-                "currentPeriod": {
-                    "type": "USAGE_PERIOD_TYPE_DAILY",
-                    "start": "2026-07-13T00:00:00Z",
-                    "end": "2026-07-14T00:00:00Z"
-                }
-            }"#,
-        )
-        .unwrap();
-        let (label, _, minutes) = period_meta(&unknown);
-        assert_eq!(label, "Unknown", "grok.unknown-period-is-typed-unavailable");
-        assert_eq!(minutes, Some(24 * 60));
-
-        let contradictory: BillingConfig = serde_json::from_str(
-            r#"{
-                "currentPeriod": {
-                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
-                    "start": "2026-07-15T00:00:00Z",
-                    "end": "2026-07-14T00:00:00Z"
-                }
-            }"#,
-        )
-        .unwrap();
-        let (label, end, minutes) = period_meta(&contradictory);
-        assert_eq!(label, "Weekly");
-        assert!(
-            end.is_some(),
-            "invalid.contradictory-bounds captures the current emitted reset baseline"
+        let end_only = map(
+            serde_json::json!({
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "end": "2026-07-24T00:00:00Z"
+            }),
+            parse_timestamp("2026-07-17T00:00:00Z").unwrap(),
         );
-        assert_eq!(minutes, None);
+        let wire = serde_json::to_value(&end_only).unwrap();
+        assert_eq!(wire["cardId"], "billing.weekly.v1");
+        assert_eq!(wire["paceStatus"]["windowKey"], "billing.weekly.v1");
+        assert_eq!(wire["paceStatus"]["state"], "learningDuration");
+        assert!(wire["resetsAt"].as_str().is_some());
+        assert!(wire["paceStatus"].get("durationSeconds").is_none());
+        assert!(wire["paceStatus"].get("durationSource").is_none());
+
+        let unknown = map(
+            serde_json::json!({
+                "type": "USAGE_PERIOD_TYPE_DAILY",
+                "start": "2026-07-17T00:00:00Z",
+                "end": "2026-07-18T00:00:00Z"
+            }),
+            parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
+        );
+        let wire = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(wire["cardId"], "row.billing.unknown.v1");
+        assert_eq!(wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
+        assert!(wire["paceStatus"].get("windowKey").is_none());
+        assert!(wire["paceStatus"].get("durationSeconds").is_none());
+
+        for (label, start, end) in [
+            (
+                "contradictory",
+                "2026-07-18T00:00:00Z",
+                "2026-07-17T00:00:00Z",
+            ),
+            ("malformed-start", "not-a-date", "2026-07-24T00:00:00Z"),
+            ("malformed-end", "2026-07-17T00:00:00Z", "not-a-date"),
+        ] {
+            let window = map(
+                serde_json::json!({
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": start,
+                    "end": end
+                }),
+                parse_timestamp("2026-07-17T12:00:00Z").unwrap(),
+            );
+            let wire = serde_json::to_value(&window).unwrap();
+            assert_eq!(
+                wire["paceStatus"]["windowKey"], "billing.weekly.v1",
+                "{label}"
+            );
+            assert_eq!(wire["paceStatus"]["state"], "unavailable", "{label}");
+            assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence", "{label}");
+            assert!(
+                wire["paceStatus"].get("durationSeconds").is_none(),
+                "{label}"
+            );
+        }
     }
 
     #[test]
