@@ -130,6 +130,11 @@ enum SelfTest {
         expect(risky?.etaText == "Projected empty in 2m", "historical projected empty text")
         let fallback = UsagePace.compute(window: window(used: 50), mode: .historical, now: now)
         expect(fallback?.expectedUsedPercent == 50, "missing historical result falls back to linear")
+        let silentAheadFallback = UsagePace.compute(
+            window: window(used: 80), mode: .historical, now: now)
+        expect(
+            silentAheadFallback?.stage.isDeficit == true,
+            "stage0 swift.color.historical-available-ahead-only captures silent Linear deficit baseline")
         let linear = UsagePace.compute(
             window: window(used: 50, historicalPace: historicalLasts), mode: .linear, now: now)
         expect(linear?.expectedUsedPercent == 50, "linear mode ignores historical")
