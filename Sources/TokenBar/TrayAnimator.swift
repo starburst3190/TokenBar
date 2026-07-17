@@ -167,8 +167,7 @@ final class TrayAnimator {
         let selection = QuotaSelectionPolicy.effectiveSelection(
             payload: quota,
             persistedSelection: persistedSelection,
-            excluding: excluded,
-            fallbackUnknownExplicit: source.fallsBackUnknownQuotaSelectionToAuto)
+            excluding: excluded)
         if let value = QuotaResolver.resolve(
             payload: quota, selection: selection, excluding: excluded)?
             .window.remainingPercent

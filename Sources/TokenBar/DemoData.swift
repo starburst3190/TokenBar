@@ -364,7 +364,11 @@ enum DemoData {
     }
 
     private static func makeAgentUsage() -> AgentUsagePayload {
-        let updated = "\(Format.todayKey())T00:00:00Z"
+        let now = Date()
+        let formatter = ISO8601DateFormatter()
+        let updated = formatter.string(from: now)
+        let sessionDuration: Int64 = 18_000
+        let weeklyDuration: Int64 = 604_800
         let agents = ClientRegistry.allIds.enumerated().map { index, id in
             let sessionUsed = Double(12 + (index * 7) % 76)
             let weeklyUsed = max(5, sessionUsed * 0.58)
@@ -375,20 +379,38 @@ enum DemoData {
                 "identity": ["email": "demo@\(id).local", "plan": "Demo"],
                 "windows": [
                     [
+                        "cardId": "session.v1",
                         "label": "Session",
                         "usedPercent": sessionUsed,
                         "remainingPercent": 100 - sessionUsed,
-                        "resetsAt": "\(Format.todayKey())T23:59:59Z",
-                        "resetText": "today",
-                        "windowMinutes": 300,
+                        "resetsAt": formatter.string(
+                            from: now.addingTimeInterval(TimeInterval(sessionDuration))),
+                        "resetText": "in 5h",
+                        "windowMinutes": sessionDuration / 60,
+                        "paceStatus": [
+                            "state": "learningHistory",
+                            "windowKey": "session.v1",
+                            "durationSeconds": sessionDuration,
+                            "durationSource": "contract",
+                            "completeCycles": 0,
+                        ],
                     ],
                     [
+                        "cardId": "weekly.v1",
                         "label": "Weekly",
                         "usedPercent": weeklyUsed,
                         "remainingPercent": 100 - weeklyUsed,
-                        "resetsAt": "\(Format.todayKey())T23:59:59Z",
-                        "resetText": "this week",
-                        "windowMinutes": 10080,
+                        "resetsAt": formatter.string(
+                            from: now.addingTimeInterval(TimeInterval(weeklyDuration))),
+                        "resetText": "in 7d",
+                        "windowMinutes": weeklyDuration / 60,
+                        "paceStatus": [
+                            "state": "learningHistory",
+                            "windowKey": "weekly.v1",
+                            "durationSeconds": weeklyDuration,
+                            "durationSource": "contract",
+                            "completeCycles": 0,
+                        ],
                     ],
                 ],
             ] as [String: Any]

@@ -11,12 +11,6 @@ public enum QuotaResolver {
         "\(clientId)|\(cardId)"
     }
 
-    /// Compatibility spelling for callers that still pass a legacy label.
-    /// Stage 5C2 migrates those callers to `cardId`.
-    public static func selection(clientId: String, label: String) -> String {
-        selection(clientId: clientId, cardId: label)
-    }
-
     /// Canonicalizes a persisted selection against the current payload.
     ///
     /// Empty and `auto` selections normalize to `auto`. Before a payload is

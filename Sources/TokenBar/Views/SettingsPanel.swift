@@ -144,7 +144,17 @@ struct SettingsPanel: View {
             }
 
             section("Quota source") {
-                radioGroup(selection: $quotaSource, options: quotaSourceOptions)
+                radioGroup(
+                    selection: Binding(
+                        get: {
+                            QuotaResolver.canonicalSelection(
+                                payload: agentUsage, selection: quotaSource)
+                        },
+                        set: { next in
+                            quotaSource = QuotaResolver.canonicalSelection(
+                                payload: agentUsage, selection: next)
+                        }),
+                    options: quotaSourceOptions)
                 hint("Feeds the gauge icons and the \"Quota left\" title. Auto follows whichever window is closest to running out.")
             }
 
@@ -423,9 +433,9 @@ struct SettingsPanel: View {
         var options = [(QuotaResolver.auto, "Auto (tightest window)")]
         for agent in agentUsage?.agents ?? [] where agent.error == nil {
             let name = ClientRegistry.style(agent.clientId).displayName
-            for window in agent.windows {
+            for window in agent.uniqueCardWindows {
                 options.append(
-                    (QuotaResolver.selection(clientId: agent.clientId, label: window.label),
+                    (QuotaResolver.selection(clientId: agent.clientId, cardId: window.cardId),
                      "\(name) · \(window.label)"))
             }
         }

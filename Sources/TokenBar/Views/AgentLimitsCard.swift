@@ -232,6 +232,7 @@ struct AgentLimitsCard: View {
     @ViewBuilder private func agentSection(_ id: String, visible: [String]) -> some View {
         let style = ClientRegistry.style(id)
         let snapshot = snapshots[id]
+        let uniqueWindows = snapshot?.uniqueCardWindows ?? []
         let isLive = liveClients.contains(id)
         let edge = dropEdge(id, in: visible)
         VStack(alignment: .leading, spacing: 6) {
@@ -260,9 +261,10 @@ struct AgentLimitsCard: View {
                         .help(snapshot?.error ?? detail)
                 }
                 VStack(spacing: 8) {
-                    if let snapshot, !snapshot.windows.isEmpty {
-                        ForEach(snapshot.windows, id: \.label) { window in
+                    if !uniqueWindows.isEmpty {
+                        ForEach(uniqueWindows, id: \.cardId) { window in
                             windowRow(window, brand: style.color)
+                                .id("\(id):\(window.cardId)")
                         }
                     } else {
                         ForEach(Self.placeholderRows[id] ?? ["Limit"], id: \.self) { label in
@@ -337,7 +339,7 @@ struct AgentLimitsCard: View {
         } else if snapshot?.error != nil {
             text = "Error"
             color = .red
-        } else if let snapshot, !snapshot.windows.isEmpty {
+        } else if let snapshot, !snapshot.uniqueCardWindows.isEmpty {
             text = snapshot.source.uppercased()
         } else if isLive {
             text = "Live"

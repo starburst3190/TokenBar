@@ -7,8 +7,6 @@ import TokenBarCore
 protocol UsageDataSource: Sendable {
     /// Whether this source may read/write the persistent last-good quota cache.
     var allowsQuotaCachePersistence: Bool { get }
-    /// Demo-only policy for stale explicit quota labels; live keeps exact picks.
-    var fallsBackUnknownQuotaSelectionToAuto: Bool { get }
 
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload
     func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload
@@ -27,7 +25,6 @@ protocol UsageDataSource: Sendable {
 /// The only normal-runtime owner of usage calls into `TBCore`.
 struct LiveUsageDataSource: UsageDataSource {
     let allowsQuotaCachePersistence = true
-    let fallsBackUnknownQuotaSelectionToAuto = false
 
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
         try await Task.detached(priority: priority) {
@@ -86,7 +83,6 @@ struct LiveUsageDataSource: UsageDataSource {
 /// deterministic fixtures in `DemoData`; it has no dependency on `TBCore`.
 struct DemoUsageDataSource: UsageDataSource {
     let allowsQuotaCachePersistence = false
-    let fallsBackUnknownQuotaSelectionToAuto = true
 
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
         _ = priority

@@ -1003,32 +1003,26 @@ enum SelfTest {
             summaryClients == registryClients && contributionClients == registryClients
                 && quotaClients == registryClients,
             "demo summary contributions and quota share the client set")
-        let dynamicLabelSelection = "\(ClientRegistry.allIds.first ?? "claude")|Sonnet"
-        let demoQuotaSelection = QuotaSelectionPolicy.effectiveSelection(
-            payload: quota,
-            persistedSelection: dynamicLabelSelection,
-            excluding: [],
-            fallbackUnknownExplicit: demoSource.fallsBackUnknownQuotaSelectionToAuto)
-        let liveQuotaSelection = QuotaSelectionPolicy.effectiveSelection(
-            payload: quota,
-            persistedSelection: dynamicLabelSelection,
-            excluding: [],
-            fallbackUnknownExplicit: liveSource.fallsBackUnknownQuotaSelectionToAuto)
-        let demoQuotaValue = QuotaSelectionPolicy.resolve(
-            payload: quota,
-            persistedSelection: dynamicLabelSelection,
-            excluding: [],
-            fallbackUnknownExplicit: true)
-        let liveQuotaValue = QuotaSelectionPolicy.resolve(
-            payload: quota,
-            persistedSelection: dynamicLabelSelection,
-            excluding: [],
-            fallbackUnknownExplicit: false)
         expect(
-            demoQuotaSelection == QuotaResolver.auto && liveQuotaSelection == QuotaResolver.auto
-                && demoQuotaValue?.clientId == liveQuotaValue?.clientId
-                && demoQuotaValue?.window.cardId == liveQuotaValue?.window.cardId,
-            "demo/live fallback flags do not diverge canonical selection")
+            quota.agents.count == ClientRegistry.allIds.count
+                && quota.agents.allSatisfy { agent in
+                    let windows = agent.uniqueCardWindows
+                    return windows.count == 2
+                        && windows[0].cardId == "session.v1"
+                        && windows[1].cardId == "weekly.v1"
+                        && windows[0].paceStatus.state == .learningHistory
+                        && windows[1].paceStatus.state == .learningHistory
+                        && windows[0].durationSeconds == 18_000
+                        && windows[1].durationSeconds == 604_800
+                        && windows[0].windowMinutes == 300
+                        && windows[1].windowMinutes == 10_080
+                        && windows.allSatisfy {
+                            $0.paceStatus.durationSource == .contract
+                                && $0.paceStatus.completeCycles == 0
+                                && $0.historicalPace == nil
+                        }
+                },
+            "demo quota cards use unique canonical learning-history windows")
 
         let modelReport = DemoData.modelReport
         let hourlyReport = DemoData.hourlyReport
