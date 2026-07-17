@@ -548,6 +548,14 @@ enum SelfTest {
                     .window.cardId == "weekly.v1",
             "unique legacy label migrates to cardId")
         expect(
+            QuotaSelectionPolicy.migrationToPersist(
+                payload: quotaPayload, persistedSelection: "codex|Weekly") == "codex|weekly.v1"
+                && QuotaSelectionPolicy.migrationToPersist(
+                    payload: quotaPayload, persistedSelection: "codex|weekly.v1") == nil
+                && QuotaSelectionPolicy.migrationToPersist(
+                    payload: quotaPayload, persistedSelection: "codex|stale") == nil,
+            "selection policy persists only a proven legacy migration")
+        expect(
             QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|stale")
                 == "codex|stale"
                 && QuotaResolver.resolve(payload: quotaPayload, selection: "codex|stale") == nil,

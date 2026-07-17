@@ -11,6 +11,18 @@ enum QuotaSelectionPolicy {
         QuotaResolver.canonicalSelection(payload: payload, selection: persistedSelection)
     }
 
+    /// Returns a stable card-id selection only when the current payload proves
+    /// that a persisted pre-v3 label has one unambiguous migration target.
+    static func migrationToPersist(
+        payload: AgentUsagePayload?,
+        persistedSelection: String
+    ) -> String? {
+        let canonical = QuotaResolver.canonicalSelection(
+            payload: payload, selection: persistedSelection)
+        guard canonical != QuotaResolver.auto, canonical != persistedSelection else { return nil }
+        return canonical
+    }
+
     static func resolve(
         payload: AgentUsagePayload?,
         persistedSelection: String,
