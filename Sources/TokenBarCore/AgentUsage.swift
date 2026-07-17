@@ -418,6 +418,9 @@ public struct UsageWindow: Decodable, Sendable {
               (0...100).contains(usedPercent), (0...100).contains(remainingPercent) else {
             return "usage percentages are out of range"
         }
+        guard abs(usedPercent + remainingPercent - 100) < 0.000_001 else {
+            return "usage percentages must sum to 100"
+        }
         return nil
     }
 

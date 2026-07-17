@@ -390,6 +390,10 @@ enum SelfTest {
              {"label":"Weekly","usedPercent":50,"remainingPercent":50,
               "paceStatus":{"state":"learningDuration","windowKey":"weekly.v1","completeCycles":0}}
              """),
+            ("contradictory percentages", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":80,"remainingPercent":80,
+              "paceStatus":{"state":"learningDuration","windowKey":"weekly.v1","completeCycles":0}}
+             """),
             ("available without historicalPace", """
              {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
               "windowMinutes":300,"paceStatus":{"state":"available","windowKey":"weekly.v1",
