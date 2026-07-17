@@ -285,12 +285,39 @@ struct QuotaInfo {
 }
 
 #[derive(Debug)]
-struct LocalModelCandidate {
+struct ModelCandidate {
     model_id: Option<String>,
     fraction: f64,
     reset: Option<DateTime<Utc>>,
     source_index: usize,
     label: String,
+}
+
+fn valid_remaining_fraction(fraction: f64) -> bool {
+    fraction.is_finite() && (0.0..=1.0).contains(&fraction)
+}
+
+fn quota_window(
+    label: String,
+    fraction: f64,
+    reset: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    card_id: String,
+    window_key: Option<String>,
+) -> UsageWindow {
+    let invalid_fraction = !valid_remaining_fraction(fraction);
+    let display_fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let identified = window_key.is_some();
+    let mut window = UsageWindow::from_provider_fraction(label, display_fraction, reset, now)
+        .with_identity(card_id, window_key, None, None);
+    if invalid_fraction && identified {
+        window.unavailable("invalidEvidence");
+    }
+    window
 }
 
 fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> {
@@ -304,7 +331,7 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
         .cascade_model_config_data
         .and_then(|d| d.client_model_configs)
         .unwrap_or_default();
-    let mut selected: BTreeMap<String, LocalModelCandidate> = BTreeMap::new();
+    let mut selected: BTreeMap<String, ModelCandidate> = BTreeMap::new();
     let mut missing_model = Vec::new();
     for (index, config) in configs.into_iter().enumerate() {
         let Some(quota) = config.quota_info else {
@@ -324,7 +351,7 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
             .filter(|s| !s.trim().is_empty())
             .or_else(|| model_id.clone())
             .unwrap_or_else(|| "Model".to_string());
-        let candidate = LocalModelCandidate {
+        let candidate = ModelCandidate {
             model_id: model_id.clone(),
             fraction,
             reset,
@@ -351,7 +378,7 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
             }
         }
     }
-    let mut candidates: Vec<LocalModelCandidate> = selected.into_values().collect();
+    let mut candidates: Vec<ModelCandidate> = selected.into_values().collect();
     candidates.extend(missing_model);
     candidates.sort_by_key(|candidate| candidate.source_index);
     let windows: Vec<UsageWindow> = candidates
@@ -367,13 +394,14 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
                     None,
                 ),
             };
-            UsageWindow::from_provider_fraction(
+            quota_window(
                 candidate.label,
                 candidate.fraction,
                 candidate.reset,
                 now,
+                card_id,
+                window_key,
             )
-            .with_identity(card_id, window_key, None, None)
         })
         .collect();
 
@@ -790,47 +818,81 @@ fn models_from_available(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> 
     let Some(models) = value.get("models").and_then(Value::as_object) else {
         return Vec::new();
     };
-    models
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (raw_id, model))| {
-            let quota = model.get("quotaInfo")?;
-            let fraction = quota.get("remainingFraction").and_then(Value::as_f64)?;
-            let reset = quota
-                .get("resetTime")
-                .and_then(Value::as_str)
-                .and_then(parse_datetime);
-            let model_id = raw_id.trim().to_string();
-            let label = model
-                .get("displayName")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| {
-                    model
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .unwrap_or(raw_id.as_str())
-                .to_string();
-            if model_id.is_empty() {
-                return Some(
-                    UsageWindow::from_provider_fraction(label, fraction, reset, now).with_identity(
-                        format!("row.models.{index}.v1"),
-                        None,
-                        None,
-                        None,
-                    ),
-                );
+    let mut selected: BTreeMap<String, ModelCandidate> = BTreeMap::new();
+    let mut missing_model = Vec::new();
+    for (source_index, (raw_id, model)) in models.iter().enumerate() {
+        let Some(quota) = model.get("quotaInfo") else {
+            continue;
+        };
+        let Some(fraction) = quota.get("remainingFraction").and_then(Value::as_f64) else {
+            continue;
+        };
+        let reset = quota
+            .get("resetTime")
+            .and_then(Value::as_str)
+            .and_then(parse_datetime);
+        let model_id = raw_id.trim().to_string();
+        let model_id = (!model_id.is_empty()).then_some(model_id);
+        let label = model
+            .get("displayName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                model
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or(raw_id.as_str())
+            .to_string();
+        let candidate = ModelCandidate {
+            model_id: model_id.clone(),
+            fraction,
+            reset,
+            source_index,
+            label,
+        };
+        let Some(model_id) = model_id else {
+            missing_model.push(candidate);
+            continue;
+        };
+        match selected.get(&model_id) {
+            Some(current)
+                if !binding_candidate_is_better(
+                    candidate.fraction,
+                    candidate.reset,
+                    candidate.source_index,
+                    current.fraction,
+                    current.reset,
+                    current.source_index,
+                    now,
+                ) => {}
+            _ => {
+                selected.insert(model_id, candidate);
             }
-            let key = format!("model.{model_id}.v1");
-            Some(
-                UsageWindow::from_provider_fraction(label, fraction, reset, now).with_identity(
-                    key.clone(),
-                    Some(key),
-                    None,
-                    None,
-                ),
+        }
+    }
+
+    let mut candidates: Vec<ModelCandidate> = selected.into_values().collect();
+    candidates.extend(missing_model);
+    candidates.sort_by_key(|candidate| candidate.source_index);
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            let (card_id, window_key) = match candidate.model_id {
+                Some(model_id) => {
+                    let key = format!("model.{model_id}.v1");
+                    (key.clone(), Some(key))
+                }
+                None => (format!("row.models.{}.v1", candidate.source_index), None),
+            };
+            quota_window(
+                candidate.label,
+                candidate.fraction,
+                candidate.reset,
+                now,
+                card_id,
+                window_key,
             )
         })
         .collect()
@@ -851,10 +913,9 @@ fn buckets_from_quota(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
     let mut selected: BTreeMap<String, QuotaBucketCandidate> = BTreeMap::new();
     let mut missing = Vec::new();
     for (source_index, bucket) in buckets.iter().enumerate() {
-        let fraction = bucket
-            .get("remainingFraction")
-            .and_then(Value::as_f64)
-            .unwrap_or(f64::NAN);
+        let Some(fraction) = bucket.get("remainingFraction").and_then(Value::as_f64) else {
+            continue;
+        };
         let reset = bucket
             .get("resetTime")
             .and_then(Value::as_str)
@@ -893,30 +954,24 @@ fn buckets_from_quota(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
                 .model_id
                 .clone()
                 .unwrap_or_else(|| "Model".to_string());
-            match candidate.model_id {
+            let (card_id, window_key) = match candidate.model_id {
                 Some(model_id) => {
                     let key = format!("model.{model_id}.v1");
-                    UsageWindow::from_provider_fraction(
-                        label,
-                        candidate.fraction,
-                        candidate.reset,
-                        now,
-                    )
-                    .with_identity(key.clone(), Some(key), None, None)
+                    (key.clone(), Some(key))
                 }
-                None => UsageWindow::from_provider_fraction(
-                    label,
-                    candidate.fraction,
-                    candidate.reset,
-                    now,
-                )
-                .with_identity(
+                None => (
                     format!("row.quota.bucket.{}.v1", candidate.source_index),
                     None,
-                    None,
-                    None,
                 ),
-            }
+            };
+            quota_window(
+                label,
+                candidate.fraction,
+                candidate.reset,
+                now,
+                card_id,
+                window_key,
+            )
         })
         .collect()
 }
@@ -946,6 +1001,14 @@ fn binding_candidate_is_better(
     current_index: usize,
     now: DateTime<Utc>,
 ) -> bool {
+    match (
+        valid_remaining_fraction(candidate_fraction),
+        valid_remaining_fraction(current_fraction),
+    ) {
+        (true, false) => return true,
+        (false, true) => return false,
+        _ => {}
+    }
     match candidate_fraction.total_cmp(&current_fraction) {
         std::cmp::Ordering::Less => return true,
         std::cmp::Ordering::Greater => return false,
@@ -1199,77 +1262,114 @@ mod tests {
     }
 
     #[test]
-    fn stage0_freezes_antigravity_model_identity_and_duplicate_baseline() {
+    fn stage4_antigravity_identity_and_duplicate_rules_are_deterministic() {
         let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let models = json!({
             "models": {
                 "model-A": {
-                    "displayName": "Shared label",
-                    "quotaInfo": { "remainingFraction": 0.5, "resetTime": "2026-07-11T00:00:00Z" }
+                    "displayName": "Trimmed loser",
+                    "quotaInfo": { "remainingFraction": 0.5, "resetTime": "2026-07-12T00:00:00Z" }
+                },
+                "  model-A  ": {
+                    "displayName": "Trimmed winner",
+                    "quotaInfo": { "remainingFraction": 0.2, "resetTime": "2026-07-13T00:00:00Z" }
                 },
                 "model-B": {
                     "displayName": "Shared label",
                     "quotaInfo": { "remainingFraction": 0.4, "resetTime": "2026-07-12T00:00:00Z" }
                 },
                 "Model-Byte-Case": {
+                    "displayName": "Shared label",
                     "quotaInfo": { "remainingFraction": 0.3, "resetTime": "2026-07-13T00:00:00Z" }
-                },
-                "  Model-Trim-Case  ": {
-                    "quotaInfo": { "remainingFraction": 0.2, "resetTime": "2026-07-14T00:00:00Z" }
                 }
             }
         });
         let windows = models_from_available(&models, now);
-        assert_eq!(windows.len(), 4);
-        assert!(windows
+        assert_eq!(windows.len(), 3);
+        let model_a = windows
             .iter()
-            .any(|window| window.pace_window_key_for_test() == Some("model.model-A.v1")));
+            .find(|window| window.pace_window_key_for_test() == Some("model.model-A.v1"))
+            .unwrap();
+        assert_eq!(model_a.label_for_test(), "Trimmed winner");
+        assert!((model_a.remaining_for_test() - 20.0).abs() < 0.01);
         assert_eq!(
             windows
                 .iter()
                 .filter(|window| window.label_for_test() == "Shared label")
                 .count(),
             2,
-            "antigravity.label-never-merges-models captures duplicate-label rows"
+            "display labels never merge distinct model IDs"
         );
-        assert!(
-            windows
-                .iter()
-                .any(|window| window.label_for_test() == "Model-Byte-Case"),
-            "antigravity.model-id-byte-case-preserved"
-        );
-        assert!(
-            windows
-                .iter()
-                .any(|window| window.label_for_test() == "  Model-Trim-Case  "),
-            "antigravity.model-id-unicode-trim captures the current untrimmed object-key baseline"
-        );
+        assert!(windows.iter().any(|window| {
+            window.pace_window_key_for_test() == Some("model.Model-Byte-Case.v1")
+        }));
 
-        let missing_model = r#"{
+        let cli = r#"{
             "userStatus": {
                 "cascadeModelConfigData": {
                     "clientModelConfigs": [
+                        {
+                            "label": "CLI loser",
+                            "modelOrAlias": { "model": " Model-X " },
+                            "quotaInfo": { "remainingFraction": 0.6, "resetTime": "2026-07-12T00:00:00Z" }
+                        },
+                        {
+                            "label": "CLI winner",
+                            "modelOrAlias": { "model": "Model-X" },
+                            "quotaInfo": { "remainingFraction": 0.2, "resetTime": "2026-07-13T00:00:00Z" }
+                        },
                         { "label": "Config only", "quotaInfo": { "remainingFraction": 0.7 } }
                     ]
                 }
             }
         }"#;
-        let fetched = parse_user_status(missing_model, now).unwrap();
-        assert_eq!(fetched.windows.len(), 1);
+        let fetched = parse_user_status(cli, now).unwrap();
+        assert_eq!(fetched.windows.len(), 2);
         assert_eq!(
-            fetched.windows[0].label_for_test(),
-            "Config only",
-            "antigravity.cli.missing-model-id keeps the display label"
+            fetched.windows[0].pace_window_key_for_test(),
+            Some("model.Model-X.v1")
         );
-        assert_eq!(
-            fetched.windows[0].pace_reason_for_test(),
-            Some("windowIdentity")
+        assert_eq!(fetched.windows[0].label_for_test(), "CLI winner");
+        let missing_wire = serde_json::to_value(&fetched.windows[1]).unwrap();
+        assert_eq!(missing_wire["cardId"], "row.cli.config.2.v1");
+        assert_eq!(missing_wire["paceStatus"]["reason"], "windowIdentity");
+
+        let missing_remote = models_from_available(
+            &json!({
+                "models": {
+                    "   ": {
+                        "displayName": "Remote model",
+                        "quotaInfo": { "remainingFraction": 0.7 }
+                    }
+                }
+            }),
+            now,
         );
+        let wire = serde_json::to_value(&missing_remote[0]).unwrap();
+        assert_eq!(wire["cardId"], "row.models.0.v1");
+        assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
+
+        let missing_bucket = buckets_from_quota(
+            &json!({
+                "buckets": [
+                    { "modelId": "   ", "remainingFraction": 0.7 }
+                ]
+            }),
+            now,
+        );
+        let wire = serde_json::to_value(&missing_bucket[0]).unwrap();
+        assert_eq!(wire["cardId"], "row.quota.bucket.0.v1");
+        assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
 
         let duplicate = json!({
             "buckets": [
+                {
+                    "modelId": "same-model",
+                    "remainingFraction": 0.25,
+                    "resetTime": "2026-07-09T00:00:00Z"
+                },
                 {
                     "modelId": "same-model",
                     "remainingFraction": 0.25,
@@ -1287,8 +1387,108 @@ mod tests {
         assert_eq!(
             selected[0].resets_at_for_test(),
             Some("2026-07-11T00:00:00.000Z"),
-            "antigravity.duplicate.earliest-future-reset wins equal remaining fractions"
+            "future reset beats past reset, then earliest future reset wins"
         );
+        let same_reset = parse_datetime("2026-07-11T00:00:00Z");
+        assert!(!binding_candidate_is_better(
+            0.25, same_reset, 1, 0.25, same_reset, 0, now
+        ));
+    }
+
+    #[test]
+    fn stage4_antigravity_rejects_invalid_fractions_at_every_source() {
+        assert!(!valid_remaining_fraction(f64::NAN));
+        assert!(!valid_remaining_fraction(f64::INFINITY));
+        assert!(!valid_remaining_fraction(-0.01));
+        assert!(!valid_remaining_fraction(1.01));
+        assert!(valid_remaining_fraction(0.0));
+        assert!(valid_remaining_fraction(1.0));
+
+        let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let assert_rows = |windows: Vec<UsageWindow>| {
+            assert_eq!(windows.len(), 3);
+            assert!(windows
+                .iter()
+                .any(|window| window.pace_window_key_for_test() == Some("model.valid.v1")));
+            for key in ["model.negative.v1", "model.over.v1"] {
+                let wire = windows
+                    .iter()
+                    .find(|window| window.pace_window_key_for_test() == Some(key))
+                    .map(serde_json::to_value)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(wire["paceStatus"]["state"], "unavailable", "{key}");
+                assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence", "{key}");
+                assert!(wire["paceStatus"].get("durationSeconds").is_none());
+            }
+        };
+
+        let cli = r#"{
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "modelOrAlias": { "model": "valid" },
+                            "quotaInfo": { "remainingFraction": 0.5 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "negative" },
+                            "quotaInfo": { "remainingFraction": -0.1 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "over" },
+                            "quotaInfo": { "remainingFraction": 1.1 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "missing" },
+                            "quotaInfo": {}
+                        }
+                    ]
+                }
+            }
+        }"#;
+        assert_rows(parse_user_status(cli, now).unwrap().windows);
+
+        assert_rows(models_from_available(
+            &json!({
+                "models": {
+                    "valid": { "quotaInfo": { "remainingFraction": 0.5 } },
+                    "negative": { "quotaInfo": { "remainingFraction": -0.1 } },
+                    "over": { "quotaInfo": { "remainingFraction": 1.1 } },
+                    "missing": { "quotaInfo": {} }
+                }
+            }),
+            now,
+        ));
+
+        assert_rows(buckets_from_quota(
+            &json!({
+                "buckets": [
+                    { "modelId": "valid", "remainingFraction": 0.5 },
+                    { "modelId": "negative", "remainingFraction": -0.1 },
+                    { "modelId": "over", "remainingFraction": 1.1 },
+                    { "modelId": "missing" }
+                ]
+            }),
+            now,
+        ));
+
+        let non_finite = quota_window(
+            "Non-finite".to_string(),
+            f64::NAN,
+            None,
+            now,
+            "model.non-finite.v1".to_string(),
+            Some("model.non-finite.v1".to_string()),
+        );
+        let wire = serde_json::to_value(non_finite).unwrap();
+        assert_eq!(wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence");
+        assert!(!binding_candidate_is_better(
+            -0.1, None, 1, 0.5, None, 0, now
+        ));
     }
 
     #[test]
