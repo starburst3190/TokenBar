@@ -16,14 +16,18 @@ public enum QuotaResolver {
     /// Empty and `auto` selections normalize to `auto`. Before a payload is
     /// available, a well-formed explicit selection is preserved so a refresh
     /// cannot erase an otherwise valid persisted choice. Once a payload exists,
-    /// exact card IDs win; only a unique legacy label can be migrated.
+    /// exact card IDs win and a unique legacy label is migrated. A well-formed
+    /// unmatched selection remains explicit: the payload can be partial during a
+    /// provider failure, so silently changing it to Auto would show another
+    /// provider instead of letting callers retain the selected source's last-good
+    /// value.
     public static func canonicalSelection(
         payload: AgentUsagePayload?, selection: String
     ) -> String {
         guard let parsed = parseExplicitSelection(selection) else { return auto }
         guard let payload else { return selection }
         guard let agent = payload.agents.first(where: { $0.clientId == parsed.clientId }) else {
-            return auto
+            return selection
         }
 
         let windows = agent.uniqueCardWindows
@@ -32,7 +36,7 @@ public enum QuotaResolver {
         }
 
         let labelMatches = windows.filter { $0.label == parsed.value }
-        guard labelMatches.count == 1, let migrated = labelMatches.first else { return auto }
+        guard labelMatches.count == 1, let migrated = labelMatches.first else { return selection }
         return Self.selection(clientId: agent.clientId, cardId: migrated.cardId)
     }
 

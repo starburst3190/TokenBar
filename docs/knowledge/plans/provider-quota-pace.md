@@ -449,7 +449,7 @@ Mac-owned [`provider-quota-pace-v3.json`](../../../Fixtures/CrossCheck/provider-
 | DTO | `UsageWindow` 加 required v3 `cardId`／`paceStatus` 與 optional coherent `historicalPace`；整個 `paceStatus` key 缺失才是 internal legacy，present-null／unknown／矛盾資料必須 decode failure |
 | Duration | Pace 只讀 positive `durationSeconds`；`windowMinutes` 只是 `durationSeconds / 60` compatibility output，不能恢復 legacy Linear fallback |
 | Mode policy | Historical 只在 `available` 使用 backend result；`learningHistory` 才可明示 Linear estimate；`learningDuration`／`unavailable`／legacy 無 pace；Off 一律無 marker |
-| Selection | Persisted identity 改為 `clientId|cardId`；舊 label 只有唯一 match 才遷移，ambiguous／stale 回 Auto；duplicate card ID 保留第一張並 fail closed |
+| Selection | Persisted identity 改為 `clientId|cardId`；舊 label 只有唯一 match 才遷移；well-formed unmatched／ambiguous explicit selection 保留並 resolve `nil`，讓 transient partial payload 使用該來源 last-good，而非靜默切到 Auto；只有 malformed／empty selection 回 Auto；duplicate card ID 保留第一張並 fail closed |
 | Presentation | Deficit／yellow gate 必須同時是 Historical basis、`available` 與 deficit stage；Linear 或 learning estimate 不得偽裝成 learned Historical |
 | Cross-check | Windows harness 未來讀同一份 v3 fixture 並與 Mac actual output 對拍；在 DTO、state machine、selection 與 presentation 全部移植前不得宣稱 parity |
 

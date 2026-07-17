@@ -549,14 +549,14 @@ enum SelfTest {
             "unique legacy label migrates to cardId")
         expect(
             QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|stale")
-                == QuotaResolver.auto
-                && QuotaResolver.resolve(payload: quotaPayload, selection: "codex|stale")?.clientId
-                    == tightest?.clientId,
-            "stale explicit selection normalizes to Auto")
+                == "codex|stale"
+                && QuotaResolver.resolve(payload: quotaPayload, selection: "codex|stale") == nil,
+            "temporarily absent explicit card stays selected instead of following Auto")
         expect(
             QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "nope|Session")
-                == QuotaResolver.auto,
-            "unknown client normalizes to Auto")
+                == "nope|Session"
+                && QuotaResolver.resolve(payload: quotaPayload, selection: "nope|Session") == nil,
+            "temporarily absent explicit client stays selected instead of following Auto")
         expect(
             QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|Weekly|extra")
                 == QuotaResolver.auto,
@@ -594,12 +594,11 @@ enum SelfTest {
             "duplicate card later occurrence fails closed")
         expect(
             QuotaResolver.canonicalSelection(payload: duplicatePayload, selection: "dupe|Ambiguous")
-                == QuotaResolver.auto,
-            "duplicate label migration is ambiguous")
+                == "dupe|Ambiguous",
+            "ambiguous legacy label cannot be migrated")
         expect(
-            QuotaResolver.resolve(payload: duplicatePayload, selection: "dupe|Ambiguous")?.window.cardId
-                == "Session",
-            "ambiguous selection follows Auto")
+            QuotaResolver.resolve(payload: duplicatePayload, selection: "dupe|Ambiguous") == nil,
+            "ambiguous legacy label stays explicit instead of following Auto")
         expect(
             QuotaResolver.resolve(payload: duplicatePayload, selection: "dupe|same.v1")?
                 .window.remainingPercent == 80
@@ -643,9 +642,9 @@ enum SelfTest {
                 payload: quotaPayload, selection: "auto", excluding: ["claude"]),
             "excludedAllCandidates false while a visible candidate survives")
         expect(
-            QuotaResolver.excludedAllCandidates(
+            !QuotaResolver.excludedAllCandidates(
                 payload: duplicatePayload, selection: "dupe|Ambiguous", excluding: ["dupe"]),
-            "ambiguous Auto obeys exclusion semantics")
+            "unresolved explicit selection does not acquire Auto exclusion semantics")
         expect(
             !QuotaResolver.excludedAllCandidates(payload: nil, selection: "auto", excluding: ["claude"]),
             "excludedAllCandidates false with no payload (fetch-failure keeps the cache)")

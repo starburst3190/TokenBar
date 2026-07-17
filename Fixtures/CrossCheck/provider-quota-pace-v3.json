@@ -162,7 +162,7 @@
       "selection": "provider-fixture.invalid|Ahead quota"
     },
     {
-      "name": "selection-ambiguous-legacy-label-auto",
+      "name": "selection-ambiguous-legacy-label-preserved",
       "kind": "selection",
       "selection": "provider-fixture.invalid|Shared label"
     },
