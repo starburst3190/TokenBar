@@ -1930,6 +1930,7 @@ where
         raw_json: credentials.raw_json,
         scope_slot: credentials.scope_slot,
     };
+    let marker_rotated = refreshed.scope_marker() != old_marker.as_slice();
     let scope = refresh.transfer(
         refreshed.scope_slot.semantic_source,
         &refreshed.scope_slot.canonical_location,
@@ -1937,8 +1938,11 @@ where
         refreshed.scope_marker(),
     );
     checkpoint(RefreshCheckpoint::MetadataHandled)?;
-    // Metadata is already durable (or this poll is marked unavailable) before
-    // the rotated provider credential becomes current on disk.
+    // A rotated marker may reach disk only after its lineage transfer is durable.
+    // The refreshed access token remains usable in memory for this poll.
+    if marker_rotated && scope.is_err() {
+        return Ok((refreshed, scope));
+    }
     save(&refreshed)?;
     checkpoint(RefreshCheckpoint::CredentialsPersisted)?;
     Ok((refreshed, scope))
@@ -2049,7 +2053,9 @@ where
         raw_root: credentials.raw_root.clone(),
         scope_slot: credentials.scope_slot.clone(),
     };
-    let scope = match refreshed.scope_marker() {
+    let new_marker = refreshed.scope_marker();
+    let marker_rotated = new_marker.is_some_and(|marker| marker != old_marker.as_slice());
+    let scope = match new_marker {
         Some(new_marker) => refresh.transfer(
             refreshed.scope_slot.semantic_source,
             &refreshed.scope_slot.canonical_location,
@@ -2059,9 +2065,12 @@ where
         None => Err(AccountScopeError::NoTrustedEvidence),
     };
     checkpoint(RefreshCheckpoint::MetadataHandled)?;
-    // The old and new fingerprints are durable before the rotated credential is
-    // made current. A provider-store write failure can still use the in-memory
-    // access token; the old stored marker remains bound to the same lineage.
+    // A rotated marker may reach the shared provider store only after its
+    // lineage transfer is durable. The new access token remains usable in
+    // memory for this poll.
+    if marker_rotated && scope.is_err() {
+        return Ok((refreshed, scope));
+    }
     if let Err(error) = save(&refreshed) {
         eprintln!("tb_core_ffi: failed to persist refreshed Claude credentials: {error}");
     }
@@ -4795,17 +4804,52 @@ mod tests {
             scope.cleanup();
         }
 
-        let (scope, path, _old_scope, before, _) = setup_codex_refresh("codex-metadata-fail");
+        let (scope, path, old_scope, before, location) = setup_codex_refresh("codex-metadata-fail");
         scope.fail_metadata_save();
-        let (_, scope_outcome) = run_codex_refresh(&scope, &path, None).await.unwrap();
+        let (refreshed, scope_outcome) = run_codex_refresh(&scope, &path, None).await.unwrap();
+        assert_eq!(refreshed.access_token, "codex-new-access");
+        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+        assert_eq!(scope.metadata_bytes(), before);
+        let persisted = load_codex_credentials_from(&path).unwrap();
+        assert_eq!(persisted.access_token, "codex-old-access");
+        assert_eq!(
+            persisted.refresh_token.as_deref(),
+            Some("codex-old-refresh")
+        );
+        assert_eq!(
+            scope
+                .resolve_current("codex-auth-json", &location, persisted.scope_marker())
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
+
+        let (scope, path, _old_scope, before, _) =
+            setup_codex_refresh("codex-metadata-fail-unchanged");
+        scope.fail_metadata_save();
+        let (refreshed, scope_outcome) = refresh_codex_credentials_with(
+            &path,
+            &scope,
+            |refresh_token| async move {
+                assert_eq!(refresh_token, "codex-old-refresh");
+                Ok(serde_json::json!({ "access_token": "codex-new-access" }))
+            },
+            save_codex_credentials,
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
         assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
         assert_eq!(scope.metadata_bytes(), before);
         assert_eq!(
-            load_codex_credentials_from(&path)
-                .unwrap()
-                .refresh_token
-                .as_deref(),
-            Some("codex-new-refresh")
+            refreshed.refresh_token.as_deref(),
+            Some("codex-old-refresh")
+        );
+        let persisted = load_codex_credentials_from(&path).unwrap();
+        assert_eq!(persisted.access_token, "codex-new-access");
+        assert_eq!(
+            persisted.refresh_token.as_deref(),
+            Some("codex-old-refresh")
         );
         scope.cleanup();
 
@@ -5020,17 +5064,71 @@ mod tests {
             scope.cleanup();
         }
 
-        let (scope, path, original, _old_scope, before, _) =
+        let (scope, path, original, old_scope, before, location) =
             setup_claude_refresh("claude-metadata-fail");
         scope.fail_metadata_save();
-        let (_, scope_outcome) = run_claude_refresh(&scope, &path, &original, None)
+        let (refreshed, scope_outcome) = run_claude_refresh(&scope, &path, &original, None)
             .await
             .unwrap();
+        assert_eq!(refreshed.access_token, "claude-new-access");
         assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
         assert_eq!(scope.metadata_bytes(), before);
         assert_eq!(
             stored_claude_refresh_token(&path).as_deref(),
-            Some("claude-new-refresh")
+            Some("claude-old-refresh")
+        );
+        assert_eq!(
+            scope
+                .resolve_current("claude-login-file", &location, b"claude-old-refresh")
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
+
+        let (scope, path, original, _old_scope, before, _) =
+            setup_claude_refresh("claude-metadata-fail-unchanged");
+        scope.fail_metadata_save();
+        let reload_path = path.clone();
+        let save_path = path.clone();
+        let (refreshed, scope_outcome) = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            |refresh_token| async move {
+                assert_eq!(refresh_token, "claude-old-refresh");
+                Ok(ClaudeRefreshResponse {
+                    access_token: "claude-new-access".to_string(),
+                    refresh_token: None,
+                    expires_in: 3_600,
+                })
+            },
+            move |credentials| save_claude_credentials_to_file(credentials, &save_path),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+        assert_eq!(scope.metadata_bytes(), before);
+        assert_eq!(
+            refreshed.refresh_token.as_deref(),
+            Some("claude-old-refresh")
+        );
+        let persisted = parse_claude_credentials_data(
+            &fs::read_to_string(&path).unwrap(),
+            ClaudeCredentialSource::File,
+        )
+        .unwrap();
+        assert_eq!(persisted.access_token, "claude-new-access");
+        assert_eq!(
+            persisted.refresh_token.as_deref(),
+            Some("claude-old-refresh")
         );
         scope.cleanup();
 

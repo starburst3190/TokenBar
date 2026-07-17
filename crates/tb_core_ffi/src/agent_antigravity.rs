@@ -653,13 +653,20 @@ where
             );
         }
     }
-    let scope = match remote_refresh_marker(&creds) {
+    let new_marker = remote_refresh_marker(&creds);
+    let marker_rotated = new_marker.is_some_and(|marker| marker != old_marker.as_slice());
+    let scope = match new_marker {
         Some(new_marker) => {
             refresh.transfer("google-oauth-creds", &location, &old_marker, new_marker)
         }
         None => Err(AccountScopeError::NoTrustedEvidence),
     };
     checkpoint(RefreshCheckpoint::MetadataHandled)?;
+    // A rotated marker may reach disk only after its lineage transfer is durable.
+    // The refreshed access token remains usable in memory for this poll.
+    if marker_rotated && scope.is_err() {
+        return Ok((creds, access_token, scope));
+    }
     if let Err(error) = save(&creds) {
         eprintln!("tb_core_ffi: failed to persist refreshed Antigravity credentials: {error}");
     }
@@ -1755,12 +1762,53 @@ mod tests {
             scope.cleanup();
         }
 
-        let (scope, path, _old_scope, before, _) = setup_refresh("antigravity-metadata-fail");
+        let (scope, path, old_scope, before, location) = setup_refresh("antigravity-metadata-fail");
         scope.fail_metadata_save();
-        let (_, _, scope_outcome) = run_refresh(&scope, &path, None).await.unwrap();
+        let (refreshed, access_token, scope_outcome) =
+            run_refresh(&scope, &path, None).await.unwrap();
+        assert_eq!(access_token, "antigravity-new-access");
+        assert_eq!(remote_access_token(&refreshed).unwrap(), access_token);
         assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
         assert_eq!(scope.metadata_bytes(), before);
-        assert_eq!(stored_refresh_token(&path), "antigravity-new-refresh");
+        assert_eq!(stored_refresh_token(&path), "antigravity-old-refresh");
+        assert_eq!(
+            scope
+                .resolve_current("google-oauth-creds", &location, b"antigravity-old-refresh",)
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
+
+        let (scope, path, _old_scope, before, _) =
+            setup_refresh("antigravity-metadata-fail-unchanged");
+        scope.fail_metadata_save();
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let save_path = path.clone();
+        let (refreshed, access_token, scope_outcome) = refresh_access_token_with(
+            &path,
+            now,
+            &scope,
+            |refresh_token| async move {
+                assert_eq!(refresh_token, "antigravity-old-refresh");
+                Ok(json!({
+                    "access_token": "antigravity-new-access",
+                    "expires_in": 3600
+                }))
+            },
+            move |credentials| write_creds_atomic(&save_path, credentials),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+        assert_eq!(scope.metadata_bytes(), before);
+        assert_eq!(access_token, "antigravity-new-access");
+        assert_eq!(remote_access_token(&refreshed).unwrap(), access_token);
+        let persisted = load_remote_credentials(&path).unwrap();
+        assert_eq!(remote_access_token(&persisted).unwrap(), access_token);
+        assert_eq!(stored_refresh_token(&path), "antigravity-old-refresh");
         scope.cleanup();
 
         let (scope, path, old_scope, _, location) = setup_refresh("antigravity-success");
