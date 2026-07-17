@@ -6,9 +6,40 @@ import TokenBarCore
 /// (Overview/Claude/Codex…, later phase) filters *which* data; this picks
 /// *how* it is broken down. The two compose.
 enum AppView: String, CaseIterable {
-    case overview, models, daily, hourly, stats, agents
+    case overview, models, monthly, daily, hourly, stats, agents
 
     var label: String { rawValue.prefix(1).uppercased() + rawValue.dropFirst() }
+
+    /// Lenses the user can individually hide via Settings. Overview and
+    /// Models are fixed anchors — Overview is the fallback target for every
+    /// hidden lens (see `effective`), so it can never itself be hidden.
+    static let toggleable: [AppView] = allCases.filter { $0 != .overview && $0 != .models }
+
+    /// Lenses shown in the tab row, given the persisted hidden-set raw
+    /// string. Same comma-separated-ids shape `ClientRegistry` uses for
+    /// hidden client tabs — `ClientRegistry.parseIdSet` is reused verbatim,
+    /// it's a generic CSV-id parser, not client-specific in implementation.
+    /// Only `toggleable` lenses can ever actually be hidden — even a
+    /// tampered raw string (e.g. a manually edited UserDefaults value)
+    /// can't hide Overview or Models, since Overview must always remain the
+    /// guaranteed fallback target (see `effective`).
+    static func visible(hiddenRaw: String) -> [AppView] {
+        let hidden = ClientRegistry.parseIdSet(hiddenRaw)
+        return allCases.filter { !toggleable.contains($0) || !hidden.contains($0.rawValue) }
+    }
+
+    /// The view to actually render/label this frame. A hidden lens never
+    /// survives — not even for the one frame before `resetViewIfHidden()`
+    /// persists the correction — because a transient popover can reopen with
+    /// a brand-new view instance whose `onChange` has nothing to compare
+    /// against (see StatusItemController's `.transient` behavior). Same
+    /// defensive shape as `lensContent`'s inline `singleClient` check for a
+    /// just-hidden client tab. Guarded to `toggleable` lenses for the same
+    /// tamper-resistance reason as `visible`.
+    static func effective(_ view: AppView, hiddenRaw: String) -> AppView {
+        guard toggleable.contains(view) else { return view }
+        return ClientRegistry.parseIdSet(hiddenRaw).contains(view.rawValue) ? .overview : view
+    }
 }
 
 /// Snapshot of the model's essential state, captured on each successful
@@ -54,6 +85,7 @@ private struct DashboardSnapshot {
     /// Whether this model owns the shared `lastSnapshot` (true only for the
     /// popover's model, whose teardown/rebuild is what the cache speeds up).
     private let cachesSnapshot: Bool
+    private let source: any UsageDataSource
     enum Phase {
         case loading
         case ready
@@ -78,8 +110,12 @@ private struct DashboardSnapshot {
     /// `cachesSnapshot` = true only for the popover's model (PopoverView), the
     /// one whose per-open teardown/rebuild the cache exists to speed up; the
     /// settings window passes false so it never writes the shared snapshot.
-    init(cachesSnapshot: Bool = false) {
+    init(
+        cachesSnapshot: Bool = false,
+        source: any UsageDataSource = UsageDataSources.current
+    ) {
         self.cachesSnapshot = cachesSnapshot
+        self.source = source
         // Guard snapshot restore on year-consistency: if the user changed the
         // year filter after the snapshot was written (e.g. setYear() persisted
         // the new year but reload() failed before apply() ran), the cached
@@ -157,18 +193,15 @@ private struct DashboardSnapshot {
         return computed
     }
 
-    /// TBCore is blocking — every fetch hops off the main actor.
+    /// The source owns the blocking FFI hop in live mode; demo mode returns
+    /// synthetic values through the same async contract.
     func load() async {
         do {
             let year = self.year
-            async let payloadTask = Task.detached(priority: .userInitiated) {
-                try TBCore.graph(year: year)
-            }.value
-            async let reportTask = Task.detached(priority: .userInitiated) {
-                try? TBCore.modelReport(year: year)
-            }.value
+            async let payloadTask = source.graph(year: year, priority: .userInitiated)
+            async let reportTask = source.modelReport(year: year, priority: .userInitiated)
             let payload = try await payloadTask
-            let report = await reportTask
+            let report = try? await reportTask
             // The year may have changed while we were off-actor (the user can
             // open the year menu during the initial load); drop a stale slice
             // so apply() never tags the new year — and the static snapshot —
@@ -226,14 +259,12 @@ private struct DashboardSnapshot {
 
     private func reload(force: Bool) async {
         let year = self.year
-        async let payloadTask = Task.detached(priority: .userInitiated) {
-            force ? try TBCore.refreshGraph(year: year) : try TBCore.graph(year: year)
-        }.value
-        async let reportTask = Task.detached(priority: .userInitiated) {
-            try? TBCore.modelReport(year: year)
-        }.value
+        async let payloadTask = force
+            ? source.refreshGraph(year: year, priority: .userInitiated)
+            : source.graph(year: year, priority: .userInitiated)
+        async let reportTask = source.modelReport(year: year, priority: .userInitiated)
         guard let payload = try? await payloadTask else { return }
-        let report = await reportTask
+        let report = try? await reportTask
         apply(payload: payload, report: report)
         // If apply() cleared a now-empty year filter, it spawned its own
         // unfiltered reload that re-fetches the lazy lenses for the new (nil)
@@ -249,16 +280,14 @@ private struct DashboardSnapshot {
         // strand the wrong slice on the lens.
         if hourly != nil {
             let captured = hourlyClients
-            let report = await Task.detached(priority: .userInitiated) {
-                try? TBCore.hourlyReport(year: year, clients: captured.map(Array.init))
-            }.value
+            let report = try? await source.hourlyReport(
+                year: year, clients: captured.map(Array.init), priority: .userInitiated)
             if self.year == year, self.hourlyClients == captured { hourly = report }
         }
         if agents != nil {
             let captured = agentsClients
-            let report = await Task.detached(priority: .userInitiated) {
-                try? TBCore.agentsReport(year: year, clients: captured.map(Array.init))
-            }.value
+            let report = try? await source.agentsReport(
+                year: year, clients: captured.map(Array.init), priority: .userInitiated)
             if self.year == year, self.agentsClients == captured { agents = report }
         }
     }
@@ -331,14 +360,10 @@ private struct DashboardSnapshot {
             // Don't race an in-flight manual Refresh or year switch.
             guard !refreshing else { continue }
             let year = self.year
-            async let payloadTask = Task.detached(priority: .utility) {
-                try? TBCore.graph(year: year)
-            }.value
-            async let reportTask = Task.detached(priority: .utility) {
-                try? TBCore.modelReport(year: year)
-            }.value
-            let fetched = await payloadTask
-            let report = await reportTask
+            async let payloadTask = source.graph(year: year, priority: .utility)
+            async let reportTask = source.modelReport(year: year, priority: .utility)
+            let fetched = try? await payloadTask
+            let report = try? await reportTask
             if Task.isCancelled { break }
             // The year may have changed while we were off-actor; drop a stale
             // slice so the chart never flickers to the wrong year.
@@ -355,16 +380,14 @@ private struct DashboardSnapshot {
             // the fresh slice with the stale one.
             if hourly != nil {
                 let captured = hourlyClients
-                let report = await Task.detached(priority: .utility) {
-                    try? TBCore.hourlyReport(year: year, clients: captured.map(Array.init))
-                }.value
+                let report = try? await source.hourlyReport(
+                    year: year, clients: captured.map(Array.init), priority: .utility)
                 if self.year == year, self.hourlyClients == captured { hourly = report }
             }
             if agents != nil {
                 let captured = agentsClients
-                let report = await Task.detached(priority: .utility) {
-                    try? TBCore.agentsReport(year: year, clients: captured.map(Array.init))
-                }.value
+                let report = try? await source.agentsReport(
+                    year: year, clients: captured.map(Array.init), priority: .utility)
                 if self.year == year, self.agentsClients == captured { agents = report }
             }
         }
@@ -375,9 +398,7 @@ private struct DashboardSnapshot {
     /// previous payload; per-provider errors live inside each snapshot.
     func pollAgentUsage() async {
         while !Task.isCancelled {
-            let payload = try? await Task.detached(priority: .utility) {
-                try TBCore.agentUsage()
-            }.value
+            let payload = try? await source.agentUsage()
             if Task.isCancelled { break }
             if let payload {
                 agentUsage = payload
@@ -392,9 +413,7 @@ private struct DashboardSnapshot {
     /// re-parses at most every 10s, so this matches its cadence.
     func pollTrace() async {
         while !Task.isCancelled {
-            let buckets = try? await Task.detached(priority: .utility) {
-                try TBCore.usageTrace(windowSecs: 600)
-            }.value
+            let buckets = try? await source.usageTrace(windowSecs: 600)
             if Task.isCancelled { break }
             if let buckets {
                 trace = buckets
@@ -427,10 +446,9 @@ private struct DashboardSnapshot {
             // against the NEW clientIds for one FFI latency (a shared hour's
             // hidden stripe would flash). Also covers plain tab switches.
             if hourly != nil, hourlyClients != selection { hourly = nil; hourlyClients = selection }
-            let report = await Task.detached(priority: .userInitiated) {
-                try? TBCore.hourlyReport(year: year, clients: clients)
-            }.value
-            // The detached FFI outlives this `.task(id:)`'s cancellation, so a
+            let report = try? await source.hourlyReport(
+                year: year, clients: clients, priority: .userInitiated)
+            // The source request may outlive this `.task(id:)`'s cancellation, so a
             // tab switch or year change during the await must not let this
             // superseded fetch commit: PopoverView cancels the task on an
             // activeTab/year change, so isCancelled captures the slice switch
@@ -442,14 +460,20 @@ private struct DashboardSnapshot {
         case .agents where agents == nil || agentsClients != selection:
             // Nil the stale report on a slice change (see the hourly case).
             if agents != nil, agentsClients != selection { agents = nil; agentsClients = selection }
-            let report = await Task.detached(priority: .userInitiated) {
-                try? TBCore.agentsReport(year: year, clients: clients)
-            }.value
+            let report = try? await source.agentsReport(
+                year: year, clients: clients, priority: .userInitiated)
             guard self.year == year, !Task.isCancelled else { return }
             agents = report
             agentsClients = selection
         default:
             break
         }
+    }
+
+    /// Shared async live-rate helper for PopoverView and SettingsWindowView.
+    /// The source remains the only owner of raw usage calls; hidden-client
+    /// filtering follows the same policy as the tray and live-session card.
+    func tokensPerMin() async -> Double? {
+        try? await LiveRate.current(source: source)
     }
 }

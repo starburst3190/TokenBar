@@ -3,6 +3,60 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>1.5.0</title>
+            <pubDate>Thu, 16 Jul 2026 19:21:13 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.5.0</link>
+            <sparkle:version>299</sparkle:version>
+            <sparkle:shortVersionString>1.5.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>New:</b>
+<ul>
+<li>Browse spending by month, drill into each month's per-model usage, and choose which optional dashboard views appear.</li>
+</ul>
+<b>Improved:</b>
+<ul>
+<li>Codex Weekly historical pace now learns from a clean, account-scoped history so expected usage, run-out timing, and risk stay consistent. Learning starts fresh after this update; Linear pace is used until enough complete weeks are available.</li>
+<li>Quota cards keep pace, ETA, and risk readable by moving projection details to a second line when space is tight.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Monthly keeps message-only activity visible even when its token and cost totals are zero.</li>
+</ul>
+<p>Thanks: @yiskang</p>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.5.0/TokenBar.app.tar.gz" length="7513984" type="application/octet-stream" sparkle:edSignature="KbHPCM6RFWGztVKe5K8IA/g/LBImAgN1BRfl7ZpkvtN7oJCNENEnHgsK5SX9xsUkhSoiT/7UHIgbIg2w7a/lBw=="/>
+        </item>
+        <item>
+            <title>1.4.0</title>
+            <pubDate>Wed, 15 Jul 2026 04:12:46 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.4.0</link>
+            <sparkle:version>264</sparkle:version>
+            <sparkle:shortVersionString>1.4.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>New:</b>
+<ul>
+<li>Added Grok Build as a first-class client, including local session usage throughout TokenBar and weekly quota when Grok OAuth credentials are available.</li>
+<li>Added discovery for named Hermes profiles, including profile-only homes.</li>
+<li>Added deep Claude workflow transcripts to local usage reports.</li>
+</ul>
+<b>Improved:</b>
+<ul>
+<li>Preserved provider-reported costs from GJC and OpenCode instead of replacing them with estimates.</li>
+<li>Made usage refreshes reliable when Roo Code, Kilo Code, Cline, Droid, Kimi, or Kiro change metadata stored outside the primary session file.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Corrected Jcode turn counts, Pi session and subagent attribution, and nested Copilot agent attribution.</li>
+<li>Prevented token totals from overflowing on corrupt or extreme input.</li>
+<li>Corrected Codex model-performance timing so repeated snapshots no longer count overlapping durations.</li>
+</ul>
+<p>Thanks: @savourylie</p>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.4.0/TokenBar.app.tar.gz" length="7647140" type="application/octet-stream" sparkle:edSignature="DKo4duLm4VDTGcUFGp3Gn3LXd6OtDuz+sR+pNDQiyb9cieeYl2UqylZhiKXmD+Bic68HvGARS5zq/uXaZYYzDA=="/>
+        </item>
+        <item>
             <title>1.3.0</title>
             <pubDate>Sat, 11 Jul 2026 13:41:20 +0000</pubDate>
             <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.3.0</link>
@@ -71,36 +125,6 @@
 </ul>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.2.0/TokenBar.app.tar.gz" length="7390235" type="application/octet-stream" sparkle:edSignature="9RRaaKVKIGuYWsvZbMdZOKRHAn4mC3odcHoBPTpov2naMTQbshU6qV72FTGGpFN/amEE1UhBgpf8Uzp0jTb7CQ=="/>
-        </item>
-        <item>
-            <title>1.1.4</title>
-            <pubDate>Thu, 25 Jun 2026 13:34:13 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.1.4</link>
-            <sparkle:version>173</sparkle:version>
-            <sparkle:shortVersionString>1.1.4</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Fixes:</b>
-<ul>
-<li>Reopening the dashboard now reliably shows the correct data: it keeps your selected year, no longer shows a previous year's numbers, and keeps the live activity and quota cards populated.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.1.4/TokenBar.app.tar.gz" length="7070011" type="application/octet-stream" sparkle:edSignature="fa1zEEFwirhzxUE4k3ASTeGhhXoHVLqku8xg2lG4SFAvlDjVwq8yXTOxC2RW6RYF+49ummJnnt25VHLYDDIqCg=="/>
-        </item>
-        <item>
-            <title>1.1.3</title>
-            <pubDate>Wed, 24 Jun 2026 19:05:58 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.1.3</link>
-            <sparkle:version>171</sparkle:version>
-            <sparkle:shortVersionString>1.1.3</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Fixes:</b>
-<ul>
-<li>Dashboard no longer flashes a loading indicator each time you open the popover</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.1.3/TokenBar.app.tar.gz" length="7067818" type="application/octet-stream" sparkle:edSignature="JBwW1pPabLaE7N4bARW+vNsXX+F1HOAQlPyfI0tr/zjbLkAglcOBg9vs6eBORB2N2RCYdyJ6zIlH7GyH2rqGCg=="/>
         </item>
         <item>
             <title>1.1.1</title>

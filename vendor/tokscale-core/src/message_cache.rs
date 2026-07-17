@@ -57,7 +57,11 @@ use std::time::UNIX_EPOCH;
 // exported first no longer become the trace default. Schema-27 caches can carry
 // the wrong nested fallback and must be rebuilt. The final #834 resolver covers
 // #821's reversed-export-order semantic.)
-const CACHE_SCHEMA_VERSION: u32 = 28;
+// 29 (M14: Codex token durations now advance from the last accepted token
+// snapshot instead of repeatedly measuring from the turn start. Schema-28
+// caches can replay overlapping duration_ms values or resume an incremental
+// parse without the new cursor, so unchanged sources must be rebuilt.)
+const CACHE_SCHEMA_VERSION: u32 = 29;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -233,6 +237,36 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, related_paths)
     }
 
+    /// Fingerprint a Droid settings snapshot together with the fallback JSONL
+    /// that supplies its model when the snapshot omits one.
+    pub(crate) fn from_droid_path(path: &Path) -> Option<Self> {
+        let Some(jsonl) = crate::sessions::droid::droid_jsonl_path(path) else {
+            return Self::from_path(path);
+        };
+        let related_paths = std::iter::once(("session.jsonl".to_string(), jsonl));
+        Self::from_path_with_related(path, related_paths)
+    }
+
+    /// Fingerprint a legacy Kimi wire log together with the shared config that
+    /// supplies its model.
+    pub(crate) fn from_kimi_path(path: &Path) -> Option<Self> {
+        let Some(config) = crate::sessions::kimi::kimi_config_path(path) else {
+            return Self::from_path(path);
+        };
+        let related_paths = std::iter::once(("config.json".to_string(), config));
+        Self::from_path_with_related(path, related_paths)
+    }
+
+    /// Fingerprint a Kiro CLI session header together with its same-stem
+    /// message sidecar.
+    pub(crate) fn from_kiro_path(path: &Path) -> Option<Self> {
+        let Some(messages) = crate::sessions::kiro::kiro_related_messages_path(path) else {
+            return Self::from_path(path);
+        };
+        let related_paths = std::iter::once(("messages.jsonl".to_string(), messages));
+        Self::from_path_with_related(path, related_paths)
+    }
+
     /// Fingerprint for a Grok `updates.jsonl` session and every sibling
     /// `read_metadata` consults. `parse_grok_updates_file` reconciles session
     /// totals from `signals.json` (compaction), and `read_metadata` additionally
@@ -263,10 +297,7 @@ impl SourceFingerprint {
     /// unchanged) must still invalidate the cache or reports keep stale
     /// model/agent/pricing.
     pub(crate) fn from_roo_path(path: &Path) -> Option<Self> {
-        let history = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("api_conversation_history.json");
+        let history = crate::sessions::roocode::history_path_for_ui_messages(path);
         let related_paths = std::iter::once(("api_conversation_history.json".to_string(), history));
         Self::from_path_with_related(path, related_paths)
     }
@@ -1088,6 +1119,108 @@ mod tests {
             plain_before, plain_after,
             "from_path ignores the history sibling (control)"
         );
+    }
+
+    #[test]
+    fn from_roo_path_invalidates_when_history_appears() {
+        let dir = TempDir::new().unwrap();
+        let ui = dir.path().join("ui_messages.json");
+        std::fs::write(&ui, b"[]").unwrap();
+
+        let before = SourceFingerprint::from_roo_path(&ui).unwrap();
+        std::fs::write(
+            crate::sessions::roocode::history_path_for_ui_messages(&ui),
+            b"<environment_details><model>gpt-5</model></environment_details>",
+        )
+        .unwrap();
+        let after = SourceFingerprint::from_roo_path(&ui).unwrap();
+
+        assert_ne!(
+            before, after,
+            "creating the optional history sibling must invalidate the roo fingerprint"
+        );
+    }
+
+    #[test]
+    fn from_droid_path_invalidates_when_fallback_jsonl_appears() {
+        let dir = TempDir::new().unwrap();
+        let settings = dir.path().join("session.settings.json");
+        std::fs::write(&settings, br#"{"tokenUsage":{"inputTokens":1}}"#).unwrap();
+
+        let before = SourceFingerprint::from_droid_path(&settings).unwrap();
+        let plain_before = SourceFingerprint::from_path(&settings).unwrap();
+        let jsonl = crate::sessions::droid::droid_jsonl_path(&settings).unwrap();
+        assert_eq!(jsonl, dir.path().join("session.jsonl"));
+        assert!(before.related_files.is_empty());
+
+        std::fs::write(&jsonl, b"Model: Claude Sonnet 4\n").unwrap();
+
+        let after = SourceFingerprint::from_droid_path(&settings).unwrap();
+        let plain_after = SourceFingerprint::from_path(&settings).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(plain_before, plain_after);
+        assert_eq!(after.related_files[0].suffix, "session.jsonl");
+
+        std::fs::write(&jsonl, b"Model: Claude Opus 4.5 Thinking\n").unwrap();
+        let rewritten = SourceFingerprint::from_droid_path(&settings).unwrap();
+        assert_ne!(after, rewritten);
+        assert_eq!(
+            plain_after,
+            SourceFingerprint::from_path(&settings).unwrap()
+        );
+    }
+
+    #[test]
+    fn from_kimi_path_invalidates_when_config_appears() {
+        let dir = TempDir::new().unwrap();
+        let wire = dir.path().join(".kimi/sessions/group/session/wire.jsonl");
+        std::fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        std::fs::write(&wire, b"usage\n").unwrap();
+
+        let before = SourceFingerprint::from_kimi_path(&wire).unwrap();
+        let plain_before = SourceFingerprint::from_path(&wire).unwrap();
+        let config = crate::sessions::kimi::kimi_config_path(&wire).unwrap();
+        assert_eq!(config, dir.path().join(".kimi/config.json"));
+        assert!(before.related_files.is_empty());
+
+        std::fs::write(&config, br#"{"model":"kimi-k2"}"#).unwrap();
+
+        let after = SourceFingerprint::from_kimi_path(&wire).unwrap();
+        let plain_after = SourceFingerprint::from_path(&wire).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(plain_before, plain_after);
+        assert_eq!(after.related_files[0].suffix, "config.json");
+
+        std::fs::write(&config, br#"{"model":"kimi-k2-thinking"}"#).unwrap();
+        let rewritten = SourceFingerprint::from_kimi_path(&wire).unwrap();
+        assert_ne!(after, rewritten);
+        assert_eq!(plain_after, SourceFingerprint::from_path(&wire).unwrap());
+    }
+
+    #[test]
+    fn from_kiro_path_invalidates_when_messages_sidecar_appears() {
+        let dir = TempDir::new().unwrap();
+        let session = dir.path().join("session.json");
+        std::fs::write(&session, b"{}").unwrap();
+
+        let before = SourceFingerprint::from_kiro_path(&session).unwrap();
+        let plain_before = SourceFingerprint::from_path(&session).unwrap();
+        let messages = crate::sessions::kiro::kiro_related_messages_path(&session).unwrap();
+        assert_eq!(messages, dir.path().join("session.jsonl"));
+        assert!(before.related_files.is_empty());
+
+        std::fs::write(&messages, b"message\n").unwrap();
+
+        let after = SourceFingerprint::from_kiro_path(&session).unwrap();
+        let plain_after = SourceFingerprint::from_path(&session).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(plain_before, plain_after);
+        assert_eq!(after.related_files[0].suffix, "messages.jsonl");
+
+        std::fs::write(&messages, b"rewritten message sidecar\n").unwrap();
+        let rewritten = SourceFingerprint::from_kiro_path(&session).unwrap();
+        assert_ne!(after, rewritten);
+        assert_eq!(plain_after, SourceFingerprint::from_path(&session).unwrap());
     }
 
     #[test]
@@ -2047,6 +2180,120 @@ mod tests {
                     .as_deref(),
                 Some("github.copilot.subagent")
             );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_schema_28_codex_cache_is_stale_and_rebuilt_with_non_overlapping_durations() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source = write_temp_file(include_bytes!(
+                "../tests/fixtures/codex_duration_timing.jsonl"
+            ));
+            let source_fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+            let parsed = crate::sessions::codex::parse_codex_file_incremental(
+                source.path(),
+                0,
+                CodexParseState::default(),
+            );
+            assert!(parsed.parse_succeeded);
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![Some(1_000), Some(4_000), Some(2_000)]
+            );
+
+            let mut stale_messages = parsed.messages.clone();
+            stale_messages[1].duration_ms = Some(5_000);
+            let stale_incremental =
+                build_codex_incremental_cache(source.path(), parsed.consumed_offset, parsed.state)
+                    .unwrap();
+            let stale_entry = CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint.clone(),
+                stale_messages,
+                Vec::new(),
+                Some(stale_incremental),
+            );
+            let cache_file = cache_path().unwrap();
+            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+            let stale_store = CachedSourceStore {
+                schema_version: 28,
+                entries: vec![stale_entry],
+            };
+
+            let writer = BufWriter::new(File::create(&cache_file).unwrap());
+            bincode::options()
+                .serialize_into(writer, &stale_store)
+                .unwrap();
+
+            let mut loaded = SourceMessageCache::load();
+            assert!(
+                loaded.entries.is_empty(),
+                "schema-28 Codex durations and incremental state must be stale"
+            );
+            assert_eq!(
+                SourceFingerprint::from_path(source.path()).unwrap(),
+                source_fingerprint,
+                "the stale entry and rebuilt parse have the same source fingerprint"
+            );
+
+            let rebuilt = crate::sessions::codex::parse_codex_file_incremental(
+                source.path(),
+                0,
+                CodexParseState::default(),
+            );
+            assert!(rebuilt.parse_succeeded);
+            assert_eq!(
+                rebuilt
+                    .messages
+                    .iter()
+                    .map(|message| message.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![Some(1_000), Some(4_000), Some(2_000)]
+            );
+            assert!(rebuilt.state.last_accepted_token_timestamp_ms.is_some());
+            let rebuilt_incremental = build_codex_incremental_cache(
+                source.path(),
+                rebuilt.consumed_offset,
+                rebuilt.state,
+            )
+            .unwrap();
+            loaded.insert(CachedSourceEntry::new(
+                source.path(),
+                source_fingerprint,
+                rebuilt.messages,
+                rebuilt.fallback_timestamp_indices,
+                Some(rebuilt_incremental),
+            ));
+            loaded.save_if_dirty();
+
+            let persisted = read_store_from_path(&cache_file).unwrap();
+            assert_eq!(persisted.schema_version, CACHE_SCHEMA_VERSION);
+            assert_eq!(persisted.entries.len(), 1);
+            assert_eq!(
+                persisted.entries[0]
+                    .messages
+                    .iter()
+                    .map(|message| message.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![Some(1_000), Some(4_000), Some(2_000)]
+            );
+            assert!(persisted.entries[0]
+                .codex_incremental
+                .as_ref()
+                .unwrap()
+                .state
+                .last_accepted_token_timestamp_ms
+                .is_some());
         }
 
         restore_cache_env(prev_env);

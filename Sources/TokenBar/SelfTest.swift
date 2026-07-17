@@ -5,6 +5,10 @@ import TokenBarCore
 // Plain assertions instead of swift-testing/XCTest because the dev machine has
 // Command Line Tools only (no testing modules); CI runs this the same way.
 
+private final class AsyncResultBox<Value: Sendable>: @unchecked Sendable {
+    var result: Result<Value, Error>?
+}
+
 enum SelfTest {
     static func run() -> Never {
         var failures = 0
@@ -15,6 +19,23 @@ enum SelfTest {
                 failures += 1
                 print("FAIL \(label)")
             }
+        }
+
+        func awaitValue<Value: Sendable>(
+            _ operation: @escaping @Sendable () async throws -> Value
+        ) -> Value? {
+            let semaphore = DispatchSemaphore(value: 0)
+            let box = AsyncResultBox<Value>()
+            Task.detached(priority: .userInitiated) {
+                defer { semaphore.signal() }
+                do {
+                    box.result = .success(try await operation())
+                } catch {
+                    box.result = .failure(error)
+                }
+            }
+            semaphore.wait()
+            return try? box.result?.get()
         }
 
         // ModelColors: provider inference + shade math.
@@ -66,13 +87,12 @@ enum SelfTest {
         let now = Date(timeIntervalSince1970: 1_750_000_000)
         func window(
             used: Double, minutes: Int64 = 60, untilReset: TimeInterval = 1800,
-            historical: Double? = nil, runOut: Double? = nil
+            historicalPace: HistoricalPace? = nil
         ) -> UsageWindow {
             UsageWindow(
                 label: "Session", usedPercent: used, remainingPercent: 100 - used,
                 resetsAt: ISO8601DateFormatter().string(from: now.addingTimeInterval(untilReset)),
-                windowMinutes: minutes, historicalExpectedPercent: historical,
-                runOutProbability: runOut)
+                windowMinutes: minutes, historicalPace: historicalPace)
         }
         let onPace = UsagePace.compute(window: window(used: 50), now: now)
         expect(onPace?.stage == .onTrack && onPace?.label == "On pace", "pace on track at 50%/50%")
@@ -86,23 +106,102 @@ enum SelfTest {
         expect(reserve?.willLastToReset == true && reserve?.etaText == "Lasts until reset", "slow burn lasts")
         expect(UsagePace.compute(window: window(used: 50, minutes: 0), now: now) == nil, "no window length, no pace")
         expect(UsagePace.compute(window: window(used: 50, untilReset: -10), now: now) == nil, "past reset, no pace")
-        // Modes: off → nil; historical override replaces expected; run-out
-        // probability drives the lasts/empty projection in historical mode.
+        // Modes: off → nil; a missing/null historical result falls back to
+        // linear; nested historical values replace only expected/stage/delta
+        // while ETA and lasts-to-reset remain backend-owned.
         expect(UsagePace.compute(window: window(used: 50), mode: .off, now: now) == nil, "pace mode off")
+        let historicalLasts = HistoricalPace(
+            expectedUsedPercent: 80, etaSeconds: nil,
+            willLastToReset: true, runOutProbability: nil)
         let hist = UsagePace.compute(
-            window: window(used: 50, historical: 80, runOut: 0.2), mode: .historical, now: now)
+            window: window(used: 50, historicalPace: historicalLasts), mode: .historical, now: now)
         expect(hist?.expectedUsedPercent == 80 && hist?.stage == .farBehind, "historical expected override")
-        expect(hist?.willLastToReset == true, "low run-out risk lasts to reset")
+        expect(hist?.willLastToReset == true && hist?.etaSeconds == nil, "historical lasts result is trusted")
         let risky = UsagePace.compute(
-            window: window(used: 90, historical: 50, runOut: 0.8), mode: .historical, now: now)
-        expect(risky?.willLastToReset == false && risky?.etaSeconds != nil, "high run-out risk projects empty")
+            window: window(
+                used: 90,
+                historicalPace: HistoricalPace(
+                    expectedUsedPercent: 50, etaSeconds: 120,
+                    willLastToReset: false, runOutProbability: 0.8)),
+            mode: .historical, now: now)
+        expect(
+            risky?.willLastToReset == false && risky?.etaSeconds == 120,
+            "historical projected empty trusts backend eta")
+        expect(risky?.etaText == "Projected empty in 2m", "historical projected empty text")
+        let fallback = UsagePace.compute(window: window(used: 50), mode: .historical, now: now)
+        expect(fallback?.expectedUsedPercent == 50, "missing historical result falls back to linear")
         let linear = UsagePace.compute(
-            window: window(used: 50, historical: 80), mode: .linear, now: now)
+            window: window(used: 50, historicalPace: historicalLasts), mode: .linear, now: now)
         expect(linear?.expectedUsedPercent == 50, "linear mode ignores historical")
-        expect(runOutRiskLabel(window: window(used: 50, runOut: 0.3)) == "≈ 30% run-out risk", "run-out risk label")
-        expect(runOutRiskLabel(window: window(used: 50)) == nil, "no probability, no risk label")
+        expect(
+            UsagePace.compute(window: window(used: 50, historicalPace: historicalLasts), now: now)?
+                .expectedUsedPercent == 50,
+            "direct pace compute stays linear")
+        expect(runOutRiskLabel(window: window(used: 50)) == nil, "missing historical risk is nil")
+        let lastingRisk = HistoricalPace(
+            expectedUsedPercent: 80, etaSeconds: nil,
+            willLastToReset: true, runOutProbability: 0.2)
+        let lastingRiskWindow = window(used: 50, historicalPace: lastingRisk)
+        let lastingRiskPace = UsagePace.compute(
+            window: lastingRiskWindow, mode: .historical, now: now)!
+        let lastingRiskPresentation = UsagePace.presentation(
+            window: lastingRiskWindow, mode: .historical, pace: lastingRiskPace)
+        expect(
+            lastingRiskPace.etaText == "Lasts until reset" &&
+                lastingRiskPresentation.etaText == nil &&
+                lastingRiskPresentation.riskText == "≈ 20% run-out risk",
+            "visible historical risk suppresses lasts text")
+        let lastingNoRiskPresentation = UsagePace.presentation(
+            window: window(used: 50, historicalPace: historicalLasts),
+            mode: .historical, pace: hist!)
+        expect(
+            lastingNoRiskPresentation.etaText == "Lasts until reset" &&
+                lastingNoRiskPresentation.riskText == nil,
+            "historical lasting without risk keeps lasts text")
+        let exhaustedWindow = window(
+            used: 100,
+            historicalPace: HistoricalPace(
+                expectedUsedPercent: 80, etaSeconds: 0,
+                willLastToReset: false, runOutProbability: 1))
+        let exhausted = UsagePace.compute(
+            window: exhaustedWindow, mode: .historical, now: now)
+        expect(
+            exhausted?.etaSeconds == 0 && exhausted?.willLastToReset == false &&
+                exhausted?.etaText == "Projected empty now" &&
+                runOutRiskLabel(window: exhaustedWindow) == "≈ 100% run-out risk",
+            "historical exhausted result is coherent")
         expect(UsagePace.durationText(130 * 60) == "2h 10m", "duration text h m")
         expect(UsagePace.durationText(26 * 3600) == "1d 2h", "duration text d h")
+
+        // Production decoder shape: nested result decodes as one object;
+        // missing/null historicalPace stays nil, and legacy top-level scalar
+        // fields are ignored rather than becoming a second source of truth.
+        let nestedWindowJSON = """
+        {"label":"Weekly","usedPercent":50,"remainingPercent":50,
+         "resetsAt":"2025-05-15T01:13:20Z","windowMinutes":60,
+         "historicalPace":{"expectedUsedPercent":80,"etaSeconds":120,
+         "willLastToReset":false,"runOutProbability":0.8}}
+        """
+        let nestedDecoded = try! JSONDecoder().decode(
+            UsageWindow.self, from: Data(nestedWindowJSON.utf8))
+        expect(
+            nestedDecoded.historicalPace?.expectedUsedPercent == 80 &&
+                nestedDecoded.historicalPace?.etaSeconds == 120 &&
+                nestedDecoded.historicalPace?.willLastToReset == false &&
+                nestedDecoded.historicalPace?.runOutProbability == 0.8,
+            "nested historical pace decodes")
+        let missingDecoded = try! JSONDecoder().decode(
+            UsageWindow.self,
+            from: Data("{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50}".utf8))
+        let nullDecoded = try! JSONDecoder().decode(
+            UsageWindow.self,
+            from: Data("{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50,\"historicalPace\":null}".utf8))
+        let legacyDecoded = try! JSONDecoder().decode(
+            UsageWindow.self,
+            from: Data("{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50,\"historicalExpectedPercent\":80,\"runOutProbability\":0.8}".utf8))
+        expect(missingDecoded.historicalPace == nil, "missing historical pace decodes as nil")
+        expect(nullDecoded.historicalPace == nil, "null historical pace decodes as nil")
+        expect(legacyDecoded.historicalPace == nil, "legacy scalar fields are not a fallback")
 
         // Contribution grid: GitHub layout, col 0 row 0 = Sunday on/before
         // Jan 1; out-of-year cells are never active; max tracks active only.
@@ -436,6 +535,113 @@ enum SelfTest {
         expect(satSmall.totalTokens == 150 && satSmall.perDayMap["2026-07-01"]?.tokens == 150,
             "UsageStats is exact for normal stripes")
 
+        // Monthly lens (plan 2026-07-15): month-level date formatter.
+        expect(Format.monthYear("2026-07") == "Jul 2026", "monthYear formats YYYY-MM")
+        expect(Format.monthYear("2025-12") == "Dec 2025", "monthYear formats December")
+        expect(Format.monthYear("garbage") == "garbage", "monthYear passes malformed input through")
+        expect(Format.monthYear("2026-13") == "2026-13", "monthYear rejects month 13")
+
+        // Monthly lens bucketing (plan 2026-07-15): group by the FULL
+        // "YYYY-MM" prefix (never month-of-year), strict client allowlist,
+        // saturating folds, drill-down merges model slices across days.
+        let monthlyJSON = """
+        {"meta":{"generatedAt":"now","version":"1","dateRange":{"start":"2025-12-31","end":"2026-01-02"}},
+         "summary":{"totalTokens":0,"totalCost":0,"totalDays":3,"activeDays":3,"averagePerDay":0,
+                    "maxCostInSingleDay":0,"clients":["a","b"],"models":[]},
+         "years":[],
+         "contributions":[
+           {"date":"2025-12-31","totals":{"tokens":0,"cost":1,"messages":1},"intensity":1,
+            "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
+            "clients":[
+              {"client":"a","modelId":"m1","providerId":"p","cost":1,"messages":1,
+               "tokens":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}}]},
+           {"date":"2026-01-01","totals":{"tokens":0,"cost":3,"messages":2},"intensity":1,
+            "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
+            "clients":[
+              {"client":"a","modelId":"m1","providerId":"p","cost":1,"messages":1,
+               "tokens":{"input":40,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}},
+              {"client":"b","modelId":"m9","providerId":"p","cost":2,"messages":1,
+               "tokens":{"input":7,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}}]},
+           {"date":"2026-01-02","totals":{"tokens":0,"cost":1,"messages":1},"intensity":1,
+            "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
+            "clients":[
+              {"client":"a","modelId":"m1","providerId":"p","cost":1,"messages":1,
+               "tokens":{"input":9223372036854775807,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}}]}
+         ]}
+        """
+        let monthlyPayload = try! JSONDecoder().decode(UsagePayload.self, from: Data(monthlyJSON.utf8))
+        let mRows = MonthlyView.monthRows(payload: monthlyPayload, clientIds: ["a"])
+        expect(mRows.count == 2 && mRows[0].month == "2026-01" && mRows[1].month == "2025-12",
+            "monthly buckets split at the year boundary, most recent first")
+        expect(mRows[1].tokens == 100 && mRows[1].messages == 1,
+            "december totals only december")
+        expect(mRows[0].tokens == .max,
+            "monthly token fold saturates an Int64.max stripe")
+        expect(mRows[0].cost == 2.0 && mRows[0].messages == 2,
+            "hidden client b is excluded from january totals")
+        expect(MonthlyView.monthRows(payload: monthlyPayload, clientIds: []).isEmpty,
+            "empty client selection shows no months")
+        let mSlices = MonthlyView.modelSlices(
+            for: mRows[0], clientIds: ["a"], colors: ModelColorMap(report: nil))
+        expect(mSlices.count == 1 && mSlices[0].key == "m1|p" && mSlices[0].tokens == .max,
+            "drill-down merges the month's model slices across days with saturation")
+        expect(MonthlyView.modelSlices(
+                for: mRows[0], clientIds: ["a", "b"], colors: ModelColorMap(report: nil)).count == 2,
+            "drill-down shows client b's model when b is selected")
+
+        // Message-only activity (PR #54 review r3595383789): a contribution
+        // with messages but zero tokens and zero cost must still surface —
+        // some parsers emit message-count-only rows. Prior guard was
+        // `tokens > 0 || cost > 0`, which dropped this month entirely.
+        let messageOnlyJSON = """
+        {"meta":{"generatedAt":"now","version":"1","dateRange":{"start":"2026-02-01","end":"2026-02-01"}},
+         "summary":{"totalTokens":0,"totalCost":0,"totalDays":1,"activeDays":1,"averagePerDay":0,
+                    "maxCostInSingleDay":0,"clients":["a"],"models":[]},
+         "years":[],
+         "contributions":[
+           {"date":"2026-02-01","totals":{"tokens":0,"cost":0,"messages":5},"intensity":0,
+            "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
+            "clients":[
+              {"client":"a","modelId":"m1","providerId":"p","cost":0,"messages":5,
+               "tokens":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}}]}
+         ]}
+        """
+        let messageOnlyPayload = try! JSONDecoder().decode(UsagePayload.self, from: Data(messageOnlyJSON.utf8))
+        let moRows = MonthlyView.monthRows(payload: messageOnlyPayload, clientIds: ["a"])
+        expect(moRows.count == 1 && moRows[0].messages == 5 && moRows[0].tokens == 0 && moRows[0].cost == 0,
+            "a message-only month (zero tokens, zero cost) still surfaces in the Monthly lens")
+
+        // Tab order (plan 2026-07-16): Monthly leads Daily in the tab row.
+        expect(AppView.allCases.map(\.rawValue) ==
+            ["overview", "models", "monthly", "daily", "hourly", "stats", "agents"],
+            "tab row leads with Monthly, ahead of Daily")
+
+        // View-tabs visibility (plan 2026-07-16, generalized): any of the
+        // five toggleable lenses can be hidden independently; Overview and
+        // Models are fixed anchors, never in AppView.toggleable.
+        expect(AppView.toggleable == [.monthly, .daily, .hourly, .stats, .agents],
+            "toggleable lenses are fixed order, excluding Overview and Models")
+        expect(AppView.visible(hiddenRaw: "") == AppView.allCases,
+            "no hidden lenses shows every lens")
+        expect(AppView.visible(hiddenRaw: "monthly,hourly") ==
+            AppView.allCases.filter { $0 != .monthly && $0 != .hourly },
+            "hiding two lenses removes exactly those two, order otherwise unchanged")
+        expect(AppView.effective(.monthly, hiddenRaw: "monthly") == .overview,
+            "a hidden lens falls back to overview")
+        expect(AppView.effective(.monthly, hiddenRaw: "") == .monthly,
+            "a visible lens is unaffected")
+        expect(AppView.effective(.daily, hiddenRaw: "monthly") == .daily,
+            "hiding one lens doesn't affect another")
+        // Hardening (code review, plan 2026-07-16): only `toggleable` lenses
+        // are ever actually hideable, even if the persisted raw string is
+        // tampered with out-of-band (e.g. a manually edited UserDefaults
+        // value) to contain "overview" or "models" — Overview must always
+        // remain the guaranteed fallback target.
+        expect(AppView.visible(hiddenRaw: "overview,models") == AppView.allCases,
+            "overview and models can never be hidden, even via a tampered raw string")
+        expect(AppView.effective(.overview, hiddenRaw: "overview") == .overview,
+            "overview is never subject to the hidden-lens fallback")
+
         // Filtered stats derive their range from the SELECTED clients (issue
         // #36 Fix, round 5): a hidden client active AFTER the visible client's
         // last day must not reset/shorten the visible streak. Fixture: "vis"
@@ -551,6 +757,217 @@ enum SelfTest {
             endFallback: "2026-07-09")
         expect(badStartBars.count == DayBars.window && badStartBars.last?.date == "2026-07-03",
             "unparseable rangeStart falls back to a trailing window")
+
+        // Synthetic --demo source: one fixture must drive every usage lens,
+        // quota card, trace row, tray rate, and year selection without a live
+        // FFI call. The fixture itself is the only data definition here.
+        let demoSource = UsageDataSources.make(arguments: ["TokenBar", "--demo"])
+        let liveSource = UsageDataSources.make(arguments: ["TokenBar"])
+        expect(demoSource is DemoUsageDataSource, "usage source factory selects demo mode")
+        expect(liveSource is LiveUsageDataSource, "usage source factory selects live mode")
+        expect(!demoSource.allowsQuotaCachePersistence, "demo source disables quota cache persistence")
+        expect(liveSource.allowsQuotaCachePersistence, "live source allows quota cache persistence")
+
+        let demoPayload = DemoData.payload
+        let demoDates = demoPayload.contributions.map(\.date)
+        let demoDayNumbers = demoDates.compactMap { ISODay($0)?.number }
+        let consecutive = zip(demoDayNumbers, demoDayNumbers.dropFirst())
+            .allSatisfy { $1 == $0 + 1 }
+        expect(
+            demoDates.count == 14 && demoDates == demoDates.sorted() && consecutive,
+            "demo graph has 14 sorted consecutive days")
+        expect(
+            demoPayload.contributions.allSatisfy { $0.clients.count == ClientRegistry.allIds.count },
+            "demo graph carries every registered client on every day")
+
+        let contributionTokens = demoPayload.contributions.reduce(Int64(0)) {
+            $0.saturatingAdding($1.totals.tokens)
+        }
+        let contributionCost = demoPayload.contributions.reduce(0.0) { $0 + $1.totals.cost }
+        expect(
+            contributionTokens == demoPayload.summary.totalTokens
+                && abs(contributionCost - demoPayload.summary.totalCost) < 0.000_000_001,
+            "demo summary totals equal contribution totals")
+
+        let summaryClients = Set(demoPayload.summary.clients)
+        let contributionClients = Set(
+            demoPayload.contributions.flatMap { $0.clients.map(\.client) })
+        let quota = DemoData.agentUsage
+        let quotaClients = Set(quota.agents.map(\.clientId))
+        let registryClients = Set(ClientRegistry.allIds)
+        expect(
+            summaryClients == registryClients && contributionClients == registryClients
+                && quotaClients == registryClients,
+            "demo summary contributions and quota share the client set")
+        let dynamicLabelSelection = "\(ClientRegistry.allIds.first ?? "claude")|Sonnet"
+        let demoQuotaSelection = QuotaSelectionPolicy.effectiveSelection(
+            payload: quota,
+            persistedSelection: dynamicLabelSelection,
+            excluding: [],
+            fallbackUnknownExplicit: demoSource.fallsBackUnknownQuotaSelectionToAuto)
+        let liveQuotaSelection = QuotaSelectionPolicy.effectiveSelection(
+            payload: quota,
+            persistedSelection: dynamicLabelSelection,
+            excluding: [],
+            fallbackUnknownExplicit: liveSource.fallsBackUnknownQuotaSelectionToAuto)
+        expect(
+            demoQuotaSelection == QuotaResolver.auto && liveQuotaSelection == dynamicLabelSelection
+                && QuotaSelectionPolicy.resolve(
+                    payload: quota,
+                    persistedSelection: dynamicLabelSelection,
+                    excluding: [],
+                    fallbackUnknownExplicit: true) != nil
+                && QuotaSelectionPolicy.resolve(
+                    payload: quota,
+                    persistedSelection: dynamicLabelSelection,
+                    excluding: [],
+                    fallbackUnknownExplicit: false) == nil,
+            "demo unknown quota labels fall back locally while live stays exact")
+
+        let modelReport = DemoData.modelReport
+        let hourlyReport = DemoData.hourlyReport
+        let agentsReport = DemoData.agentsReport
+        let trace = DemoData.trace(windowSecs: 600)
+        let modelClients = Set(modelReport.entries.map(\.client))
+        let hourlyClients = Set(hourlyReport.entries.flatMap(\.clients))
+        let agentClients = Set(agentsReport.entries.flatMap(\.clients))
+        let traceClients = Set(trace.map(\.client))
+        let hourlyKeys = hourlyReport.entries.map(\.hour)
+        expect(
+            Set(hourlyKeys).count == hourlyKeys.count && hourlyKeys == hourlyKeys.sorted()
+                && hourlyReport.entries.allSatisfy {
+                    $0.clients == $0.clients.sorted() && $0.models == $0.models.sorted()
+                },
+            "demo hourly buckets are unique and sorted")
+        expect(
+            !modelReport.entries.isEmpty && !hourlyReport.entries.isEmpty
+                && !agentsReport.entries.isEmpty && !trace.isEmpty,
+            "demo reports and trace are non-empty")
+        expect(
+            modelClients == registryClients && hourlyClients == registryClients
+                && agentClients == registryClients && traceClients == registryClients,
+            "demo report and trace ids are registered clients")
+
+        let selectedClient = ClientRegistry.allIds.first ?? ""
+        var graphInput: Int64 = 0
+        var graphOutput: Int64 = 0
+        var graphCacheRead: Int64 = 0
+        var graphCacheWrite: Int64 = 0
+        var graphReasoning: Int64 = 0
+        var graphMessages = 0
+        var graphCost = 0.0
+        for contribution in demoPayload.contributions {
+            for client in contribution.clients where client.client == selectedClient {
+                graphInput += client.tokens.input
+                graphOutput += client.tokens.output
+                graphCacheRead += client.tokens.cacheRead
+                graphCacheWrite += client.tokens.cacheWrite
+                graphReasoning += client.tokens.reasoning
+                graphMessages += client.messages
+                graphCost += client.cost
+            }
+        }
+        let selectedHourly = DemoData.hourlyReport(for: nil, clients: [selectedClient])
+        let hourlyInput = selectedHourly.entries.reduce(Int64(0)) { $0 + $1.input }
+        let hourlyOutput = selectedHourly.entries.reduce(Int64(0)) { $0 + $1.output }
+        let hourlyCacheRead = selectedHourly.entries.reduce(Int64(0)) { $0 + $1.cacheRead }
+        let hourlyCacheWrite = selectedHourly.entries.reduce(Int64(0)) { $0 + $1.cacheWrite }
+        let hourlyReasoning = selectedHourly.entries.reduce(Int64(0)) { $0 + $1.reasoning }
+        let hourlyMessages = selectedHourly.entries.reduce(0) { $0 + $1.messageCount }
+        let hourlyCost = selectedHourly.entries.reduce(0.0) { $0 + $1.cost }
+        expect(
+            graphInput == hourlyInput && graphOutput == hourlyOutput
+                && graphCacheRead == hourlyCacheRead && graphCacheWrite == hourlyCacheWrite
+                && graphReasoning == hourlyReasoning && graphMessages == hourlyMessages
+                && abs(graphCost - hourlyCost) < 0.000_000_001,
+            "selected demo hourly totals equal graph client rows")
+
+        expect(
+            quota.agents.allSatisfy { agent in
+                !agent.windows.isEmpty && agent.windows.allSatisfy {
+                    $0.windowMinutes ?? 0 > 0
+                        && $0.usedPercent >= 0 && $0.remainingPercent > 0
+                        && abs($0.usedPercent + $0.remainingPercent - 100) < 0.000_001
+                }
+            },
+            "demo quota windows have valid labels and used-plus-remaining totals")
+        let rawDemoRate = DemoData.tokensPerMin
+        let traceRate = trace.reduce(0.0) { $0 + $1.tokensPerMin }
+        let selectedTraceRate = trace.first { $0.client == selectedClient }?.tokensPerMin ?? 0
+        let hiddenTraceRate = TraceBucket.totalRate(trace, hidden: [selectedClient])
+        let allHiddenTraceRate = TraceBucket.totalRate(trace, hidden: registryClients)
+        expect(
+            rawDemoRate > 0 && trace.allSatisfy { $0.tokensPerMin > 0 }
+                && abs(rawDemoRate - traceRate) < 0.000_001
+                && abs(hiddenTraceRate - (rawDemoRate - selectedTraceRate)) < 0.000_001
+                && allHiddenTraceRate == 0,
+            "demo raw rate equals trace and hidden-client reductions")
+
+        let currentYear = String(Format.todayKey().prefix(4))
+        let currentPayload = DemoData.payload(for: currentYear)
+        let otherYear = String((Int(currentYear) ?? 2000) - 1)
+        let otherPayload = DemoData.payload(for: otherYear)
+        expect(
+            demoPayload.contributions.last?.date == Format.todayKey()
+                && currentPayload.contributions.last?.date == Format.todayKey(),
+            "demo nil and current-year windows end today")
+        expect(
+            otherPayload.contributions.count == 14
+                && otherPayload.contributions.allSatisfy { $0.date.hasPrefix(otherYear) }
+                && otherPayload.years.contains { $0.year == otherYear },
+            "demo non-current year stays within the selected year")
+
+        let demoJan1 = DemoData.dates(for: "2024", today: "2024-01-01")
+        let demoJan13 = DemoData.dates(for: "2024", today: "2024-01-13")
+        let demoJan14 = DemoData.dates(for: "2024", today: "2024-01-14")
+        let rollingJan1 = DemoData.dates(for: nil, today: "2024-01-01")
+        let leapDay = DemoData.dates(for: "2024", today: "2024-02-29")
+        let priorYear = DemoData.dates(for: "2023", today: "2024-02-29")
+        let invalidYear = DemoData.dates(for: "not-a-year", today: "2024-02-29")
+        expect(
+            demoJan1.count == 1 && demoJan1.last == "2024-01-01"
+                && demoJan13.count == 13 && demoJan13.last == "2024-01-13"
+                && demoJan14.count == 14 && demoJan14.last == "2024-01-14",
+            "demo current-year dates clamp at January 1")
+        expect(
+            rollingJan1.count == 14 && rollingJan1.last == "2024-01-01"
+                && rollingJan1.first?.hasPrefix("2023-") == true,
+            "demo all-years dates retain the rolling cross-year window")
+        expect(
+            leapDay.count == 14 && leapDay.contains("2024-02-29")
+                && priorYear.count == 14 && priorYear.allSatisfy { $0.hasPrefix("2023-") }
+                && invalidYear.count == 14 && invalidYear.last == "2024-02-29",
+            "demo date helper handles leap and invalid years")
+
+        let sourcedPayload = awaitValue {
+            try await demoSource.graph(year: nil, priority: .userInitiated)
+        }
+        let sourcedRefresh = awaitValue {
+            try await demoSource.refreshGraph(year: nil, priority: .userInitiated)
+        }
+        let sourcedModels = awaitValue {
+            try await demoSource.modelReport(year: nil, priority: .userInitiated)
+        }
+        let sourcedHourly = awaitValue {
+            try await demoSource.hourlyReport(
+                year: nil, clients: nil, priority: .userInitiated)
+        }
+        let sourcedAgents = awaitValue {
+            try await demoSource.agentsReport(
+                year: nil, clients: nil, priority: .userInitiated)
+        }
+        let sourcedQuota = awaitValue { try await demoSource.agentUsage() }
+        let sourcedTrace = awaitValue { try await demoSource.usageTrace(windowSecs: 600) }
+        let sourcedRate = awaitValue { try await demoSource.tokensPerMin() }
+        expect(
+            sourcedPayload?.summary.totalTokens == demoPayload.summary.totalTokens
+                && sourcedRefresh?.summary.totalCost == demoPayload.summary.totalCost,
+            "demo source graph and refresh read synthetic data")
+        expect(
+            sourcedModels?.entries.isEmpty == false && sourcedHourly?.entries.isEmpty == false
+                && sourcedAgents?.entries.isEmpty == false && sourcedQuota?.agents.isEmpty == false
+                && sourcedTrace?.isEmpty == false && (sourcedRate ?? 0) > 0,
+            "demo source serves every usage API")
 
         // FFI envelope/error contract (hermetic; no FFI allocation or live data).
         for (label, passed) in TBCore.envelopeContractChecks() {

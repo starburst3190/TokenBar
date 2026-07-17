@@ -1076,9 +1076,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Droid)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::droid::parse_droid_file(path)
-            })
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_droid_path,
+                sessions::droid::parse_droid_file,
+            )
         })
         .collect();
     for outcome in droid_outcomes {
@@ -1124,9 +1128,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Kimi)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::kimi::parse_kimi_file(path)
-            })
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_kimi_path,
+                sessions::kimi::parse_kimi_file,
+            )
         })
         .collect();
     for outcome in kimi_outcomes {
@@ -1387,9 +1395,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Kiro)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::kiro::parse_kiro_file(path)
-            })
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_kiro_path,
+                sessions::kiro::parse_kiro_file,
+            )
         })
         .collect();
     for outcome in kiro_outcomes {
@@ -2539,10 +2551,18 @@ where
     simple_lane!(ClientId::Warp,      sessions::warp::parse_warp_file);
     simple_lane!(ClientId::Amp,       sessions::amp::parse_amp_file);
     simple_lane!(ClientId::Codebuff,  sessions::codebuff::parse_codebuff_file);
-    simple_lane!(ClientId::Droid,     sessions::droid::parse_droid_file);
+    simple_lane!(
+        ClientId::Droid,
+        sessions::droid::parse_droid_file,
+        message_cache::SourceFingerprint::from_droid_path
+    );
     simple_lane!(ClientId::OpenClaw,  sessions::openclaw::parse_openclaw_transcript);
     simple_lane!(ClientId::Pi,        sessions::pi::parse_pi_file);
-    simple_lane!(ClientId::Kimi,      sessions::kimi::parse_kimi_file);
+    simple_lane!(
+        ClientId::Kimi,
+        sessions::kimi::parse_kimi_file,
+        message_cache::SourceFingerprint::from_kimi_path
+    );
     simple_lane!(ClientId::Qwen,      sessions::qwen::parse_qwen_file);
     // roo family: fingerprint via from_roo_path so a history-only rewrite of the
     // sibling api_conversation_history.json (which parse_roo_kilo_file reads for
@@ -2592,7 +2612,11 @@ where
         true
     );
     simple_lane!(ClientId::Mux,       sessions::mux::parse_mux_file);
-    simple_lane!(ClientId::Kiro,      sessions::kiro::parse_kiro_file);
+    simple_lane!(
+        ClientId::Kiro,
+        sessions::kiro::parse_kiro_file,
+        message_cache::SourceFingerprint::from_kiro_path
+    );
 
     // ---- Gemini (cache-aware with invalidate_cache semantics) ----
     // Uses load_or_parse_source_with_fingerprint_and_policy equivalent:
@@ -3120,8 +3144,8 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
         &scan_result.kiro_db,
     ];
     dbs.extend(single_dbs.into_iter().flatten().cloned());
-    // Hermes/Zed dbs may also be discovered via user-provided extra scan
-    // roots (the `files` lanes) — use the plural helpers so every db gets
+    // Hermes/Zed dbs may also be auto-discovered or supplied through extra
+    // scan roots (the `files` lanes) — use the plural helpers so every db gets
     // its `-wal` sidecar probed, not just the default-path single.
     dbs.extend(scan_result.hermes_db_paths());
     dbs.extend(scan_result.zed_db_paths());
@@ -3165,6 +3189,27 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
             }
         }
     }
+    // Roo-family task parsers read model and agent identity from the sibling
+    // api_conversation_history.json. Probe it alongside ui_messages.json so a
+    // history-only rewrite reaches the cache fingerprint and active lane.
+    for client in [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline] {
+        for ui_messages in scan_result.get(client) {
+            latest = latest.max(roo_source_mtime_ms(ui_messages).unwrap_or(0));
+        }
+    }
+    // These file-backed parsers consult secondary sources whose writes do not
+    // update the scanned primary: Droid's fallback transcript, legacy Kimi's
+    // shared config, and Kiro CLI's same-stem message log. Probe each dependency
+    // so a sibling-only change reaches the specialized cache fingerprint.
+    for settings in scan_result.get(ClientId::Droid) {
+        latest = latest.max(droid_source_mtime_ms(settings).unwrap_or(0));
+    }
+    for wire in scan_result.get(ClientId::Kimi) {
+        latest = latest.max(kimi_source_mtime_ms(wire).unwrap_or(0));
+    }
+    for session in scan_result.get(ClientId::Kiro) {
+        latest = latest.max(kiro_source_mtime_ms(session).unwrap_or(0));
+    }
     Ok(latest)
 }
 
@@ -3173,6 +3218,55 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(duration.as_millis() as u64)
+}
+
+/// Newest mtime for a primary source and every related path its parser reads.
+/// Missing optional paths are ignored. Any other metadata failure returns
+/// `None`, allowing pruning callers to fail open rather than silently dropping
+/// a source whose freshness cannot be established.
+fn source_with_related_mtime_ms(
+    source: &Path,
+    related_paths: impl IntoIterator<Item = PathBuf>,
+) -> Option<u64> {
+    let mut latest = file_mtime_ms(source)?;
+    for related in related_paths {
+        let metadata = match std::fs::metadata(&related) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let modified = metadata.modified().ok()?;
+        let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        latest = latest.max(duration.as_millis() as u64);
+    }
+    Some(latest)
+}
+
+fn roo_source_mtime_ms(ui_messages_path: &Path) -> Option<u64> {
+    source_with_related_mtime_ms(
+        ui_messages_path,
+        std::iter::once(sessions::roocode::history_path_for_ui_messages(
+            ui_messages_path,
+        )),
+    )
+}
+
+fn droid_source_mtime_ms(settings_path: &Path) -> Option<u64> {
+    source_with_related_mtime_ms(
+        settings_path,
+        sessions::droid::droid_jsonl_path(settings_path),
+    )
+}
+
+fn kimi_source_mtime_ms(wire_path: &Path) -> Option<u64> {
+    source_with_related_mtime_ms(wire_path, sessions::kimi::kimi_config_path(wire_path))
+}
+
+fn kiro_source_mtime_ms(session_path: &Path) -> Option<u64> {
+    source_with_related_mtime_ms(
+        session_path,
+        sessions::kiro::kiro_related_messages_path(session_path),
+    )
 }
 
 /// Newest mtime for a Grok session's scanned updates file and every metadata
@@ -3200,10 +3294,11 @@ fn grok_source_mtime_ms(updates_path: &Path) -> Option<u64> {
 /// touching it: the Hermes/Zed/Antigravity-CLI/micode lanes hold SQLite dbs
 /// (WAL writes may not bump the main `.db` mtime), while the jcode lane holds a
 /// `session_*.json` snapshot whose sibling `.journal.jsonl` is appended between
-/// snapshot rewrites. Those lanes remain exempt. Grok can still be bounded by
-/// pruning against the newest mtime of `updates.jsonl` and every metadata sibling
-/// the parser reads (`signals.json` / `summary.json` / `events.jsonl`). Any stat
-/// failure keeps the file — over-parsing is safe, silently skipping is not.
+/// snapshot rewrites. Those lanes remain exempt. Roo-family, Droid, legacy Kimi,
+/// Kiro CLI, and Grok sources can still be bounded by folding every parser
+/// dependency into their newest mtime.
+/// Any stat failure keeps the file — over-parsing is safe, silently skipping is
+/// not.
 fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_ms: u64) {
     // Lanes whose scanned file's mtime does not reflect a sibling write
     // (SQLite `-wal` or jcode's `.journal.jsonl`); kept in lockstep with the
@@ -3215,8 +3310,36 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
         ClientId::MiMoCode as usize,
         ClientId::Jcode as usize,
     ];
+    let roo_lanes = [
+        ClientId::RooCode as usize,
+        ClientId::KiloCode as usize,
+        ClientId::Cline as usize,
+    ];
     for (lane, files) in scan_result.files.iter_mut().enumerate() {
         if db_lanes.contains(&lane) {
+            continue;
+        }
+        if roo_lanes.contains(&lane) {
+            files
+                .retain(|path| roo_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms));
+            continue;
+        }
+        if lane == ClientId::Droid as usize {
+            files.retain(|path| {
+                droid_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+            });
+            continue;
+        }
+        if lane == ClientId::Kimi as usize {
+            files.retain(|path| {
+                kimi_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+            });
+            continue;
+        }
+        if lane == ClientId::Kiro as usize {
+            files.retain(|path| {
+                kiro_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+            });
             continue;
         }
         if lane == ClientId::Grok as usize {
@@ -3926,16 +4049,18 @@ mod tests {
     use super::{
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
         dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
-        get_model_report, get_monthly_report, message_cache, normalize_model_for_grouping,
-        parse_all_messages_with_pricing, parse_all_messages_with_pricing_with_env_strategy,
-        parse_local_clients, parse_local_unified_messages, parsed_to_unified, pricing,
+        get_model_report, get_monthly_report, latest_source_mtime_ms, message_cache,
+        normalize_model_for_grouping, parse_all_messages_with_pricing,
+        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
+        parse_local_unified_messages, parsed_to_unified, pricing, prune_scan_result_by_mtime,
         reprice_lane_message, retain_for_requested_clients, scan_messages_streaming, scanner,
-        select_local_parse_pricing, unified_to_parsed, AgentAccumulator, ClientId, CostSource,
-        GroupBy, LocalParseOptions, OpenCodeStreamingSelection, ReportOptions, TokenBreakdown,
-        UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
+        select_local_parse_pricing, sessions, unified_to_parsed, AgentAccumulator, ClientId,
+        CostSource, GroupBy, LocalParseOptions, OpenCodeStreamingSelection, ReportOptions,
+        TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
     };
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::str::FromStr;
     use std::sync::Arc;
 
@@ -6293,6 +6418,313 @@ mod tests {
         }
     }
 
+    /// Regression fixture for Codex sessions that are live-only, archive-only,
+    /// or briefly present in both roots while the CLI moves a transcript.
+    fn write_codex_sessions_and_archived_sessions_fixture(source_home: &std::path::Path) {
+        let sessions_dir = source_home.join(".codex/sessions");
+        let archived_dir = source_home.join(".codex/archived_sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&archived_dir).unwrap();
+
+        std::fs::write(
+            sessions_dir.join("live-only.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"33333333-3333-7333-8333-333333333333","source":"interactive","model_provider":"openai","cwd":"/repo"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"output_tokens":5,"total_tokens":55},"last_token_usage":{"input_tokens":50,"output_tokens":5,"total_tokens":55}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            archived_dir.join("archived-only.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-06-20T09:00:00Z","type":"session_meta","payload":{"id":"44444444-4444-7444-8444-444444444444","source":"interactive","model_provider":"openai","cwd":"/repo"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-20T09:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-20T09:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":70,"output_tokens":7,"total_tokens":77},"last_token_usage":{"input_tokens":70,"output_tokens":7,"total_tokens":77}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let shared_content = concat!(
+            r#"{"timestamp":"2026-06-22T08:00:00Z","type":"session_meta","payload":{"id":"55555555-5555-7555-8555-555555555555","source":"interactive","model_provider":"openai","cwd":"/repo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-22T08:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-22T08:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":3,"total_tokens":33},"last_token_usage":{"input_tokens":30,"output_tokens":3,"total_tokens":33}}}}"#,
+            "\n"
+        );
+        std::fs::write(
+            sessions_dir.join("shared-in-sessions.jsonl"),
+            shared_content,
+        )
+        .unwrap();
+        std::fs::write(
+            archived_dir.join("shared-in-archived.jsonl"),
+            shared_content,
+        )
+        .unwrap();
+    }
+
+    fn with_isolated_tokscale_cache<T>(
+        cache_home: &std::path::Path,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        action()
+    }
+
+    fn write_codex_duration_prefix_fixture(
+        source_home: &std::path::Path,
+    ) -> (std::path::PathBuf, String) {
+        let lines = include_str!("../tests/fixtures/codex_duration_timing.jsonl")
+            .lines()
+            .collect::<Vec<_>>();
+        let sessions_dir = source_home.join(".codex/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let source = sessions_dir.join("codex-duration-timing.jsonl");
+        std::fs::write(&source, format!("{}\n", lines[..5].join("\n"))).unwrap();
+        (source, format!("{}\n", lines[5..].join("\n")))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_non_overlapping_durations_survive_incremental_and_streaming_caches() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let (source, suffix) = write_codex_duration_prefix_fixture(source_home.path());
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients = vec!["codex".to_string()];
+        let parse_materialized = || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                &home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        };
+
+        let prefix = with_isolated_tokscale_cache(materialized_cache.path(), parse_materialized);
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].duration_ms, Some(1_000));
+
+        let mut source_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap();
+        source_file.write_all(suffix.as_bytes()).unwrap();
+        source_file.flush().unwrap();
+        drop(source_file);
+
+        let materialized_incremental =
+            with_isolated_tokscale_cache(materialized_cache.path(), parse_materialized);
+        let materialized_warm =
+            with_isolated_tokscale_cache(materialized_cache.path(), parse_materialized);
+        for (phase, messages) in [
+            ("incremental", &materialized_incremental),
+            ("warm", &materialized_warm),
+        ] {
+            assert_eq!(messages.len(), 3, "{phase} materialized messages");
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![Some(1_000), Some(4_000), Some(2_000)],
+                "{phase} materialized durations"
+            );
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report_options = || ReportOptions {
+            home_dir: Some(home.clone()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            ..Default::default()
+        };
+        let streaming_cold = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+
+        // The cold Codex streaming lane does not persist SourceMessageCache.
+        // Seed this isolated cache through the public materialized path so the
+        // second report exercises the shipping cache-hit branch.
+        let cache_seed = with_isolated_tokscale_cache(streaming_cache.path(), parse_materialized);
+        assert_eq!(cache_seed.len(), 3);
+        assert!(
+            streaming_cache
+                .path()
+                .join("cache/source-message-cache.bin")
+                .is_file(),
+            "materialized seed must persist the cache used by the warm report"
+        );
+        let streaming_warm = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+
+        for (phase, report) in [("cold", &streaming_cold), ("warm", &streaming_warm)] {
+            assert_eq!(report.total_messages, 3, "{phase} streaming messages");
+            assert_eq!(report.entries.len(), 1, "{phase} model groups");
+            let performance = &report.entries[0].performance;
+            assert_eq!(
+                performance.total_duration_ms, 7_000,
+                "{phase} total duration"
+            );
+            assert_eq!(performance.timed_tokens, 170, "{phase} timed tokens");
+            assert_eq!(performance.sample_count, 3, "{phase} samples");
+            assert_eq!(performance.token_coverage, 1.0, "{phase} coverage");
+            let expected_ms_per_1k = 7_000.0 * 1_000.0 / 170.0;
+            assert!(
+                (performance.ms_per_1k_tokens.unwrap() - expected_ms_per_1k).abs() < f64::EPSILON,
+                "{phase} milliseconds per 1K tokens"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_archive_roots_are_exact_once_across_all_consumers() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let count_cache = tempfile::TempDir::new().unwrap();
+
+        write_codex_sessions_and_archived_sessions_fixture(source_home.path());
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients = vec!["codex".to_string()];
+        let materialized = with_isolated_tokscale_cache(materialized_cache.path(), || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                &home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        });
+
+        assert_eq!(materialized.len(), 3);
+        let session_ids: HashSet<_> = materialized
+            .iter()
+            .map(|message| message.session_id.as_str())
+            .collect();
+        assert!(session_ids.contains("live-only"));
+        assert!(session_ids.contains("archived-only"));
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>(),
+            150,
+        );
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|message| message.tokens.output)
+                .sum::<i64>(),
+            15,
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report_options = || ReportOptions {
+            home_dir: Some(home.clone()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            ..Default::default()
+        };
+        let streaming_cold = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+
+        // Codex's cold streaming lane does not populate SourceMessageCache, so
+        // seed the same isolated cache through the public materialized path
+        // before exercising the streaming cache-hit branch.
+        let cache_seed = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                &home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        });
+        assert_eq!(cache_seed.len(), 3);
+        assert!(
+            streaming_cache
+                .path()
+                .join("cache/source-message-cache.bin")
+                .is_file(),
+            "materialized seed must persist the cache used by the warm pass",
+        );
+        let streaming_warm = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(report_options()))
+                .unwrap()
+        });
+        for (phase, streaming) in [("cold", &streaming_cold), ("warm", &streaming_warm)] {
+            assert_eq!(streaming.total_messages, 3, "{phase} streaming messages");
+            assert_eq!(streaming.total_input, 150, "{phase} streaming input");
+            assert_eq!(streaming.total_output, 15, "{phase} streaming output");
+        }
+
+        let counted = with_isolated_tokscale_cache(count_cache.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(home),
+                use_env_roots: false,
+                clients: Some(clients),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: None,
+            })
+            .unwrap()
+        });
+        assert_eq!(counted.counts.get(ClientId::Codex), 3);
+        assert_eq!(counted.messages.len(), 3);
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            150,
+        );
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.output)
+                .sum::<i64>(),
+            15,
+        );
+    }
+
     fn write_codex_forked_history_fixture(source_home: &std::path::Path) {
         let codex_dir = source_home.join(".codex/sessions");
         std::fs::create_dir_all(&codex_dir).unwrap();
@@ -8365,7 +8797,7 @@ mod tests {
     #[test]
     fn test_parse_local_clients_honors_scanner_extra_scan_paths_for_hermes_profile_db() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        let profile_dir = temp_dir.path().join("external-hermes/director_planning");
         std::fs::create_dir_all(&profile_dir).unwrap();
         let profile_db = profile_dir.join("state.db");
         let conn = create_hermes_sqlite_db(&profile_db);
@@ -8428,13 +8860,94 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn test_auto_discovered_hermes_profile_reaches_all_consumers() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let count_cache = tempfile::TempDir::new().unwrap();
+        let profile_dir = source_home.path().join(".hermes/profiles/research");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &conn,
+            "hermes-auto-profile",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(conn);
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients = vec!["hermes".to_string()];
+        let materialized = with_isolated_tokscale_cache(materialized_cache.path(), || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                &home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        });
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].session_id, "hermes-auto-profile");
+        assert_eq!(materialized[0].tokens.input, 100);
+        assert_eq!(materialized[0].tokens.output, 25);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let streaming = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(ReportOptions {
+                    home_dir: Some(home.clone()),
+                    use_env_roots: false,
+                    clients: Some(clients.clone()),
+                    ..Default::default()
+                }))
+                .unwrap()
+        });
+        assert_eq!(streaming.total_messages, 2);
+        assert_eq!(streaming.total_input, 100);
+        assert_eq!(streaming.total_output, 25);
+
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        let counted = with_isolated_tokscale_cache(count_cache.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(home),
+                use_env_roots: false,
+                clients: Some(clients),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: Some(future_ms),
+            })
+            .unwrap()
+        });
+        assert_eq!(counted.counts.get(ClientId::Hermes), 2);
+        assert_eq!(counted.messages.len(), 1);
+        assert_eq!(counted.messages[0].session_id, "hermes-auto-profile");
+        assert_eq!(counted.messages[0].input, 100);
+        assert_eq!(counted.messages[0].output, 25);
+    }
+
+    #[test]
     fn test_modified_after_never_prunes_hermes_dbs_from_extra_scan_paths() {
         // SQLite WAL writes may leave the main db file's mtime untouched, so
         // `modified_after` must not prune Hermes/Zed dbs even when they come
         // from user scan roots (the `files` lanes) rather than the default
         // single-db path. A threshold in the future would prune any mtime.
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        let profile_dir = temp_dir.path().join("external-hermes/director_planning");
         std::fs::create_dir_all(&profile_dir).unwrap();
         let profile_db = profile_dir.join("state.db");
         let conn = create_hermes_sqlite_db(&profile_db);
@@ -8792,6 +9305,717 @@ mod tests {
         );
     }
 
+    fn roo_task_root(home: &Path, client: ClientId) -> PathBuf {
+        let relative = match client {
+            ClientId::RooCode => ".config/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks",
+            ClientId::KiloCode => ".config/Code/User/globalStorage/kilocode.kilo-code/tasks",
+            ClientId::Cline => ".config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks",
+            _ => panic!("not a Roo-family client: {client:?}"),
+        };
+        home.join(relative)
+    }
+
+    fn write_roo_history_fixture(history: &Path, model: &str, agent: &str) {
+        std::fs::write(
+            history,
+            format!(
+                "<environment_details><model>{model}</model><slug>{agent}</slug></environment_details>"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_roo_task_fixture(
+        home: &Path,
+        client: ClientId,
+        task_id: &str,
+        model: &str,
+        agent: &str,
+    ) -> (PathBuf, PathBuf) {
+        let task_dir = roo_task_root(home, client).join(task_id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let ui_messages = task_dir.join("ui_messages.json");
+        std::fs::write(
+            &ui_messages,
+            r#"[{"type":"say","say":"api_req_started","ts":"2026-06-25T10:00:00Z","text":"{\"cost\":0.125,\"tokensIn\":100,\"tokensOut\":25,\"cacheReads\":10,\"cacheWrites\":5,\"apiProtocol\":\"anthropic\"}"}]"#,
+        )
+        .unwrap();
+        let history = sessions::roocode::history_path_for_ui_messages(&ui_messages);
+        write_roo_history_fixture(&history, model, agent);
+        (ui_messages, history)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_roo_family_history_rewrite_refreshes_materialized_and_streaming_caches() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let family = [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline];
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "old-model".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "new-model-with-longer-id".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let mut histories = Vec::new();
+        for client in family {
+            let task_id = format!("{}-task", client.as_str());
+            let (_, history) = write_roo_task_fixture(
+                source_home.path(),
+                client,
+                &task_id,
+                "old-model",
+                "old-agent",
+            );
+            histories.push(history);
+        }
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients: Vec<String> = family
+            .into_iter()
+            .map(|client| client.as_str().to_string())
+            .collect();
+        let run_materialized = || {
+            with_isolated_tokscale_cache(materialized_cache.path(), || {
+                parse_all_messages_with_pricing_with_env_strategy(
+                    &home,
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                )
+            })
+        };
+        let run_streaming = || {
+            with_isolated_tokscale_cache(streaming_cache.path(), || {
+                let mut messages = Vec::new();
+                scan_messages_streaming(
+                    &home,
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                    &|_: &UnifiedMessage| true,
+                    &mut |message: &UnifiedMessage| messages.push(message.clone()),
+                );
+                messages
+            })
+        };
+
+        let materialized_before = run_materialized();
+        let streaming_before = run_streaming();
+        for (lane, messages) in [
+            ("materialized", &materialized_before),
+            ("streaming", &streaming_before),
+        ] {
+            assert_eq!(messages.len(), 3, "{lane} seed message count");
+            assert!(messages.iter().all(|message| {
+                message.model_id == "old-model" && message.agent.as_deref() == Some("old-agent")
+            }));
+        }
+
+        for history in &histories {
+            write_roo_history_fixture(history, "new-model-with-longer-id", "new-agent");
+        }
+
+        let materialized_after = run_materialized();
+        let streaming_after = run_streaming();
+        assert_eq!(materialized_after.len(), 3);
+        assert_eq!(streaming_after.len(), 3);
+        for client in family {
+            let client_name = client.as_str();
+            let materialized = materialized_after
+                .iter()
+                .find(|message| message.client == client_name)
+                .unwrap();
+            let streaming = streaming_after
+                .iter()
+                .find(|message| message.client == client_name)
+                .unwrap();
+            let materialized_before = materialized_before
+                .iter()
+                .find(|message| message.client == client_name)
+                .unwrap();
+
+            assert_eq!(materialized.session_id, format!("{client_name}-task"));
+            assert_eq!(materialized.model_id, "new-model-with-longer-id");
+            assert_eq!(materialized.agent.as_deref(), Some("new-agent"));
+            assert_eq!(materialized.tokens.input, 100);
+            assert_eq!(materialized.tokens.output, 25);
+            assert_eq!(materialized.tokens.cache_read, 10);
+            assert_eq!(materialized.tokens.cache_write, 5);
+            assert!(
+                materialized.cost > materialized_before.cost,
+                "{client_name} history model rewrite must refresh derived pricing"
+            );
+
+            assert_eq!(streaming.client, materialized.client);
+            assert_eq!(streaming.session_id, materialized.session_id);
+            assert_eq!(streaming.model_id, materialized.model_id);
+            assert_eq!(streaming.agent, materialized.agent);
+            assert_eq!(streaming.tokens.input, materialized.tokens.input);
+            assert_eq!(streaming.tokens.output, materialized.tokens.output);
+            assert_eq!(streaming.tokens.cache_read, materialized.tokens.cache_read);
+            assert_eq!(
+                streaming.tokens.cache_write,
+                materialized.tokens.cache_write
+            );
+            assert!((streaming.cost - materialized.cost).abs() < 1e-9);
+        }
+    }
+
+    fn latest_source_mtime_probes_roo_history(client: ClientId) {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let (ui_messages, history) = write_roo_task_fixture(
+            source_home.path(),
+            client,
+            "mtime-task",
+            "test-model",
+            "test-agent",
+        );
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for (path, time) in [(&ui_messages, stale_time), (&history, fresh_time)] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let Ok(()) = file.set_modified(time) else {
+                return;
+            };
+        }
+
+        let token = latest_source_mtime_ms(&LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec![client.as_str().to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            token,
+            1_700_086_400_000,
+            "{} change token must include the history sibling",
+            client.as_str()
+        );
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_roocode_history() {
+        latest_source_mtime_probes_roo_history(ClientId::RooCode);
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_kilocode_history() {
+        latest_source_mtime_probes_roo_history(ClientId::KiloCode);
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_cline_history() {
+        latest_source_mtime_probes_roo_history(ClientId::Cline);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_modified_after_keeps_roo_family_with_fresh_history() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let family = [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline];
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+
+        for client in family {
+            let stale_id = format!("{}-stale", client.as_str());
+            let active_id = format!("{}-active", client.as_str());
+            let (stale_ui, stale_history) = write_roo_task_fixture(
+                source_home.path(),
+                client,
+                &stale_id,
+                "stale-model",
+                "stale-agent",
+            );
+            let (active_ui, active_history) = write_roo_task_fixture(
+                source_home.path(),
+                client,
+                &active_id,
+                "active-model",
+                "active-agent",
+            );
+            for path in [&stale_ui, &stale_history, &active_ui, &active_history] {
+                let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                let Ok(()) = file.set_modified(stale_time) else {
+                    return;
+                };
+            }
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&active_history)
+                .unwrap();
+            let Ok(()) = file.set_modified(fresh_time) else {
+                return;
+            };
+        }
+
+        let clients: Vec<String> = family
+            .into_iter()
+            .map(|client| client.as_str().to_string())
+            .collect();
+        let parsed = with_isolated_tokscale_cache(cache_home.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(clients),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: Some(1_700_043_200_000),
+            })
+            .unwrap()
+        });
+
+        assert_eq!(parsed.messages.len(), 3);
+        for client in family {
+            assert_eq!(parsed.counts.get(client), 1);
+            assert!(parsed.messages.iter().any(|message| {
+                message.client == client.as_str()
+                    && message.session_id == format!("{}-active", client.as_str())
+                    && message.model_id == "active-model"
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_modified_after_roo_history_stat_failure_keeps_source() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let ui_messages = temp_dir.path().join("ui_messages.json");
+        std::fs::write(&ui_messages, b"[]").unwrap();
+        let history = sessions::roocode::history_path_for_ui_messages(&ui_messages);
+        std::os::unix::fs::symlink("api_conversation_history.json", &history).unwrap();
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::RooCode)
+            .push(ui_messages.clone());
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        prune_scan_result_by_mtime(&mut scan_result, future_ms);
+
+        assert_eq!(
+            scan_result.get(ClientId::RooCode),
+            std::slice::from_ref(&ui_messages),
+            "an unreadable history sibling must fail open during pruning"
+        );
+    }
+
+    struct M13RelatedFixture {
+        droid_source: PathBuf,
+        droid_related: PathBuf,
+        kimi_source: PathBuf,
+        kimi_related: PathBuf,
+        kiro_source: PathBuf,
+        kiro_related: PathBuf,
+    }
+
+    fn write_m13_primary_fixtures(home: &Path) -> M13RelatedFixture {
+        let droid_dir = home.join(".factory/sessions");
+        std::fs::create_dir_all(&droid_dir).unwrap();
+        let droid_source = droid_dir.join("droid-session.settings.json");
+        std::fs::write(
+            &droid_source,
+            r#"{"providerLock":"anthropic","providerLockTimestamp":"2026-01-01T00:00:00Z","tokenUsage":{"inputTokens":100,"outputTokens":20,"cacheCreationTokens":5,"cacheReadTokens":10,"thinkingTokens":2}}"#,
+        )
+        .unwrap();
+        let droid_related = droid_dir.join("droid-session.jsonl");
+
+        let kimi_session_dir = home.join(".kimi/sessions/group-1/kimi-session");
+        std::fs::create_dir_all(&kimi_session_dir).unwrap();
+        let kimi_source = kimi_session_dir.join("wire.jsonl");
+        std::fs::write(
+            &kimi_source,
+            r#"{"timestamp":1767225600.0,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":50,"output":5,"input_cache_read":3,"input_cache_creation":2},"message_id":"kimi-turn"}}}"#,
+        )
+        .unwrap();
+        let kimi_related = home.join(".kimi/config.json");
+
+        let kiro_dir = home.join(".kiro/sessions/cli");
+        std::fs::create_dir_all(&kiro_dir).unwrap();
+        let kiro_source = kiro_dir.join("kiro-session.json");
+        std::fs::write(
+            &kiro_source,
+            r#"{"session_id":"kiro-session","cwd":"/tmp/m13-project","session_state":{"rts_model_state":{"model_info":{"model_id":"kiro-model","context_window_tokens":1000}},"conversation_metadata":{"user_turn_metadatas":[{"input_token_count":0,"output_token_count":0,"end_timestamp":1767225601,"total_request_count":1,"message_ids":["kiro-turn"],"context_usage_percentage":10.0}]}}}"#,
+        )
+        .unwrap();
+        let kiro_related = kiro_source.with_extension("jsonl");
+
+        M13RelatedFixture {
+            droid_source,
+            droid_related,
+            kimi_source,
+            kimi_related,
+            kiro_source,
+            kiro_related,
+        }
+    }
+
+    fn write_m13_related_fixtures(paths: &M13RelatedFixture) {
+        std::fs::write(
+            &paths.droid_related,
+            r#"{"message":"Model: Claude-Opus-4.5-[Anthropic]"}"#,
+        )
+        .unwrap();
+        std::fs::write(&paths.kimi_related, r#"{"model":"kimi-new-model"}"#).unwrap();
+        std::fs::write(
+            &paths.kiro_related,
+            concat!(
+                r#"{"version":"v1","kind":"Prompt","data":{"message_id":"kiro-prompt","content":[{"kind":"text","data":"prompt body"}],"meta":{"timestamp":1767225600.0}}}"#,
+                "\n",
+                r#"{"version":"v1","kind":"AssistantMessage","data":{"message_id":"kiro-turn","content":[{"kind":"text","data":"abcdefghijklmnop"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn set_m13_fixture_mtimes(
+        paths: &M13RelatedFixture,
+        primary_time: std::time::SystemTime,
+        related_time: std::time::SystemTime,
+    ) -> bool {
+        for path in [&paths.droid_source, &paths.kimi_source, &paths.kiro_source] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            if file.set_modified(primary_time).is_err() {
+                return false;
+            }
+        }
+        for path in [
+            &paths.droid_related,
+            &paths.kimi_related,
+            &paths.kiro_related,
+        ] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            if file.set_modified(related_time).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_m13_related_sources_refresh_materialized_and_streaming_caches() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        let clients = vec!["droid".to_string(), "kimi".to_string(), "kiro".to_string()];
+
+        let mut litellm = HashMap::new();
+        for (model, input_rate, output_rate) in [
+            ("claude-unknown", 0.001, 0.002),
+            ("claude-opus-4-5", 0.01, 0.02),
+            ("kimi-for-coding", 0.001, 0.002),
+            ("kimi-new-model", 0.01, 0.02),
+            ("kiro-model", 0.003, 0.004),
+        ] {
+            litellm.insert(
+                model.to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(input_rate),
+                    output_cost_per_token: Some(output_rate),
+                    ..Default::default()
+                },
+            );
+        }
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let home = source_home.path().to_str().unwrap().to_string();
+        let run_materialized = || {
+            with_isolated_tokscale_cache(materialized_cache.path(), || {
+                parse_all_messages_with_pricing_with_env_strategy(
+                    &home,
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                )
+            })
+        };
+        let run_streaming = || {
+            with_isolated_tokscale_cache(streaming_cache.path(), || {
+                let mut messages = Vec::new();
+                scan_messages_streaming(
+                    &home,
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                    &|_: &UnifiedMessage| true,
+                    &mut |message: &UnifiedMessage| messages.push(message.clone()),
+                );
+                messages
+            })
+        };
+
+        let materialized_before = run_materialized();
+        let streaming_before = run_streaming();
+        assert_eq!(materialized_before.len(), 3);
+        assert_eq!(streaming_before.len(), 3);
+        for (client, model) in [
+            ("droid", "claude-unknown"),
+            ("kimi", "kimi-for-coding"),
+            ("kiro", "kiro-model"),
+        ] {
+            assert_eq!(
+                materialized_before
+                    .iter()
+                    .find(|message| message.client == client)
+                    .unwrap()
+                    .model_id,
+                model
+            );
+            assert_eq!(
+                streaming_before
+                    .iter()
+                    .find(|message| message.client == client)
+                    .unwrap()
+                    .model_id,
+                model
+            );
+        }
+
+        write_m13_related_fixtures(&paths);
+
+        let materialized_after = run_materialized();
+        let streaming_after = run_streaming();
+        assert_eq!(materialized_after.len(), 3);
+        assert_eq!(streaming_after.len(), 3);
+        for client in ["droid", "kimi", "kiro"] {
+            let before = materialized_before
+                .iter()
+                .find(|message| message.client == client)
+                .unwrap();
+            let materialized = materialized_after
+                .iter()
+                .find(|message| message.client == client)
+                .unwrap();
+            let streaming = streaming_after
+                .iter()
+                .find(|message| message.client == client)
+                .unwrap();
+
+            let expected_model = match client {
+                "droid" => "claude-opus-4-5",
+                "kimi" => "kimi-new-model",
+                "kiro" => "kiro-model",
+                _ => unreachable!(),
+            };
+            assert_eq!(materialized.model_id, expected_model);
+            assert!(
+                materialized.cost > before.cost,
+                "{client} related-source creation must refresh derived cost"
+            );
+            if client == "kiro" {
+                assert_eq!(before.tokens.output, 0);
+                assert_eq!(materialized.tokens.output, 4);
+                assert_eq!(materialized.timestamp, 1_767_225_600_000);
+                assert_eq!(materialized.duration_ms, Some(1_000));
+            }
+
+            assert_eq!(streaming.client, materialized.client);
+            assert_eq!(streaming.session_id, materialized.session_id);
+            assert_eq!(streaming.model_id, materialized.model_id);
+            assert_eq!(streaming.provider_id, materialized.provider_id);
+            assert_eq!(streaming.workspace_key, materialized.workspace_key);
+            assert_eq!(streaming.workspace_label, materialized.workspace_label);
+            assert_eq!(streaming.timestamp, materialized.timestamp);
+            assert_eq!(streaming.duration_ms, materialized.duration_ms);
+            assert_eq!(streaming.message_count, materialized.message_count);
+            assert_eq!(streaming.tokens.input, materialized.tokens.input);
+            assert_eq!(streaming.tokens.output, materialized.tokens.output);
+            assert_eq!(streaming.tokens.cache_read, materialized.tokens.cache_read);
+            assert_eq!(
+                streaming.tokens.cache_write,
+                materialized.tokens.cache_write
+            );
+            assert_eq!(streaming.tokens.reasoning, materialized.tokens.reasoning);
+            assert!((streaming.cost - materialized.cost).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_m13_related_sources() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        write_m13_related_fixtures(&paths);
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        if !set_m13_fixture_mtimes(&paths, stale_time, fresh_time) {
+            return;
+        }
+
+        for client in [ClientId::Droid, ClientId::Kimi, ClientId::Kiro] {
+            let token = latest_source_mtime_ms(&LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec![client.as_str().to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: None,
+            })
+            .unwrap();
+            assert_eq!(
+                token,
+                1_700_086_400_000,
+                "{} change token must include its parser dependency",
+                client.as_str()
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_modified_after_keeps_m13_sources_with_fresh_dependencies() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        write_m13_related_fixtures(&paths);
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        if !set_m13_fixture_mtimes(&paths, stale_time, fresh_time) {
+            return;
+        }
+
+        let parsed = with_isolated_tokscale_cache(cache_home.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec![
+                    "droid".to_string(),
+                    "kimi".to_string(),
+                    "kiro".to_string(),
+                ]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: Some(1_700_043_200_000),
+            })
+            .unwrap()
+        });
+
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.counts.get(ClientId::Droid), 1);
+        assert_eq!(parsed.counts.get(ClientId::Kimi), 1);
+        assert_eq!(parsed.counts.get(ClientId::Kiro), 1);
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| { message.client == "droid" && message.model_id == "claude-opus-4-5" }));
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| { message.client == "kimi" && message.model_id == "kimi-new-model" }));
+        assert!(parsed.messages.iter().any(|message| {
+            message.client == "kiro" && message.output == 4 && message.duration_ms == Some(1_000)
+        }));
+    }
+
+    #[test]
+    fn test_modified_after_prunes_stale_m13_sources_without_dependencies() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::Droid)
+            .push(paths.droid_source);
+        scan_result.get_mut(ClientId::Kimi).push(paths.kimi_source);
+        scan_result.get_mut(ClientId::Kiro).push(paths.kiro_source);
+
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        prune_scan_result_by_mtime(&mut scan_result, future_ms);
+
+        assert!(scan_result.get(ClientId::Droid).is_empty());
+        assert!(scan_result.get(ClientId::Kimi).is_empty());
+        assert!(scan_result.get(ClientId::Kiro).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_modified_after_m13_dependency_stat_failures_keep_sources() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let paths = write_m13_primary_fixtures(source_home.path());
+        for related in [
+            &paths.droid_related,
+            &paths.kimi_related,
+            &paths.kiro_related,
+        ] {
+            std::os::unix::fs::symlink(related.file_name().unwrap(), related).unwrap();
+        }
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::Droid)
+            .push(paths.droid_source.clone());
+        scan_result
+            .get_mut(ClientId::Kimi)
+            .push(paths.kimi_source.clone());
+        scan_result
+            .get_mut(ClientId::Kiro)
+            .push(paths.kiro_source.clone());
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        prune_scan_result_by_mtime(&mut scan_result, future_ms);
+
+        assert_eq!(
+            scan_result.get(ClientId::Droid),
+            std::slice::from_ref(&paths.droid_source)
+        );
+        assert_eq!(
+            scan_result.get(ClientId::Kimi),
+            std::slice::from_ref(&paths.kimi_source)
+        );
+        assert_eq!(
+            scan_result.get(ClientId::Kiro),
+            std::slice::from_ref(&paths.kiro_source)
+        );
+    }
+
     // micode `.db` is WAL-mode SQLite reached via the generic `*.db` glob, so it
     // must be exempt from mtime pruning (a WAL-only write leaves the main db's
     // mtime untouched) — same treatment as Antigravity CLI / Hermes / Zed.
@@ -9099,6 +10323,49 @@ mod tests {
         latest_source_mtime_ms_probes_grok_sibling("events.jsonl");
     }
 
+    #[test]
+    fn test_latest_source_mtime_ms_probes_auto_discovered_hermes_profile_wal() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let profile_dir = source_home.path().join(".hermes/profiles/research");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let db = profile_dir.join("state.db");
+        let wal = profile_dir.join("state.db-wal");
+        std::fs::File::create(&db).unwrap();
+        std::fs::File::create(&wal).unwrap();
+
+        let db_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let wal_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        let db_file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        let Ok(()) = db_file.set_modified(db_time) else {
+            return;
+        };
+        drop(db_file);
+        let wal_file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        let Ok(()) = wal_file.set_modified(wal_time) else {
+            return;
+        };
+        drop(wal_file);
+
+        let options = LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        };
+        let token = crate::latest_source_mtime_ms(&options).unwrap();
+
+        assert_eq!(
+            token, 1_700_086_400_000,
+            "the change token must include an auto-discovered profile WAL"
+        );
+    }
+
     // The live-tail change token must move when jcode appends to the sibling
     // `.journal.jsonl` even though the snapshot mtime is unchanged; otherwise
     // UsageTail short-circuits and never reflects the new turn.
@@ -9273,7 +10540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_local_clients_dedups_hermes_sessions_across_default_and_extra_dbs() {
+    fn test_parse_local_clients_dedups_default_and_auto_discovered_hermes_profile() {
         let temp_dir = tempfile::TempDir::new().unwrap();
 
         let default_dir = temp_dir.path().join(".hermes");
@@ -9304,10 +10571,17 @@ mod tests {
             999,
             9.99,
         );
+        insert_hermes_session(
+            &profile_conn,
+            "profile-only-session",
+            "claude-sonnet-4",
+            1,
+            30,
+            3,
+            0.02,
+        );
         drop(profile_conn);
 
-        let mut extra_scan_paths = std::collections::BTreeMap::new();
-        extra_scan_paths.insert("hermes".to_string(), vec![profile_db]);
         let parsed = parse_local_clients(LocalParseOptions {
             home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
             use_env_roots: false,
@@ -9315,19 +10589,24 @@ mod tests {
             since: None,
             until: None,
             year: None,
-            scanner_settings: scanner::ScannerSettings {
-                extra_scan_paths,
-                ..Default::default()
-            },
+            scanner_settings: scanner::ScannerSettings::default(),
             modified_after: None,
         })
         .unwrap();
 
-        assert_eq!(parsed.counts.get(ClientId::Hermes), 2);
-        assert_eq!(parsed.messages.len(), 1);
-        assert_eq!(parsed.messages[0].session_id, "shared-hermes-session");
-        assert_eq!(parsed.messages[0].input, 100);
-        assert_eq!(parsed.messages[0].output, 25);
+        assert_eq!(parsed.counts.get(ClientId::Hermes), 3);
+        assert_eq!(parsed.messages.len(), 2);
+        let shared = parsed
+            .messages
+            .iter()
+            .find(|message| message.session_id == "shared-hermes-session")
+            .unwrap();
+        assert_eq!(shared.input, 100);
+        assert_eq!(shared.output, 25);
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| message.session_id == "profile-only-session"));
     }
 
     #[test]

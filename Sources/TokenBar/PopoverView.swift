@@ -30,6 +30,7 @@ struct PopoverView: View {
     }
     @AppStorage("tokenbar.chart.view") private var chartViewRaw = "2d"
     @AppStorage("tokenbar.view") private var activeViewRaw = AppView.overview.rawValue
+    @AppStorage("tokenbar.views.hidden") private var hiddenViewsRaw = ""
     @AppStorage("tokenbar.bridge.dismissed") private var bridgeDismissed = false
     /// "overview" or a client id. Persisted so the selection survives the
     /// popover's rootView teardown/rebuild cycle (StatusItemController swaps
@@ -51,6 +52,18 @@ struct PopoverView: View {
         Binding(
             get: { AppView(rawValue: activeViewRaw) ?? .overview },
             set: { activeViewRaw = $0.rawValue })
+    }
+
+    /// Lenses shown in the tab row — a hidden lens drops out the instant the
+    /// user hides it in Settings. Reactive via `hiddenViewsRaw` so a live
+    /// Settings toggle updates the row without reopening the popover.
+    private var visibleViews: [AppView] {
+        AppView.visible(hiddenRaw: hiddenViewsRaw)
+    }
+
+    /// This frame's actually-safe view — see `AppView.effective`.
+    private var effectiveView: AppView {
+        AppView.effective(activeView.wrappedValue, hiddenRaw: hiddenViewsRaw)
     }
 
     /// Client ids shown in the top tab bar: present clients minus the user's
@@ -98,7 +111,7 @@ struct PopoverView: View {
                     .padding(.horizontal, 12)
                     .padding(.bottom, 8)
             }
-            ViewSwitch(active: activeView)
+            ViewSwitch(active: activeView, views: visibleViews)
                 .padding(.horizontal, 12)
                 .padding(.bottom, 10)
             Divider()
@@ -144,6 +157,13 @@ struct PopoverView: View {
         // lazy re-fetch only refreshes an already-loaded lens, so a lens still
         // nil from the reopen would never reload); without the slice, switching
         // client tabs would serve the previous tab's FFI-filtered totals.
+        // Keyed on the raw activeViewRaw, not effectiveView: intentional. If a
+        // now-hidden lazy lens (Hourly/Agents) is still the persisted active
+        // view for one frame, this fires an ensureData fetch for it — but
+        // resetViewIfHidden() immediately rewrites activeViewRaw to
+        // "overview" (same onChange pass), which changes this task's id and
+        // cancels the in-flight fetch before it commits. Self-correcting;
+        // switching to effectiveView here isn't needed for correctness.
         .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(lensClientIds.joined(separator: ","))") {
             await model.ensureData(for: activeView.wrappedValue, clients: lensClientIds)
         }
@@ -196,6 +216,9 @@ struct PopoverView: View {
         .onChange(of: displayClients) { _, _ in
             resetTabIfHidden()
         }
+        .onChange(of: hiddenViewsRaw, initial: true) { _, _ in
+            resetViewIfHidden()
+        }
     }
 
     /// Fall back to Overview if the active client tab is no longer displayed
@@ -208,6 +231,14 @@ struct PopoverView: View {
         guard model.stats?.presentClients != nil else { return }
         if activeTab != "overview", !displayClients.contains(activeTab) {
             activeTab = "overview"
+        }
+    }
+
+    /// Fall back to Overview if the active lens just got hidden in Settings —
+    /// the tab-row analog of `resetTabIfHidden()`.
+    private func resetViewIfHidden() {
+        if effectiveView != activeView.wrappedValue {
+            activeView.wrappedValue = effectiveView
         }
     }
 
@@ -393,7 +424,7 @@ struct PopoverView: View {
             // slice, so this hot path (re-evals every ~10s trace poll) doesn't
             // re-aggregate UsageStats on every body eval.
             let activeStats = model.stats(selecting: Set(clientIds)) ?? stats
-            switch activeView.wrappedValue {
+            switch effectiveView {
             case .overview:
                 OverviewView(
                     payload: payload, clientIds: clientIds, stats: activeStats,
@@ -406,6 +437,8 @@ struct PopoverView: View {
                     report: model.modelReport, clientIds: clientIds, colors: model.colors)
             case .daily:
                 DailyView(payload: payload, clientIds: clientIds, colors: model.colors)
+            case .monthly:
+                MonthlyView(payload: payload, clientIds: clientIds, colors: model.colors)
             case .hourly:
                 HourlyView(report: model.hourly, clientIds: clientIds)
             case .stats:
@@ -421,7 +454,7 @@ struct PopoverView: View {
 
     private var footer: some View {
         HStack {
-            Text(activeView.wrappedValue.label)
+            Text(effectiveView.label)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
             Spacer()
@@ -582,9 +615,7 @@ struct PopoverView: View {
     /// `.task` cancels this loop when the popover closes.
     private func pollTokensPerMin() async {
         while !Task.isCancelled {
-            let rate = try? await Task.detached(priority: .utility) {
-                try LiveRate.current()
-            }.value
+            let rate = await model.tokensPerMin()
             if Task.isCancelled { break }
             tokensPerMin = rate
             try? await Task.sleep(for: .seconds(10))

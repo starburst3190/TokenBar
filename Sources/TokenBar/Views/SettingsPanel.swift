@@ -22,6 +22,7 @@ struct SettingsPanel: View {
     /// Mirrors SMAppService's actual state (read once per panel appearance).
     @State private var autostartEnabled = AutostartService.isAvailable && AutostartService.isEnabled
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
+    @AppStorage("tokenbar.views.hidden") private var hiddenViewsRaw = ""
     @AppStorage("tokenbar.limits.asUsed") private var limitsAsUsed = false
     @AppStorage("tokenbar.limits.paceMode") private var paceModeRaw = PaceMode.historical.rawValue
     @AppStorage("tokenbar.limits.layout") private var layoutRaw = LimitsLayout.full.rawValue
@@ -216,6 +217,34 @@ struct SettingsPanel: View {
                         hint("Hides only that client's quota card here and on its own tab — the tab and its cost/token data stay visible. Useful for accounts with no OAuth quota (e.g. Claude Console). Grayed out when the tab itself is hidden below, since a hidden tab always hides its quota card too.")
                     }
                 }
+            }
+
+            section("View tabs") {
+                let hiddenViews = ClientRegistry.parseIdSet(hiddenViewsRaw)
+                VStack(spacing: 1) {
+                    ForEach(AppView.toggleable, id: \.self) { view in
+                        HStack {
+                            Text(view.label)
+                                .font(.caption)
+                            Spacer()
+                            Toggle("", isOn: Binding(
+                                get: { !hiddenViews.contains(view.rawValue) },
+                                set: { show in
+                                    var hidden = hiddenViews
+                                    if show { hidden.remove(view.rawValue) } else { hidden.insert(view.rawValue) }
+                                    hiddenViewsRaw = hidden.sorted().joined(separator: ",")
+                                }
+                            ))
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .labelsHidden()
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                    }
+                }
+                .glassCard(cornerRadius: 8)
+                hint("Off removes a tab from the popover's tab row. Cost/token data is unaffected.")
             }
 
             section("Client tabs (top bar)") {

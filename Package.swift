@@ -6,6 +6,9 @@ import PackageDescription
 let package = Package(
     name: "TokenBar",
     platforms: [.macOS(.v14)],
+    products: [
+        .executable(name: "crosscheck-harness", targets: ["CrossCheckHarness"]),
+    ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
     ],
@@ -32,6 +35,16 @@ let package = Package(
             ],
             linkerSettings: rustLinkerSettings
         ),
+        // Swift↔C# fixture cross-check harness. Depends on TokenBarCore (which
+        // links the Rust staticlib), so it needs the same rustLinkerSettings.
+        // Format.swift is symlinked in from Sources/TokenBar so the harness
+        // compiles the exact shipping formatter source, not a reimplementation.
+        .executableTarget(
+            name: "CrossCheckHarness",
+            dependencies: ["TokenBarCore"],
+            path: "Sources/CrossCheckHarness",
+            linkerSettings: rustLinkerSettings
+        ),
     ]
 )
 
@@ -39,7 +52,13 @@ let package = Package(
 // must run from the repo root for the relative -L path to resolve.
 var rustLinkerSettings: [LinkerSetting] {
     [
-        .unsafeFlags(["-L", "target/release", "-ltb_core_ffi"]),
+        // The archive is named as an explicit linker input, NOT -l: since the
+        // crate also builds a cdylib for the Windows port's P/Invoke, both
+        // libtb_core_ffi.a and .dylib sit in target/release, and Darwin's
+        // -l lookup prefers the dylib — which would silently turn the app's
+        // Rust linkage dynamic with a build-tree absolute path (Codex review
+        // finding, verified with otool -L).
+        .unsafeFlags(["-Xlinker", "target/release/libtb_core_ffi.a"]),
         // Sparkle.framework rides in Contents/Frameworks inside the .app.
         .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
         .linkedFramework("Security"),
