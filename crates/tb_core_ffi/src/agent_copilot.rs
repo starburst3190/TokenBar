@@ -86,10 +86,25 @@ pub(crate) async fn fetch(
     let usage: CopilotUser =
         serde_json::from_str(&body).map_err(|e| format!("decode Copilot usage: {e}"))?;
 
+    let (plan, windows) = map_user(usage, now);
+
+    let account_scope = agent_account_scope::resolve_credential(
+        "copilot",
+        credential.semantic_source,
+        &credential.canonical_location,
+        &credential.marker,
+    );
+    Ok(CopilotData {
+        identity: Some(AgentIdentity { email: None, plan }),
+        account_scope,
+        windows,
+    })
+}
+
+fn map_user(usage: CopilotUser, now: DateTime<Utc>) -> (Option<String>, Vec<UsageWindow>) {
     let resets_at = usage.quota_reset_date.as_deref().and_then(parse_reset_date);
-    let snapshots = usage.quota_snapshots;
     let mut windows = Vec::new();
-    if let Some(snapshots) = snapshots {
+    if let Some(snapshots) = usage.quota_snapshots {
         if let Some(window) = snapshot_window_with_identity(
             "Premium",
             "premium_interactions.v1",
@@ -105,24 +120,11 @@ pub(crate) async fn fetch(
             windows.push(window);
         }
     }
-
-    let account_scope = agent_account_scope::resolve_credential(
-        "copilot",
-        credential.semantic_source,
-        &credential.canonical_location,
-        &credential.marker,
-    );
-    Ok(CopilotData {
-        identity: Some(AgentIdentity {
-            email: None,
-            plan: usage
-                .copilot_plan
-                .filter(|s| !s.trim().is_empty())
-                .map(clean_plan),
-        }),
-        account_scope,
-        windows,
-    })
+    let plan = usage
+        .copilot_plan
+        .filter(|plan| !plan.trim().is_empty())
+        .map(clean_plan);
+    (plan, windows)
 }
 
 fn snapshot_window_with_identity(
@@ -207,43 +209,39 @@ mod tests {
     }
 
     #[test]
-    fn stage0_freezes_copilot_card_and_duration_baseline() {
+    fn stage4_copilot_maps_shared_reset_to_both_quota_cards() {
         let now = Utc.timestamp_opt(1_751_328_000, 0).single().unwrap();
-        let reset = parse_reset_date("2026-08-01").unwrap();
-        let premium = snapshot_window(
-            "Premium",
-            Some(QuotaSnapshot {
-                entitlement: 300.0,
-                remaining: 90.0,
-                percent_remaining: Some(30.0),
-            }),
-            Some(reset),
-            now,
+        let usage: CopilotUser = serde_json::from_str(
+            r#"{
+                "copilot_plan": "individual",
+                "quota_reset_date": "2026-08-01",
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 300,
+                        "remaining": 90,
+                        "percent_remaining": 30
+                    },
+                    "chat": {
+                        "entitlement": 100,
+                        "remaining": 75
+                    }
+                }
+            }"#,
         )
         .unwrap();
-        let chat = snapshot_window(
-            "Chat",
-            Some(QuotaSnapshot {
-                entitlement: 100.0,
-                remaining: 75.0,
-                percent_remaining: None,
-            }),
-            Some(reset),
-            now,
-        )
-        .unwrap();
+        let (plan, windows) = map_user(usage, now);
+        assert_eq!(plan.as_deref(), Some("Individual"));
+        assert_eq!(windows.len(), 2);
+        let premium = &windows[0];
+        let chat = &windows[1];
 
-        assert_eq!(
-            premium.label_for_test(),
-            "Premium",
-            "copilot.premium.calendar-month"
-        );
-        assert_eq!(chat.label_for_test(), "Chat", "copilot.chat.calendar-month");
+        assert_eq!(premium.label_for_test(), "Premium");
+        assert_eq!(chat.label_for_test(), "Chat");
         assert_eq!(
             premium.resets_at_for_test(),
             Some("2026-08-01T00:00:00.000Z")
         );
-        assert_eq!(chat.resets_at_for_test(), Some("2026-08-01T00:00:00.000Z"));
+        assert_eq!(chat.resets_at_for_test(), premium.resets_at_for_test());
         assert_eq!(
             premium.window_minutes_for_test(),
             Some(44_640),
@@ -255,6 +253,11 @@ mod tests {
             Some("premium_interactions.v1")
         );
         assert_eq!(chat.pace_window_key_for_test(), Some("chat.v1"));
+        for window in &windows {
+            let wire = serde_json::to_value(window).unwrap();
+            assert_eq!(wire["paceStatus"]["durationSource"], "contract");
+            assert_eq!(wire["paceStatus"]["durationSeconds"], 2_678_400);
+        }
 
         let non_calendar_reset = parse_reset_date("2026-08-15").unwrap();
         let observed = snapshot_window(
