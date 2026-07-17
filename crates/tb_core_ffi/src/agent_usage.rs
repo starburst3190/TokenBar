@@ -2547,7 +2547,6 @@ fn codex_windows(
 
     let mut anonymous_slots = HashSet::new();
     for extra in additional_rate_limits.unwrap_or(&[]) {
-        let label = additional_limit_label(extra);
         let source = additional_limit_source(extra);
         let digest = source.map(sha256_hex);
         let Some(rate_limit) = extra.rate_limit.as_ref() else {
@@ -2565,7 +2564,7 @@ fn codex_windows(
                     continue;
                 }
                 windows.push(map_window_with_identity(
-                    &label,
+                    "Unknown",
                     window,
                     now,
                     format!("row.additional.unknown.{slot}.v1"),
@@ -2573,6 +2572,7 @@ fn codex_windows(
                 ));
                 continue;
             };
+            let label = additional_limit_label(extra);
             let window_key = format!("additional.{digest}.{slot}.v1");
             if !emitted_card_ids.insert(window_key.clone()) {
                 continue;
@@ -2923,19 +2923,6 @@ fn map_window_with_identity(
         .then(|| DurationEvidence::provider(window.reset_at, window.limit_window_seconds));
     UsageWindow::from_provider_used_percent(label.to_string(), window.used_percent, resets_at, now)
         .with_identity(card_id, window_key, provider_duration, None)
-}
-
-#[cfg(test)]
-fn map_window(label: &str, window: CodexWindow, now: DateTime<Utc>) -> UsageWindow {
-    let window_key = match window.limit_window_seconds {
-        18_000 => Some("main.session.v1".to_string()),
-        604_800 => Some("main.weekly.v1".to_string()),
-        _ => None,
-    };
-    let card_id = window_key
-        .clone()
-        .unwrap_or_else(|| "row.main.unknown.v1".to_string());
-    map_window_with_identity(label, window, now, card_id, window_key)
 }
 
 fn additional_limit_source(limit: &CodexAdditionalRateLimit) -> Option<String> {
@@ -3401,26 +3388,40 @@ mod tests {
             }),
         };
         let windows = codex_windows(Some(&reversed), None, now);
+        assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "Session", "codex.main.18000.session");
+        assert_eq!(windows[0].card_id, "main.session.v1");
+        assert_eq!(windows[0].window_key.as_deref(), Some("main.session.v1"));
         assert_eq!(windows[0].window_minutes, Some(300));
         assert_eq!(windows[1].label, "Weekly", "codex.main.604800.weekly");
+        assert_eq!(windows[1].card_id, "main.weekly.v1");
+        assert_eq!(windows[1].window_key.as_deref(), Some("main.weekly.v1"));
         assert_eq!(windows[1].window_minutes, Some(10_080));
 
-        let unknown = map_window(
-            "Session",
-            CodexWindow {
+        let unknown_rate_limit = CodexRateLimit {
+            primary_window: Some(CodexWindow {
                 used_percent: 10.0,
-                reset_at: 1_700_003_600,
+                reset_at: now.timestamp() + 3_600,
                 limit_window_seconds: 3_600,
-            },
-            now,
-        );
+            }),
+            secondary_window: None,
+        };
+        let unknown = codex_windows(Some(&unknown_rate_limit), None, now);
+        assert_eq!(unknown.len(), 1);
+        let unknown = &unknown[0];
+        assert_eq!(unknown.card_id, "row.main.primary.v1");
+        assert_eq!(unknown.window_key, None);
         assert_eq!(unknown.window_minutes, None);
         assert_eq!(unknown.pace_status.state, PaceState::Unavailable);
         assert_eq!(
             unknown.pace_status.reason.as_deref(),
             Some("windowIdentity")
         );
+        let wire = serde_json::to_value(unknown).unwrap();
+        assert_eq!(wire["cardId"], "row.main.primary.v1");
+        assert!(wire["paceStatus"].get("windowKey").is_none());
+        assert_eq!(wire["paceStatus"]["state"], "unavailable");
+        assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
     }
 
     #[test]
@@ -3648,7 +3649,7 @@ mod tests {
         assert_eq!(
             additional_limit_label(&named),
             "Named Limit",
-            "display label remains separate from the future metered-feature identity"
+            "display label remains separate from the metered-feature identity"
         );
 
         let anonymous = CodexAdditionalRateLimit {
@@ -3656,16 +3657,12 @@ mod tests {
             metered_feature: None,
             rate_limit: None,
         };
-        assert_eq!(
-            additional_limit_label(&anonymous),
-            "Codex Extra Limit",
-            "codex.additional.missing-identity baseline uses a shared display fallback"
-        );
+        assert_eq!(additional_limit_source(&anonymous), None);
 
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let both_slots = CodexAdditionalRateLimit {
             limit_name: Some("named-limit".to_string()),
-            metered_feature: Some("metered-feature".to_string()),
+            metered_feature: Some(" metered-feature ".to_string()),
             rate_limit: Some(CodexRateLimit {
                 primary_window: Some(CodexWindow {
                     used_percent: 10.0,
@@ -3679,12 +3676,123 @@ mod tests {
                 }),
             }),
         };
+        assert_eq!(
+            additional_limit_source(&both_slots).as_deref(),
+            Some("metered-feature")
+        );
         let windows = codex_windows(None, Some(&[both_slots]), now);
         assert_eq!(
             windows.len(),
             2,
             "codex.additional.primary-secondary emits both semantic slots"
         );
+        let digest = sha256_hex("metered-feature".to_string());
+        let primary_key = format!("additional.{digest}.primary.v1");
+        let secondary_key = format!("additional.{digest}.secondary.v1");
+        assert_eq!(windows[0].card_id, primary_key);
+        assert_eq!(
+            windows[0].window_key.as_deref(),
+            Some(windows[0].card_id.as_str())
+        );
+        assert_eq!(windows[1].card_id, secondary_key);
+        assert_eq!(
+            windows[1].window_key.as_deref(),
+            Some(windows[1].card_id.as_str())
+        );
+    }
+
+    #[test]
+    fn codex_unknown_and_anonymous_windows_are_structural_and_skip_history() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let unknown_main = CodexRateLimit {
+            primary_window: Some(CodexWindow {
+                used_percent: 5.0,
+                reset_at: now.timestamp() + 3_600,
+                limit_window_seconds: 3_600,
+            }),
+            secondary_window: None,
+        };
+        let anonymous = |primary_used: f64, secondary_used: f64| CodexAdditionalRateLimit {
+            limit_name: None,
+            metered_feature: None,
+            rate_limit: Some(CodexRateLimit {
+                primary_window: Some(CodexWindow {
+                    used_percent: primary_used,
+                    reset_at: now.timestamp() + 7_200,
+                    limit_window_seconds: 7_200,
+                }),
+                secondary_window: Some(CodexWindow {
+                    used_percent: secondary_used,
+                    reset_at: now.timestamp() + 86_400,
+                    limit_window_seconds: 86_400,
+                }),
+            }),
+        };
+        let windows = codex_windows(
+            Some(&unknown_main),
+            Some(&[anonymous(10.0, 20.0), anonymous(30.0, 40.0)]),
+            now,
+        );
+        assert_eq!(windows.len(), 3);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.card_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "row.main.primary.v1",
+                "row.additional.unknown.primary.v1",
+                "row.additional.unknown.secondary.v1"
+            ]
+        );
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.used_percent)
+                .collect::<Vec<_>>(),
+            vec![5.0, 10.0, 20.0],
+            "duplicate anonymous slots keep the provider-order first row"
+        );
+        for window in &windows[1..] {
+            assert_eq!(window.label_for_test(), "Unknown");
+            assert_ne!(window.label_for_test(), "Codex extra limit");
+        }
+        for window in &windows {
+            assert_eq!(window.window_key, None);
+            assert_eq!(window.pace_status.state, PaceState::Unavailable);
+            assert_eq!(window.pace_status.reason.as_deref(), Some("windowIdentity"));
+        }
+
+        let scope = TestRefreshScope::new("codex", "unknown-windows");
+        let account_scope = scope
+            .resolve_current("fixture", "unknown-windows", b"marker")
+            .unwrap();
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "codex".to_string(),
+            source: "fixture".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows,
+            credits: None,
+            error: None,
+        };
+        let history_calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut snapshot, now.timestamp(), |_, _, _| {
+            history_calls.set(history_calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(history_calls.get(), 0);
+
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        let rows = wire["windows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(row["paceStatus"].get("windowKey").is_none());
+            assert_eq!(row["paceStatus"]["state"], "unavailable");
+            assert_eq!(row["paceStatus"]["reason"], "windowIdentity");
+        }
+        scope.cleanup();
     }
 
     #[test]
