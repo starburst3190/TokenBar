@@ -22,7 +22,7 @@ use crate::agent_account_scope::{
 use crate::agent_usage::{clean_plan, parse_datetime, percent_encode, AgentIdentity, UsageWindow};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, value::RawValue, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -259,29 +259,19 @@ struct NamedTier {
 #[derive(Debug, Deserialize)]
 struct ModelConfigData {
     #[serde(rename = "clientModelConfigs")]
-    client_model_configs: Option<Vec<ModelConfig>>,
+    client_model_configs: Option<Vec<Box<RawValue>>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ModelConfig {
-    label: Option<String>,
-    #[serde(rename = "modelOrAlias")]
-    model_or_alias: Option<ModelAlias>,
-    #[serde(rename = "quotaInfo")]
-    quota_info: Option<QuotaInfo>,
+struct AvailableModelsResponse {
+    #[serde(default)]
+    models: BTreeMap<String, Box<RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ModelAlias {
-    model: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QuotaInfo {
-    #[serde(rename = "remainingFraction")]
-    remaining_fraction: Option<f64>,
-    #[serde(rename = "resetTime")]
-    reset_time: Option<String>,
+struct QuotaBucketsResponse {
+    #[serde(default)]
+    buckets: Vec<Box<RawValue>>,
 }
 
 #[derive(Debug)]
@@ -304,20 +294,11 @@ fn quota_window(
     now: DateTime<Utc>,
     card_id: String,
     window_key: Option<String>,
-) -> UsageWindow {
-    let invalid_fraction = !valid_remaining_fraction(fraction);
-    let display_fraction = if fraction.is_finite() {
-        fraction.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let identified = window_key.is_some();
-    let mut window = UsageWindow::from_provider_fraction(label, display_fraction, reset, now)
-        .with_identity(card_id, window_key, None, None);
-    if invalid_fraction && identified {
-        window.unavailable("invalidEvidence");
-    }
-    window
+) -> Option<UsageWindow> {
+    valid_remaining_fraction(fraction).then(|| {
+        UsageWindow::from_provider_fraction(label, fraction, reset, now)
+            .with_identity(card_id, window_key, None, None)
+    })
 }
 
 fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> {
@@ -334,21 +315,30 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
     let mut selected: BTreeMap<String, ModelCandidate> = BTreeMap::new();
     let mut missing_model = Vec::new();
     for (index, config) in configs.into_iter().enumerate() {
-        let Some(quota) = config.quota_info else {
+        let Ok(config) = serde_json::from_str::<Value>(config.get()) else {
             continue;
         };
-        let Some(fraction) = quota.remaining_fraction else {
+        let Some(quota) = config.get("quotaInfo") else {
             continue;
         };
-        let reset = quota.reset_time.as_deref().and_then(parse_datetime);
+        let Some(fraction) = quota.get("remainingFraction").and_then(Value::as_f64) else {
+            continue;
+        };
+        let reset = quota
+            .get("resetTime")
+            .and_then(Value::as_str)
+            .and_then(parse_datetime);
         let model_id = config
-            .model_or_alias
-            .and_then(|model| model.model)
-            .map(|model| model.trim().to_string())
-            .filter(|model| !model.is_empty());
+            .pointer("/modelOrAlias/model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
         let label = config
-            .label
+            .get("label")
+            .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
             .or_else(|| model_id.clone())
             .unwrap_or_else(|| "Model".to_string());
         let candidate = ModelCandidate {
@@ -383,7 +373,7 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
     candidates.sort_by_key(|candidate| candidate.source_index);
     let windows: Vec<UsageWindow> = candidates
         .into_iter()
-        .map(|candidate| {
+        .filter_map(|candidate| {
             let (card_id, window_key) = match candidate.model_id {
                 Some(model_id) => {
                     let key = format!("model.{model_id}.v1");
@@ -471,7 +461,7 @@ async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
         .build()
         .map_err(|e| format!("build Antigravity client: {e}"))?;
 
-    let code_assist = code_assist_post(
+    let code_assist_body = code_assist_post(
         &client,
         "loadCodeAssist",
         &json!({
@@ -480,6 +470,8 @@ async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
         &access_token,
     )
     .await?;
+    let code_assist: Value = serde_json::from_str(&code_assist_body)
+        .map_err(|e| format!("decode Antigravity loadCodeAssist: {e}"))?;
     let project = project_id(&code_assist);
     let plan = resolve_remote_plan(&code_assist);
     let windows = fetch_model_quotas(&client, &access_token, project.as_deref(), now).await?;
@@ -720,7 +712,7 @@ async fn code_assist_post(
     method: &str,
     body: &Value,
     access_token: &str,
-) -> Result<Value, String> {
+) -> Result<String, String> {
     let resp = client
         .post(format!("{CODE_ASSIST_BASE}:{method}"))
         .bearer_auth(access_token)
@@ -740,9 +732,9 @@ async fn code_assist_post(
     if !status.is_success() {
         return Err(format!("Antigravity {method} returned {}", status.as_u16()));
     }
-    resp.json()
+    resp.text()
         .await
-        .map_err(|e| format!("decode Antigravity {method}: {e}"))
+        .map_err(|e| format!("read Antigravity {method}: {e}"))
 }
 
 async fn fetch_model_quotas(
@@ -757,20 +749,14 @@ async fn fetch_model_quotas(
     };
     // Primary: fetchAvailableModels (per-model quotaInfo). Fall back to
     // retrieveUserQuota buckets if the catalog endpoint is denied.
-    match code_assist_post(client, "fetchAvailableModels", &body, access_token).await {
-        Ok(value) => {
-            let windows = models_from_available(&value, now);
-            if windows.is_empty() {
-                let quota =
-                    code_assist_post(client, "retrieveUserQuota", &body, access_token).await?;
-                Ok(buckets_from_quota(&quota, now))
-            } else {
-                Ok(windows)
-            }
-        }
-        Err(_) => {
+    match code_assist_post(client, "fetchAvailableModels", &body, access_token)
+        .await
+        .and_then(|body| models_from_available(&body, now))
+    {
+        Ok(windows) if !windows.is_empty() => Ok(windows),
+        _ => {
             let quota = code_assist_post(client, "retrieveUserQuota", &body, access_token).await?;
-            Ok(buckets_from_quota(&quota, now))
+            buckets_from_quota(&quota, now)
         }
     }
 }
@@ -814,13 +800,15 @@ fn resolve_remote_plan(code_assist: &Value) -> Option<String> {
     }
 }
 
-fn models_from_available(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
-    let Some(models) = value.get("models").and_then(Value::as_object) else {
-        return Vec::new();
-    };
+fn models_from_available(body: &str, now: DateTime<Utc>) -> Result<Vec<UsageWindow>, String> {
+    let response: AvailableModelsResponse = serde_json::from_str(body)
+        .map_err(|e| format!("decode Antigravity fetchAvailableModels: {e}"))?;
     let mut selected: BTreeMap<String, ModelCandidate> = BTreeMap::new();
     let mut missing_model = Vec::new();
-    for (source_index, (raw_id, model)) in models.iter().enumerate() {
+    for (source_index, (raw_id, model)) in response.models.into_iter().enumerate() {
+        let Ok(model) = serde_json::from_str::<Value>(model.get()) else {
+            continue;
+        };
         let Some(quota) = model.get("quotaInfo") else {
             continue;
         };
@@ -876,9 +864,9 @@ fn models_from_available(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> 
     let mut candidates: Vec<ModelCandidate> = selected.into_values().collect();
     candidates.extend(missing_model);
     candidates.sort_by_key(|candidate| candidate.source_index);
-    candidates
+    Ok(candidates
         .into_iter()
-        .map(|candidate| {
+        .filter_map(|candidate| {
             let (card_id, window_key) = match candidate.model_id {
                 Some(model_id) => {
                     let key = format!("model.{model_id}.v1");
@@ -895,7 +883,7 @@ fn models_from_available(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> 
                 window_key,
             )
         })
-        .collect()
+        .collect())
 }
 
 #[derive(Debug)]
@@ -906,13 +894,15 @@ struct QuotaBucketCandidate {
     source_index: usize,
 }
 
-fn buckets_from_quota(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
-    let Some(buckets) = value.get("buckets").and_then(Value::as_array) else {
-        return Vec::new();
-    };
+fn buckets_from_quota(body: &str, now: DateTime<Utc>) -> Result<Vec<UsageWindow>, String> {
+    let response: QuotaBucketsResponse = serde_json::from_str(body)
+        .map_err(|e| format!("decode Antigravity retrieveUserQuota: {e}"))?;
     let mut selected: BTreeMap<String, QuotaBucketCandidate> = BTreeMap::new();
     let mut missing = Vec::new();
-    for (source_index, bucket) in buckets.iter().enumerate() {
+    for (source_index, bucket) in response.buckets.into_iter().enumerate() {
+        let Ok(bucket) = serde_json::from_str::<Value>(bucket.get()) else {
+            continue;
+        };
         let Some(fraction) = bucket.get("remainingFraction").and_then(Value::as_f64) else {
             continue;
         };
@@ -947,9 +937,9 @@ fn buckets_from_quota(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
     let mut chosen: Vec<QuotaBucketCandidate> = selected.into_values().collect();
     chosen.extend(missing);
     chosen.sort_by_key(|candidate| candidate.source_index);
-    chosen
+    Ok(chosen
         .into_iter()
-        .map(|candidate| {
+        .filter_map(|candidate| {
             let label = candidate
                 .model_id
                 .clone()
@@ -973,7 +963,7 @@ fn buckets_from_quota(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
                 window_key,
             )
         })
-        .collect()
+        .collect())
 }
 
 fn bucket_candidate_is_better(
@@ -1247,7 +1237,7 @@ mod tests {
                 "gemini-3-pro": { "displayName": "Gemini 3 Pro", "quotaInfo": { "remainingFraction": 0.5 } }
             }
         });
-        let w = models_from_available(&models, now);
+        let w = models_from_available(&models.to_string(), now).unwrap();
         assert_eq!(w.len(), 1);
 
         let quota = json!({
@@ -1256,7 +1246,7 @@ mod tests {
                 { "modelId": "claude", "remainingFraction": 0.3 }
             ]
         });
-        let b = buckets_from_quota(&quota, now);
+        let b = buckets_from_quota(&quota.to_string(), now).unwrap();
         assert_eq!(b.len(), 1);
         assert!((b[0].remaining_for_test() - 30.0).abs() < 0.01); // lowest kept
     }
@@ -1286,7 +1276,7 @@ mod tests {
                 }
             }
         });
-        let windows = models_from_available(&models, now);
+        let windows = models_from_available(&models.to_string(), now).unwrap();
         assert_eq!(windows.len(), 3);
         let model_a = windows
             .iter()
@@ -1344,9 +1334,11 @@ mod tests {
                         "quotaInfo": { "remainingFraction": 0.7 }
                     }
                 }
-            }),
+            })
+            .to_string(),
             now,
-        );
+        )
+        .unwrap();
         let wire = serde_json::to_value(&missing_remote[0]).unwrap();
         assert_eq!(wire["cardId"], "row.models.0.v1");
         assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
@@ -1356,9 +1348,11 @@ mod tests {
                 "buckets": [
                     { "modelId": "   ", "remainingFraction": 0.7 }
                 ]
-            }),
+            })
+            .to_string(),
             now,
-        );
+        )
+        .unwrap();
         let wire = serde_json::to_value(&missing_bucket[0]).unwrap();
         assert_eq!(wire["cardId"], "row.quota.bucket.0.v1");
         assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
@@ -1382,7 +1376,7 @@ mod tests {
                 }
             ]
         });
-        let selected = buckets_from_quota(&duplicate, now);
+        let selected = buckets_from_quota(&duplicate.to_string(), now).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(
             selected[0].resets_at_for_test(),
@@ -1408,20 +1402,18 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let assert_rows = |windows: Vec<UsageWindow>| {
-            assert_eq!(windows.len(), 3);
-            assert!(windows
-                .iter()
-                .any(|window| window.pace_window_key_for_test() == Some("model.valid.v1")));
+            assert_eq!(windows.len(), 1);
+            assert_eq!(
+                windows[0].pace_window_key_for_test(),
+                Some("model.valid.v1")
+            );
             for key in ["model.negative.v1", "model.over.v1"] {
-                let wire = windows
-                    .iter()
-                    .find(|window| window.pace_window_key_for_test() == Some(key))
-                    .map(serde_json::to_value)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(wire["paceStatus"]["state"], "unavailable", "{key}");
-                assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence", "{key}");
-                assert!(wire["paceStatus"].get("durationSeconds").is_none());
+                assert!(
+                    windows
+                        .iter()
+                        .all(|window| window.pace_window_key_for_test() != Some(key)),
+                    "invalid quota row must not be published: {key}"
+                );
             }
         };
 
@@ -1451,41 +1443,142 @@ mod tests {
         }"#;
         assert_rows(parse_user_status(cli, now).unwrap().windows);
 
-        assert_rows(models_from_available(
-            &json!({
-                "models": {
-                    "valid": { "quotaInfo": { "remainingFraction": 0.5 } },
-                    "negative": { "quotaInfo": { "remainingFraction": -0.1 } },
-                    "over": { "quotaInfo": { "remainingFraction": 1.1 } },
-                    "missing": { "quotaInfo": {} }
+        let assert_overflowing_duplicate = |windows: Vec<UsageWindow>| {
+            assert_eq!(windows.len(), 1);
+            assert_eq!(
+                windows[0].pace_window_key_for_test(),
+                Some("model.same-model.v1")
+            );
+            assert!((windows[0].remaining_for_test() - 50.0).abs() < 0.01);
+        };
+        let overflowing_cli = r#"{
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "modelOrAlias": { "model": "same-model" },
+                            "quotaInfo": { "remainingFraction": 1e400 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "same-model" },
+                            "quotaInfo": { "remainingFraction": 0.5 }
+                        }
+                    ]
                 }
-            }),
-            now,
-        ));
+            }
+        }"#;
+        assert_overflowing_duplicate(parse_user_status(overflowing_cli, now).unwrap().windows);
 
-        assert_rows(buckets_from_quota(
-            &json!({
-                "buckets": [
-                    { "modelId": "valid", "remainingFraction": 0.5 },
-                    { "modelId": "negative", "remainingFraction": -0.1 },
-                    { "modelId": "over", "remainingFraction": 1.1 },
-                    { "modelId": "missing" }
-                ]
-            }),
-            now,
-        ));
+        assert_rows(
+            models_from_available(
+                &json!({
+                    "models": {
+                        "valid": { "quotaInfo": { "remainingFraction": 0.5 } },
+                        "negative": { "quotaInfo": { "remainingFraction": -0.1 } },
+                        "over": { "quotaInfo": { "remainingFraction": 1.1 } },
+                        "missing": { "quotaInfo": {} }
+                    }
+                })
+                .to_string(),
+                now,
+            )
+            .unwrap(),
+        );
 
-        let non_finite = quota_window(
+        let overflowing_models = r#"{
+            "models": {
+                "same-model": {
+                    "quotaInfo": { "remainingFraction": 1e400 }
+                },
+                " same-model ": {
+                    "quotaInfo": { "remainingFraction": 0.5 }
+                }
+            }
+        }"#;
+        assert_overflowing_duplicate(models_from_available(overflowing_models, now).unwrap());
+
+        assert_rows(
+            buckets_from_quota(
+                &json!({
+                    "buckets": [
+                        { "modelId": "valid", "remainingFraction": 0.5 },
+                        { "modelId": "negative", "remainingFraction": -0.1 },
+                        { "modelId": "over", "remainingFraction": 1.1 },
+                        { "modelId": "missing" }
+                    ]
+                })
+                .to_string(),
+                now,
+            )
+            .unwrap(),
+        );
+
+        let overflowing_buckets = r#"{
+            "buckets": [
+                { "modelId": "same-model", "remainingFraction": 1e400 },
+                { "modelId": "same-model", "remainingFraction": 0.5 }
+            ]
+        }"#;
+        assert_overflowing_duplicate(buckets_from_quota(overflowing_buckets, now).unwrap());
+
+        let malformed_cli_row = r#"{
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "label": 1e400,
+                            "modelOrAlias": { "model": "same-model" },
+                            "quotaInfo": { "remainingFraction": 0.4 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "same-model" },
+                            "quotaInfo": { "remainingFraction": 0.5 }
+                        }
+                    ]
+                }
+            }
+        }"#;
+        assert_overflowing_duplicate(parse_user_status(malformed_cli_row, now).unwrap().windows);
+
+        let malformed_model_row = r#"{
+            "models": {
+                "same-model": {
+                    "displayName": 1e400,
+                    "quotaInfo": { "remainingFraction": 0.4 }
+                },
+                " same-model ": {
+                    "quotaInfo": { "remainingFraction": 0.5 }
+                }
+            }
+        }"#;
+        assert_overflowing_duplicate(models_from_available(malformed_model_row, now).unwrap());
+
+        let malformed_bucket_fields = r#"{
+            "buckets": [
+                { "modelId": 42, "remainingFraction": 0.4 },
+                { "modelId": "valid", "remainingFraction": 0.5 }
+            ]
+        }"#;
+        let malformed_bucket_windows = buckets_from_quota(malformed_bucket_fields, now).unwrap();
+        assert_eq!(malformed_bucket_windows.len(), 2);
+        assert!(malformed_bucket_windows
+            .iter()
+            .any(|window| window.pace_window_key_for_test() == Some("model.valid.v1")));
+        let malformed_bucket_wire = serde_json::to_value(&malformed_bucket_windows[0]).unwrap();
+        assert_eq!(
+            malformed_bucket_wire["paceStatus"]["reason"],
+            "windowIdentity"
+        );
+
+        assert!(quota_window(
             "Non-finite".to_string(),
             f64::NAN,
             None,
             now,
             "model.non-finite.v1".to_string(),
             Some("model.non-finite.v1".to_string()),
-        );
-        let wire = serde_json::to_value(non_finite).unwrap();
-        assert_eq!(wire["paceStatus"]["state"], "unavailable");
-        assert_eq!(wire["paceStatus"]["reason"], "invalidEvidence");
+        )
+        .is_none());
         assert!(!binding_candidate_is_better(
             -0.1, None, 1, 0.5, None, 0, now
         ));
