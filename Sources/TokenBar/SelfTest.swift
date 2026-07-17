@@ -1073,19 +1073,69 @@ enum SelfTest {
                     return windows.count == 2
                         && windows[0].cardId == "session.v1"
                         && windows[1].cardId == "weekly.v1"
-                        && windows[0].paceStatus.state == .learningHistory
-                        && windows[1].paceStatus.state == .learningHistory
-                        && windows[0].durationSeconds == 18_000
-                        && windows[1].durationSeconds == 604_800
-                        && windows[0].windowMinutes == 300
-                        && windows[1].windowMinutes == 10_080
-                        && windows.allSatisfy {
-                            $0.paceStatus.durationSource == .contract
-                                && $0.paceStatus.completeCycles == 0
-                                && $0.historicalPace == nil
-                        }
                 },
-            "demo quota cards use unique canonical learning-history windows")
+            "demo quota cards use unique canonical window identities")
+
+        let firstDemoWindows = quota.agents.first?.uniqueCardWindows ?? []
+        let secondDemoWindows = quota.agents.dropFirst().first?.uniqueCardWindows ?? []
+        let demoLearningDuration = firstDemoWindows.first
+        let demoLearningHistory = firstDemoWindows.dropFirst().first
+        let demoAvailable = secondDemoWindows.first
+        let demoUnavailable = secondDemoWindows.dropFirst().first
+        expect(
+            firstDemoWindows.count == 2
+                && demoLearningDuration?.paceStatus.state == .learningDuration
+                && demoLearningDuration?.durationSeconds == nil
+                && demoLearningDuration?.windowMinutes == nil
+                && demoLearningDuration?.paceStatus.durationSource == .observed
+                && demoLearningHistory?.paceStatus.state == .learningHistory
+                && demoLearningHistory?.durationSeconds == 604_800
+                && demoLearningHistory?.windowMinutes == 10_080
+                && demoLearningHistory?.historicalPace == nil,
+            "demo fixture exposes learning-duration and learning-history rows")
+        expect(
+            secondDemoWindows.count == 2
+                && demoAvailable?.paceStatus.state == .available
+                && demoAvailable?.durationSeconds == 18_000
+                && demoAvailable?.historicalPace?.expectedUsedPercent == 35
+                && demoUnavailable?.paceStatus.state == .unavailable
+                && demoUnavailable?.paceStatus.reason == .missingReset
+                && demoUnavailable?.resetsAt == nil,
+            "demo fixture exposes historical-available and typed-unavailable rows")
+
+        let demoLearningEstimate = demoLearningHistory.flatMap {
+            UsagePace.compute(window: $0, mode: .historical)
+        }
+        let demoHistoricalAhead = demoAvailable.flatMap {
+            UsagePace.compute(window: $0, mode: .historical)
+        }
+        expect(
+            demoLearningEstimate?.basis == .linear
+                && demoLearningEstimate?.isHistoricalDeficit == false,
+            "demo learning-history estimate cannot trigger historical warning color")
+        expect(
+            demoHistoricalAhead?.basis == .historical
+                && demoHistoricalAhead?.stage.isDeficit == true
+                && demoHistoricalAhead?.isHistoricalDeficit == true,
+            "demo available row is a historical deficit acceptance fixture")
+        expect(
+            demoLearningDuration.flatMap {
+                UsagePace.compute(window: $0, mode: .historical)
+            } == nil
+                && demoUnavailable.flatMap {
+                    UsagePace.compute(window: $0, mode: .historical)
+                } == nil,
+            "demo learning-duration and unavailable rows suppress projections")
+        expect(
+            quota.agents.dropFirst(2).allSatisfy { agent in
+                agent.uniqueCardWindows.allSatisfy {
+                    $0.paceStatus.state == .learningHistory
+                        && $0.paceStatus.durationSource == .contract
+                        && $0.paceStatus.completeCycles == 0
+                        && $0.historicalPace == nil
+                }
+            },
+            "remaining demo quota cards stay on canonical learning-history fixtures")
 
         let modelReport = DemoData.modelReport
         let hourlyReport = DemoData.hourlyReport
@@ -1147,13 +1197,19 @@ enum SelfTest {
 
         expect(
             quota.agents.allSatisfy { agent in
-                !agent.windows.isEmpty && agent.windows.allSatisfy {
-                    $0.windowMinutes ?? 0 > 0
-                        && $0.usedPercent >= 0 && $0.remainingPercent > 0
-                        && abs($0.usedPercent + $0.remainingPercent - 100) < 0.000_001
+                !agent.windows.isEmpty && agent.windows.allSatisfy { window in
+                    let durationShapeIsValid = switch window.paceStatus.state {
+                    case .learningHistory, .available:
+                        (window.windowMinutes ?? 0) > 0
+                    case .learningDuration, .unavailable, .legacyMissing:
+                        window.windowMinutes == nil
+                    }
+                    return durationShapeIsValid
+                        && window.usedPercent >= 0 && window.remainingPercent > 0
+                        && abs(window.usedPercent + window.remainingPercent - 100) < 0.000_001
                 }
             },
-            "demo quota windows have valid labels and used-plus-remaining totals")
+            "demo quota windows have valid duration and percentage shapes")
         let rawDemoRate = DemoData.tokensPerMin
         let traceRate = trace.reduce(0.0) { $0 + $1.tokensPerMin }
         let selectedTraceRate = trace.first { $0.client == selectedClient }?.tokensPerMin ?? 0
