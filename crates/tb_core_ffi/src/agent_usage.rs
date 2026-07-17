@@ -233,10 +233,9 @@ impl UsageWindow {
         window
     }
 
-    /// Build a provider reading without clamping it before the generic adapter
-    /// can classify invalid evidence. Invalid values remain display-clamped by
-    /// the legacy constructor, but `with_identity` marks identified cards
-    /// unavailable instead of allowing them into history.
+    /// Preserve the raw provider reading until identity is attached so the
+    /// generic adapter can classify invalid evidence. `with_identity` then
+    /// restores finite display percentages before any wire serialization.
     pub(crate) fn from_provider_used_percent(
         label: String,
         used_percent: f64,
@@ -269,6 +268,14 @@ impl UsageWindow {
     ) -> Self {
         let invalid_reading =
             !self.used_percent.is_finite() || !(0.0..=100.0).contains(&self.used_percent);
+        if invalid_reading {
+            self.used_percent = if self.used_percent.is_finite() {
+                self.used_percent.clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            self.remaining_percent = 100.0 - self.used_percent;
+        }
         self.card_id = card_id.into();
         self.window_key = window_key;
         self.provider_duration = provider_duration;
@@ -2322,7 +2329,9 @@ where
 
     let Ok(account_scope) = snapshot.account_scope.as_ref() else {
         for window in &mut snapshot.windows {
-            window.unavailable("accountScope");
+            if window.window_key.is_some() {
+                window.unavailable("accountScope");
+            }
         }
         return;
     };
@@ -4288,7 +4297,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_window_rejects_out_of_range_fraction() {
+    fn unified_window_sanitizes_invalid_fraction_for_wire() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let zero = unified_ratelimit_window("Session", Some(0.0), None, now).unwrap();
         assert!((zero.used_percent - 0.0).abs() < 1e-9);
@@ -4296,10 +4305,31 @@ mod tests {
         let full = unified_ratelimit_window("Session", Some(1.0), None, now).unwrap();
         assert!((full.used_percent - 100.0).abs() < 1e-9);
         assert!((full.remaining_percent - 0.0).abs() < 1e-9);
+
         let over = unified_ratelimit_window("Session", Some(1.5), None, now).unwrap();
-        assert!((over.used_percent - 150.0).abs() < 1e-9);
-        assert!((over.remaining_percent + 50.0).abs() < 1e-9);
+        assert_eq!(over.used_percent, 100.0);
+        assert_eq!(over.remaining_percent, 0.0);
         assert_eq!(over.pace_status.reason.as_deref(), Some("invalidEvidence"));
+
+        let windows = parse_unified_ratelimit_windows(
+            &header_map(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "NaN"),
+                ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
+            ]),
+            now,
+        );
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_percent, 0.0);
+        assert_eq!(windows[0].remaining_percent, 100.0);
+        assert_eq!(
+            windows[0].pace_status.reason.as_deref(),
+            Some("invalidEvidence")
+        );
+        let wire = serde_json::to_value(&windows[0]).unwrap();
+        assert_eq!(wire["usedPercent"], 0.0);
+        assert_eq!(wire["remainingPercent"], 100.0);
+        assert_eq!(wire["paceStatus"]["state"], "unavailable");
+
         // None utilization -> no window
         assert!(unified_ratelimit_window("Session", None, Some(1_783_111_200), now).is_none());
     }
@@ -5333,18 +5363,27 @@ mod tests {
             updated_at: String::new(),
             identity: None,
             account_scope: Err(AccountScopeError::MetadataWrite),
-            windows: vec![UsageWindow::from_provider_used_percent(
-                "Session".to_string(),
-                20.0,
-                Some(now + chrono::Duration::hours(5)),
-                now,
-            )
-            .with_identity(
-                "session.v1",
-                Some("session.v1".to_string()),
-                None,
-                Some(DurationEvidence::contract(300 * 60)),
-            )],
+            windows: vec![
+                UsageWindow::from_provider_used_percent(
+                    "Session".to_string(),
+                    20.0,
+                    Some(now + chrono::Duration::hours(5)),
+                    now,
+                )
+                .with_identity(
+                    "session.v1",
+                    Some("session.v1".to_string()),
+                    None,
+                    Some(DurationEvidence::contract(300 * 60)),
+                ),
+                UsageWindow::from_provider_used_percent(
+                    "Unknown".to_string(),
+                    30.0,
+                    Some(now + chrono::Duration::hours(5)),
+                    now,
+                )
+                .with_identity("row.unknown.v1", None, None, None),
+            ],
             credits: None,
             error: None,
         };
@@ -5362,6 +5401,12 @@ mod tests {
             snapshot.windows[0].pace_status.state,
             PaceState::Unavailable
         );
+        assert_eq!(
+            snapshot.windows[1].pace_status.reason.as_deref(),
+            Some("windowIdentity")
+        );
+        assert!(snapshot.windows[1].pace_status.window_key.is_none());
+        assert!(serde_json::to_value(&snapshot).is_ok());
     }
 
     #[test]
