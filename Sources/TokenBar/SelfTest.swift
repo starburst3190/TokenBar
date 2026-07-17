@@ -523,7 +523,8 @@ enum SelfTest {
         {"generatedAt":"now","agents":[
           {"clientId":"codex","source":"oauth","updatedAt":"now",
            "windows":[{"cardId":"session.v1","label":"Session","usedPercent":20,"remainingPercent":80},
-                      {"cardId":"weekly.v1","label":"Weekly","usedPercent":65,"remainingPercent":35}]},
+                      {"cardId":"weekly.v1","label":"Weekly","usedPercent":65,"remainingPercent":35},
+                      {"cardId":"model.gpt|preview.v1","label":"Delimiter","usedPercent":5,"remainingPercent":95}]},
           {"clientId":"claude","source":"oauth","updatedAt":"now",
            "windows":[{"cardId":"session.v1","label":"Session","usedPercent":88,"remainingPercent":12},
                       {"cardId":"weekly.v1","label":"Weekly","usedPercent":10,"remainingPercent":90}]},
@@ -541,6 +542,15 @@ enum SelfTest {
         expect(
             QuotaResolver.selection(clientId: "codex", cardId: "weekly.v1") == "codex|weekly.v1",
             "canonical selection stores cardId")
+        let delimiterSelection = QuotaResolver.selection(
+            clientId: "codex", cardId: "model.gpt|preview.v1")
+        expect(
+            delimiterSelection == "codex|model.gpt|preview.v1"
+                && QuotaResolver.canonicalSelection(
+                    payload: quotaPayload, selection: delimiterSelection) == delimiterSelection
+                && QuotaResolver.resolve(payload: quotaPayload, selection: delimiterSelection)?
+                    .window.cardId == "model.gpt|preview.v1",
+            "card selection preserves delimiters inside cardId")
         expect(
             QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|Weekly")
                 == "codex|weekly.v1"
@@ -567,14 +577,24 @@ enum SelfTest {
             "temporarily absent explicit client stays selected instead of following Auto")
         expect(
             QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|Weekly|extra")
-                == QuotaResolver.auto,
-            "malformed selection normalizes to Auto")
+                == "codex|Weekly|extra"
+                && QuotaResolver.resolve(
+                    payload: quotaPayload, selection: "codex|Weekly|extra") == nil,
+            "unmatched explicit selection preserves delimiter characters")
         expect(
             QuotaResolver.canonicalSelection(payload: nil, selection: "future|legacy-card.v1")
                 == "future|legacy-card.v1"
                 && QuotaResolver.canonicalSelection(payload: nil, selection: "future|legacy|extra")
+                    == "future|legacy|extra",
+            "payload nil preserves explicit selection delimiters")
+        expect(
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "future")
+                == QuotaResolver.auto
+                && QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "|card")
+                    == QuotaResolver.auto
+                && QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "future|")
                     == QuotaResolver.auto,
-            "payload nil preserves well-formed explicit selection")
+            "structurally malformed selections normalize to Auto")
         expect(QuotaResolver.resolve(payload: nil, selection: "auto") == nil, "no payload, no quota")
 
         let duplicateJSON = """

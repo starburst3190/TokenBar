@@ -85,7 +85,8 @@ public enum QuotaResolver {
         _ raw: String
     ) -> (clientId: String, value: String)? {
         guard !raw.isEmpty, raw != auto else { return nil }
-        let parts = raw.split(separator: "|", omittingEmptySubsequences: false)
+        let parts = raw.split(
+            separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
         guard parts.count == 2 else { return nil }
         let clientId = String(parts[0])
         let value = String(parts[1])
