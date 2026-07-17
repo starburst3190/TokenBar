@@ -485,6 +485,7 @@ where
     if let Some(expires_in) = tokens.expires_in {
         credentials.expires_at = Some(Utc::now() + chrono::Duration::seconds(expires_in.max(0)));
     }
+    let refresh_token_rotated = credentials.refresh_token.as_bytes() != old_marker.as_slice();
     let location = credentials
         .scope_location()
         .map_err(|_| "Grok auth location cannot be scoped safely.".to_string())?;
@@ -496,7 +497,12 @@ where
     );
     checkpoint(RefreshCheckpoint::MetadataHandled)?;
 
-    // The lineage transfer is durable before the rotated pair is persisted.
+    // A rotated marker may reach disk only after its lineage transfer is durable.
+    // The refreshed access token remains usable in memory for this poll.
+    if refresh_token_rotated && scope.is_err() {
+        return Ok((credentials, scope));
+    }
+
     // If write-back fails, the still-stored old marker resolves the same scope.
     if let Err(error) = save(&credentials) {
         eprintln!("tb_core_ffi: failed to persist refreshed Grok credentials: {error}");
@@ -1298,12 +1304,20 @@ mod tests {
             scope.cleanup();
         }
 
-        let (scope, path, _old_scope, before, _) = setup_refresh("grok-metadata-fail");
+        let (scope, path, old_scope, before, location) = setup_refresh("grok-metadata-fail");
         scope.fail_metadata_save();
-        let (_, scope_outcome) = run_refresh(&scope, &path, None).await.unwrap();
+        let (refreshed, scope_outcome) = run_refresh(&scope, &path, None).await.unwrap();
+        assert_eq!(refreshed.access_token, "grok-new-access");
         assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
         assert_eq!(scope.metadata_bytes(), before);
-        assert_eq!(stored_refresh_token(&path), "grok-new-refresh");
+        let persisted_marker = stored_refresh_token(&path);
+        assert_eq!(persisted_marker, "grok-old-refresh");
+        assert_eq!(
+            scope
+                .resolve_current("grok-auth-json", &location, persisted_marker.as_bytes())
+                .unwrap(),
+            old_scope
+        );
         scope.cleanup();
 
         let (scope, path, old_scope, _, location) = setup_refresh("grok-success");
