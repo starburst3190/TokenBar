@@ -1623,6 +1623,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "core-foundation",
  "dirs",
  "fs2",
  "hmac",
@@ -1630,6 +1631,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",

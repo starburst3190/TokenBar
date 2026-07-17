@@ -30,6 +30,7 @@ const METADATA_SCHEMA_VERSION: u32 = 1;
 const INSTALLATION_KEY_BYTES: usize = 32;
 const LINEAGE_ID_BYTES: usize = 16;
 const DIGEST_BYTES: usize = 32;
+const ERR_SEC_SUCCESS: i32 = 0;
 const ERR_SEC_DUPLICATE_ITEM: i32 = -25_299;
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25_300;
 
@@ -149,18 +150,99 @@ trait Backend {
 #[derive(Debug, Clone, Copy)]
 struct SystemBackend;
 
+#[cfg(target_os = "macos")]
+fn installation_key_item_query(
+    keychain: &security_framework::os::macos::keychain::SecKeychain,
+    value: Option<&[u8]>,
+) -> core_foundation::dictionary::CFDictionary {
+    use core_foundation::array::CFArray;
+    use core_foundation::base::{TCFType as _, ToVoid as _};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::CFMutableDictionary;
+    use core_foundation::string::{CFString, CFStringRef};
+    use security_framework_sys::item::{
+        kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecClass,
+        kSecClassGenericPassword, kSecMatchSearchList, kSecReturnData, kSecUseAuthenticationUI,
+        kSecUseKeychain, kSecValueData,
+    };
+
+    extern "C" {
+        #[link_name = "kSecUseAuthenticationUIFail"]
+        static K_SEC_USE_AUTHENTICATION_UI_FAIL: CFStringRef;
+    }
+
+    let service = CFString::new(KEYCHAIN_SERVICE);
+    let account = CFString::new(KEYCHAIN_ACCOUNT);
+    let mut query: CFMutableDictionary = CFMutableDictionary::new();
+    unsafe {
+        query.add(&kSecClass.to_void(), &kSecClassGenericPassword.to_void());
+        query.add(&kSecAttrService.to_void(), &service.to_void());
+        query.add(&kSecAttrAccount.to_void(), &account.to_void());
+        query.add(
+            &kSecAttrSynchronizable.to_void(),
+            &CFBoolean::false_value().to_void(),
+        );
+        // Per-operation failure is required here: the menu app must never allow
+        // Security.framework to display authentication or legacy ACL UI.
+        query.add(
+            &kSecUseAuthenticationUI.to_void(),
+            &K_SEC_USE_AUTHENTICATION_UI_FAIL.to_void(),
+        );
+        match value {
+            Some(value) => {
+                let data = CFData::from_buffer(value);
+                query.add(&kSecUseKeychain.to_void(), &keychain.as_CFType().to_void());
+                query.add(&kSecValueData.to_void(), &data.to_void());
+            }
+            None => {
+                let search_list = CFArray::from_CFTypes(std::slice::from_ref(keychain));
+                query.add(
+                    &kSecMatchSearchList.to_void(),
+                    &search_list.as_CFType().to_void(),
+                );
+                query.add(
+                    &kSecReturnData.to_void(),
+                    &CFBoolean::true_value().to_void(),
+                );
+            }
+        }
+    }
+    query.to_immutable()
+}
+
 impl Backend for SystemBackend {
     #[cfg(target_os = "macos")]
     fn keychain_read(&self) -> Result<Option<Vec<u8>>, AccountScopeError> {
+        use core_foundation::base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType as _};
+        use core_foundation::data::CFData;
         use security_framework::os::macos::keychain::SecKeychain;
+        use security_framework_sys::keychain_item::SecItemCopyMatching;
 
         let keychain =
             SecKeychain::default().map_err(|_| AccountScopeError::KeychainUnavailable)?;
-        match keychain.find_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
-            Ok((password, _item)) => Ok(Some(password.as_ref().to_vec())),
-            Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
-            Err(_) => Err(AccountScopeError::KeychainUnavailable),
+        let query = installation_key_item_query(&keychain, None);
+        let mut result: CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
+        if status != ERR_SEC_SUCCESS {
+            if !result.is_null() {
+                unsafe { CFRelease(result) };
+            }
+            return if status == ERR_SEC_ITEM_NOT_FOUND {
+                Ok(None)
+            } else {
+                Err(AccountScopeError::KeychainUnavailable)
+            };
         }
+        if result.is_null() {
+            return Err(AccountScopeError::KeychainUnavailable);
+        }
+        if unsafe { CFGetTypeID(result) } != CFData::type_id() {
+            unsafe { CFRelease(result) };
+            return Err(AccountScopeError::KeychainUnavailable);
+        }
+        let data = unsafe { CFData::wrap_under_create_rule(result.cast()) };
+        Ok(Some(data.bytes().to_vec()))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -170,20 +252,20 @@ impl Backend for SystemBackend {
 
     #[cfg(target_os = "macos")]
     fn keychain_add_if_absent(&self, key: &[u8]) -> Result<KeyAddOutcome, AccountScopeError> {
+        use core_foundation::base::TCFType as _;
         use security_framework::os::macos::keychain::SecKeychain;
+        use security_framework_sys::keychain_item::SecItemAdd;
 
-        // SecKeychainAddGenericPassword is add-only. Targeting the explicit
-        // default file keychain keeps this item out of the synchronizing store;
-        // a duplicate is never updated, so concurrent creators cannot replace
-        // the winner's installation key.
+        // SecItemAdd remains add-only and targets the explicit default file
+        // keychain. A duplicate is never updated, so concurrent creators cannot
+        // replace the winner's installation key.
         let keychain =
             SecKeychain::default().map_err(|_| AccountScopeError::KeychainUnavailable)?;
-        match keychain.add_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key) {
-            Ok(()) => Ok(KeyAddOutcome::Added),
-            Err(error) if error.code() == ERR_SEC_DUPLICATE_ITEM => {
-                Ok(KeyAddOutcome::AlreadyExists)
-            }
-            Err(_) => Err(AccountScopeError::KeychainUnavailable),
+        let query = installation_key_item_query(&keychain, Some(key));
+        match unsafe { SecItemAdd(query.as_concrete_TypeRef(), std::ptr::null_mut()) } {
+            ERR_SEC_SUCCESS => Ok(KeyAddOutcome::Added),
+            ERR_SEC_DUPLICATE_ITEM => Ok(KeyAddOutcome::AlreadyExists),
+            _ => Err(AccountScopeError::KeychainUnavailable),
         }
     }
 
@@ -1824,6 +1906,45 @@ mod tests {
         );
         let new_scope = resolve_test(&backend, &lock, b"new").unwrap();
         assert_ne!(new_scope, old);
+        backend.cleanup();
+    }
+
+    #[test]
+    fn key_loss_reloads_replacement_key_before_metadata_recovery() {
+        let backend = TestBackend::new("key-loss-reload");
+        backend.state.lock().unwrap().random = VecDeque::from([
+            vec![0x31; INSTALLATION_KEY_BYTES],
+            vec![0x41; LINEAGE_ID_BYTES],
+            vec![0x32; INSTALLATION_KEY_BYTES],
+            vec![0x42; LINEAGE_ID_BYTES],
+        ]);
+        let lock = Mutex::new(());
+        let old_scope = resolve_test(&backend, &lock, b"same-marker").unwrap();
+        let old_metadata = metadata_bytes(&backend);
+
+        backend.state.lock().unwrap().key = Ok(None);
+        assert_eq!(
+            resolve_test(&backend, &lock, b"same-marker"),
+            Err(AccountScopeError::OrphanedArtifacts)
+        );
+        assert_eq!(
+            fs::read(
+                backend
+                    .directory
+                    .join("quota-account-scope-v1.orphaned-1752710400.json")
+            )
+            .unwrap(),
+            old_metadata
+        );
+
+        let replacement_scope = resolve_test(&backend, &lock, b"same-marker").unwrap();
+        assert_ne!(replacement_scope, old_scope);
+        let replacement_metadata = metadata_bytes(&backend);
+        assert_eq!(
+            resolve_test(&backend, &lock, b"same-marker").unwrap(),
+            replacement_scope
+        );
+        assert_eq!(metadata_bytes(&backend), replacement_metadata);
         backend.cleanup();
     }
 
