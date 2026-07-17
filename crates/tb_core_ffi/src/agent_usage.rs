@@ -2345,9 +2345,11 @@ where
             // The provider already classified this card as windowIdentity.
             continue;
         };
+        let key = SeriesKey::new(snapshot.client_id.clone(), account_scope, window_key);
+        active_keys.push(key.clone());
         if matches!(window.pace_status.state, PaceState::Unavailable) {
-            // Missing reset and other typed early rejects must not enter the
-            // history transaction at all.
+            // Emission protects existing history from capacity eviction, but
+            // missing reset and other typed early rejects never record a sample.
             continue;
         }
         let Some(reset_at) = window
@@ -2366,8 +2368,6 @@ where
             window.unavailable("invalidEvidence");
             continue;
         }
-        let key = SeriesKey::new(snapshot.client_id.clone(), account_scope, window_key);
-        active_keys.push(key.clone());
         observations.push(QuotaObservation {
             key,
             reset_at: Some(reset_at),
@@ -2378,7 +2378,7 @@ where
         mapped_indices.push(index);
     }
 
-    if observations.is_empty() {
+    if active_keys.is_empty() {
         return;
     }
 
@@ -4169,7 +4169,7 @@ mod tests {
     }
 
     #[test]
-    fn stage4_claude_extra_usage_is_typed_missing_reset_and_skips_history() {
+    fn stage4_claude_extra_usage_is_active_without_recording_an_observation() {
         let window = claude_extra_usage_window(Some(&ClaudeExtraUsage {
             is_enabled: true,
             monthly_limit: Some(10_000.0),
@@ -4195,6 +4195,7 @@ mod tests {
         let account_scope = scope
             .resolve_current("fixture", "extra-usage", b"extra-usage-marker")
             .unwrap();
+        let expected_scope = account_scope.as_str().to_string();
         let mut snapshot = AgentUsageSnapshot {
             client_id: "claude".to_string(),
             source: "oauth".to_string(),
@@ -4206,15 +4207,141 @@ mod tests {
             error: None,
         };
         let calls = std::cell::Cell::new(0);
-        enrich_snapshot_with(&mut snapshot, 1_700_000_000, |_, _, _| {
+        enrich_snapshot_with(&mut snapshot, 1_700_000_000, |active, observations, _| {
             calls.set(calls.get() + 1);
+            assert_eq!(
+                active,
+                &[SeriesKey::new("claude", &expected_scope, "extra_usage.v1")]
+            );
+            assert!(observations.is_empty());
             Ok(Vec::new())
         });
-        assert_eq!(calls.get(), 0);
+        assert_eq!(calls.get(), 1);
         assert_eq!(
             snapshot.windows[0].pace_status.state,
             PaceState::Unavailable
         );
+        assert_eq!(
+            snapshot.windows[0].pace_status.reason.as_deref(),
+            Some("missingReset")
+        );
+        scope.cleanup();
+    }
+
+    #[test]
+    fn stage4_emitted_unavailable_series_survives_capacity_admission() {
+        let scope = TestRefreshScope::new("claude", "emitted-capacity");
+        let account_scope = scope
+            .resolve_current("fixture", "capacity", b"capacity-marker")
+            .unwrap();
+        let account_scope_value = account_scope.as_str().to_string();
+        let history_path = scope
+            .root()
+            .join(crate::agent_quota_history::HISTORY_FILE_NAME);
+        let seed_now = 1_800_000_000_i64;
+        let seed_reset = seed_now + 86_400;
+        let weekly_key = SeriesKey::new("claude", &account_scope_value, "weekly.v1");
+        let mut seeded_keys = vec![weekly_key.clone()];
+        seeded_keys.extend(
+            (0..crate::agent_quota_history::MAX_SERIES - 1).map(|index| {
+                SeriesKey::new(
+                    "claude",
+                    &account_scope_value,
+                    format!("zzzz.{index:04}.v1"),
+                )
+            }),
+        );
+        for (sample_index, sampled_at) in [
+            seed_now,
+            seed_now + 86_400 / 5,
+            seed_now + 2 * 86_400 / 5,
+            seed_now + 3 * 86_400 / 5,
+            seed_now + 4 * 86_400 / 5,
+            seed_reset - 1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seeded_observations = seeded_keys
+                .iter()
+                .cloned()
+                .map(|key| QuotaObservation {
+                    key,
+                    reset_at: Some(seed_reset),
+                    used_percent: 10.0 + sample_index as f64 * 10.0,
+                    provider: None,
+                    contract: Some(DurationEvidence::contract(86_400)),
+                })
+                .collect::<Vec<_>>();
+            let seeded = crate::agent_quota_history::record_observations_at_path_and_evaluate(
+                &seeded_keys,
+                &seeded_observations,
+                sampled_at,
+                &history_path,
+            )
+            .unwrap();
+            assert_eq!(seeded.len(), crate::agent_quota_history::MAX_SERIES);
+        }
+
+        let now = seed_reset + 15 * 60 + 1;
+        let now_date = Utc.timestamp_opt(now, 0).single().unwrap();
+        let mut weekly =
+            UsageWindow::from_provider_used_percent("Weekly".to_string(), 20.0, None, now_date)
+                .with_identity(
+                    "weekly.v1",
+                    Some("weekly.v1".to_string()),
+                    None,
+                    Some(DurationEvidence::contract(86_400)),
+                );
+        weekly.unavailable("missingReset");
+        let new_window = UsageWindow::from_provider_used_percent(
+            "New quota".to_string(),
+            5.0,
+            Some(Utc.timestamp_opt(now + 86_400, 0).single().unwrap()),
+            now_date,
+        )
+        .with_identity(
+            "new.v1",
+            Some("new.v1".to_string()),
+            None,
+            Some(DurationEvidence::contract(86_400)),
+        );
+        let mut snapshot = AgentUsageSnapshot {
+            client_id: "claude".to_string(),
+            source: "oauth".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            windows: vec![weekly, new_window],
+            credits: None,
+            error: None,
+        };
+
+        enrich_snapshot_with(
+            &mut snapshot,
+            now,
+            |active, observations, transaction_now| {
+                assert_eq!(active.len(), 2);
+                assert!(active.contains(&weekly_key));
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].key.window_key, "new.v1");
+                crate::agent_quota_history::record_observations_at_path_and_evaluate(
+                    active,
+                    observations,
+                    transaction_now,
+                    &history_path,
+                )
+            },
+        );
+
+        let store: Value = serde_json::from_slice(&fs::read(&history_path).unwrap()).unwrap();
+        let series = store["series"].as_array().unwrap();
+        assert_eq!(series.len(), crate::agent_quota_history::MAX_SERIES);
+        assert!(series.iter().any(|entry| {
+            entry["providerId"] == "claude"
+                && entry["accountScope"] == account_scope_value
+                && entry["windowKey"] == "weekly.v1"
+        }));
         assert_eq!(
             snapshot.windows[0].pace_status.reason.as_deref(),
             Some("missingReset")
