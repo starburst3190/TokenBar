@@ -1,5 +1,5 @@
 ---
-status: draft
+status: active
 id: kb-plan-provider-quota-pace
 kind: plan
 scope: repository
@@ -17,6 +17,8 @@ sources: ["crates/tb_core_ffi/src/agent_history.rs", "crates/tb_core_ffi/src/age
 [`codex-historical-pace-v2.md`](codex-historical-pace-v2.md) 保留為已落地的 Codex Weekly evaluator 基礎與 migration 證據，但不再代表 provider-wide outcome。這份新計畫取代它作為後續實作與驗收的 active design。
 
 > **核心結果：** pace duration 屬於 quota window，不屬於 provider 特例。任何已顯示、具有 recurring percentage quota 語意的 card，都必須走同一個 duration lifecycle；無法證明 duration 時，UI 必須明示原因，而不是顯示看似真實的 pace。
+>
+> **Implementation checkpoint（2026-07-17）：** Mac Stages 0–6 已在任務分支落地：secure account scope、duration lifecycle、generic v3 history、五個 provider adapters、typed Swift lifecycle／selection／presentation，以及 Rust serializer 鎖定的跨語言 fixture 均已通過各自的 hermetic gate。Stage 7 repository-wide 與人工 live UX gate 尚未結案；Windows port／parity 仍是 pending，本 checkpoint 沒有寫入 Windows repository。
 
 ## 目錄
 
@@ -434,6 +436,21 @@ Stage 0 no longer discovers mappings。It turns every row and every reject rule 
 | 5. Wire and Mac UX | `executor`；`ctb.h`、Swift models、`UsagePace`、settings／quota card views | 加 `paceStatus`、移除 silent fallback、更新 learning／available文案與顏色 | Rust JSON 可由 Swift decode；yellow ahead 僅由真實 evaluator fixture 驅動 |
 | 6. Cross-port handoff | Main session；CrossCheckHarness、canonical docs、fixture artifact | 跑完整 baseline、列出 intended wire delta、準備 Windows DTO／state-machine handoff | 非 pace cases 零回歸；Windows 尚未 port 時明確標為 pending，不改 Windows repo |
 | 7. Integrated verification | Main session，加 fresh `verifier` | 執行 full gates、人工 local UX與 adversarial edge cases | Verifier 回傳 `CONFIRMED`；任何 `REFUTED` 回到 owning stage |
+
+### Stage 6 checkpoint and Windows handoff
+
+Mac-owned [`provider-quota-pace-v3.json`](../../../Fixtures/CrossCheck/provider-quota-pace-v3.json) 由 Rust production serializer test 鎖定，再由 Swift production `AgentUsagePayload`／`UsageWindow` decoder、`UsagePace` 與 `QuotaResolver` 執行。Fixture 包含 7 張 lifecycle windows 與 12 個 projection／selection／legacy／malformed cases；所有資料皆為 `.invalid` synthetic identifiers，不含 credential、account ID、email 或本機 path。
+
+| Surface | Windows port requirement |
+|---|---|
+| DTO | `UsageWindow` 加 required v3 `cardId`／`paceStatus` 與 optional coherent `historicalPace`；整個 `paceStatus` key 缺失才是 internal legacy，present-null／unknown／矛盾資料必須 decode failure |
+| Duration | Pace 只讀 positive `durationSeconds`；`windowMinutes` 只是 `durationSeconds / 60` compatibility output，不能恢復 legacy Linear fallback |
+| Mode policy | Historical 只在 `available` 使用 backend result；`learningHistory` 才可明示 Linear estimate；`learningDuration`／`unavailable`／legacy 無 pace；Off 一律無 marker |
+| Selection | Persisted identity 改為 `clientId|cardId`；舊 label 只有唯一 match 才遷移，ambiguous／stale 回 Auto；duplicate card ID 保留第一張並 fail closed |
+| Presentation | Deficit／yellow gate 必須同時是 Historical basis、`available` 與 deficit stage；Linear 或 learning estimate 不得偽裝成 learned Historical |
+| Cross-check | Windows harness 未來讀同一份 v3 fixture 並與 Mac actual output 對拍；在 DTO、state machine、selection 與 presentation 全部移植前不得宣稱 parity |
+
+`crosscheck-harness` 的 no-selector legacy run 目前可完整產生 42 pace＋74 format cases；74 個非 pace cases 與既有 C# reference 零差異。28 個 legacy pace cases 存在 intended mismatch，來源是 v3 strict decoder、typed lifecycle 與 no-silent-fallback contract；Windows status 明確為 **port/parity pending**。
 
 ### Change budget
 

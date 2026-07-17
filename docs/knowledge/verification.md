@@ -147,7 +147,7 @@ A source reader that consumes secondary files must be verified as one unit. The 
 | Client filter | Non-empty selected IDs reach Rust before mixed buckets are folded; `nil`／empty client lists mean all clients per `ctb.h`; the Swift lens strict-membership check blocks all-hidden views |
 | Arithmetic | Rust report totals, FFI mappers, Swift models, and live-rate consumers use bounded arithmetic where required |
 | Stale-data policy | A failed refresh retains the last good value instead of blanking a working card |
-| Historical pace | Rust 的 optional nested result 同時擁有 expected、ETA、will-last 與 risk；Swift 只能導出 stage／文字，result 缺席時才使用 Linear |
+| Historical pace | Rust 的 typed `paceStatus` 擁有 lifecycle／duration，optional nested result 同時擁有 expected、ETA、will-last 與 risk；Swift 只能導出 mode policy、stage 與文字。只有 `learningHistory` 可明示使用 exact-duration Linear estimate，`learningDuration`／`unavailable`／legacy 不得 silent fallback |
 | Lifecycle | Closing a popover or settings window cancels its tasks and stops background rendering |
 
 ## Cross-port fixture cross-check
@@ -156,14 +156,16 @@ Windows port（[Nanako0129/TokenBar-Windows](https://github.com/Nanako0129/Token
 
 | 項目 | 內容 |
 |---|---|
-| Swift harness | [`Sources/CrossCheckHarness/main.swift`](../../Sources/CrossCheckHarness/main.swift)，`TZ=Asia/Taipei swift run crosscheck-harness <fixtures> <out>`；經 symlink 編入 app target 的 `Format.swift`，測的是 shipping 程式碼 |
-| 契約與 fixture | Windows repo 的 `crosscheck/`（README＝schema 契約；fixture 以 FFI wire 編碼，兩邊都用 production decoder，無自製映射） |
+| Swift harness | [`Sources/CrossCheckHarness/main.swift`](../../Sources/CrossCheckHarness/main.swift)，`TZ=Asia/Taipei swift run crosscheck-harness <fixtures> <out> [usage-pace|format|provider-quota-pace-v3]`；selector 省略時維持 legacy complete run，所有路徑使用 shipping 程式碼 |
+| 契約與 fixture | Windows repo 的 legacy `crosscheck/` 保留既有 116-case reference；provider v3 handoff 由 Mac-owned [`provider-quota-pace-v3.json`](../../Fixtures/CrossCheck/provider-quota-pace-v3.json) 提供，Rust production serializer 鎖定 payload，Swift／未來 Windows 都必須用 production decoder，無自製 wire mapping |
 | 比對 | Windows repo 的 `crosscheck/diff.py`：字串逐 byte、數字 epsilon 1e-9、缺鍵視同 null |
 | 執行時機 | `Sources/TokenBarCore` 邏輯或 `Format` 語意變更後；Windows repo 每次 re-sync 或 delta 移植後 |
 
 > 首輪實績（2026-07-16）：首跑 115 案例抓到 4 條 printf 捨入 seam 的真實漂移——C# 側以 `Math.Round` 預捨入模擬 `%.nf` 會把非 midpoint 的近半值重新量化；printf 對二進位真值做正確捨入。教訓：**模擬 printf 的中介捨入層一律可疑**。修正與後續 comparator 強化（整數精確比對、bool 嚴格比對、Int64 邊界案例——fixture 現為 116 案）都記錄在 Windows repo。
 
 > Historical pace v2 checkpoint（2026-07-16）：116-case legacy baseline 已重跑，非 historical cases 全數一致。27 個 field differences 只分布在 9 個使用舊 top-level historical scalars 的 cases：`historical-expected-clamped`、`historical-runout-exact-half`、`historical-runout-high-keeps-eta`、`historical-runout-low-forces-lasts`、`historical-with-expected`、`runout-risk-certain`、`runout-risk-clamped-above-one`、`runout-risk-half-percent-rounds-up`、`runout-risk-thirty`。這些是 nested contract 取代 scalar contract 的 intended mismatch；Windows 新增 nested fixture／DTO 並完成 semantic port 前，不得宣稱 historical parity。
+>
+> Provider-wide v3 checkpoint（2026-07-17）：no-selector Mac harness 以 production decoder 完整產生 42 pace＋74 format cases，不再因單一 malformed legacy row 中止。Format 74 cases 與現有 C# reference 零差異；pace 有 43 個 field differences，分布在 28／42 cases。差異來自三個 intended contract 變更：整個 `paceStatus` 缺失不再以 `windowMinutes` 恢復 Linear、舊 top-level historical／risk scalars 不再驅動結果，以及 2 個越界百分比 rows 現在明示 `rejected: true`。Mac-owned v3 fixture 另有 7 張 lifecycle windows 與 12 個 projection／selection／legacy／malformed cases，payload 已由 Rust serializer test 鎖定；Windows DTO／state machine／selection／presentation port 完成前，狀態維持 **port/parity pending**。
 
 ## Documentation checks
 

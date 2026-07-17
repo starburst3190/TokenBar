@@ -16,7 +16,7 @@ sources: ["docs/knowledge/current-state.md", "docs/knowledge/vendor-tokscale.md"
 
 | Plan | Status | Scope |
 |---|---|---|
-| [`provider-quota-pace.md`](provider-quota-pace.md) | draft | Pace duration and historical calculation for every recurring provider quota card |
+| [`provider-quota-pace.md`](provider-quota-pace.md) | active | Mac implementation is complete through the Rust-locked cross-port fixture；Stage 7 integration and Windows parity remain pending |
 | [`codex-historical-pace-v2.md`](codex-historical-pace-v2.md) | superseded | Implemented Codex Weekly v2 foundation retained as migration and evaluator evidence |
 | [`tokscale-alignment.md`](tokscale-alignment.md) | active | Rolling selective alignment and correctness order |
 
