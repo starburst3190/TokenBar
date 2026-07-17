@@ -173,7 +173,7 @@ struct SettingsPanel: View {
                         radioGroup(
                             selection: $paceModeRaw,
                             options: PaceMode.allCases.map { ($0.rawValue, "Pace: \($0.rawValue.capitalized)") })
-                        hint("The deficit/reserve marker. Historical learns your weekly usage curve and shows run-out risk, falling back to linear until enough weeks accrue; Linear paces evenly by the clock; Off hides the marker.")
+                        hint("The deficit/reserve marker. Historical learns each quota window's usage pattern; during learning, the Linear estimate is labeled; Linear uses the exact reset duration; Off hides the marker.")
                     }
 
                     if !limitOrdered.isEmpty {

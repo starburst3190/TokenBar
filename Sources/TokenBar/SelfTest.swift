@@ -179,6 +179,60 @@ enum SelfTest {
         expect(learningEstimate?.expectedUsedPercent == 50,
             "learningHistory historical mode uses Linear estimate")
 
+        // Stage 5D UI presentation: typed state copy and mode gates are pure
+        // helper behavior, so these contracts do not depend on SwiftUI layout.
+        for mode in [PaceMode.historical, PaceMode.linear] {
+            expect(
+                AgentLimitsCard.PacePresentation.statusText(
+                    state: .learningDuration, reason: nil, mode: mode)
+                    == "Learning reset duration",
+                "learningDuration copy in \(mode.rawValue) mode")
+            expect(
+                AgentLimitsCard.PacePresentation.statusText(
+                    state: .legacyMissing, reason: nil, mode: mode)
+                    == "Pace unavailable · legacy data",
+                "legacy pace copy in \(mode.rawValue) mode")
+        }
+        expect(
+            AgentLimitsCard.PacePresentation.statusText(
+                state: .learningHistory, reason: nil, mode: .historical)
+                == "Learning history · Linear estimate",
+            "learningHistory uses exact Linear estimate copy")
+        expect(
+            AgentLimitsCard.PacePresentation.statusText(
+                state: .learningHistory, reason: nil, mode: .linear) == "Linear"
+                && AgentLimitsCard.PacePresentation.statusText(
+                    state: .available, reason: nil, mode: .linear) == "Linear",
+            "linear mode labels duration-ready cards")
+
+        let unavailableCopies: [(UsagePaceUnavailableReason, String)] = [
+            (.windowIdentity, "Pace unavailable · unknown quota window"),
+            (.missingReset, "Pace unavailable · missing reset"),
+            (.invalidEvidence, "Pace unavailable · invalid quota data"),
+            (.accountScope, "Pace unavailable · account identity unavailable"),
+            (.storeCapacity, "Pace unavailable · history storage full"),
+            (.history, "Pace unavailable · history unavailable"),
+            (.nonRecurring, "Pace unavailable · non-recurring quota"),
+        ]
+        for (reason, copy) in unavailableCopies {
+            expect(
+                AgentLimitsCard.PacePresentation.statusText(
+                    state: .unavailable, reason: reason, mode: .historical) == copy,
+                "typed unavailable \(reason.rawValue) copy")
+        }
+        expect(
+            AgentLimitsCard.PacePresentation.statusText(
+                state: .available, reason: nil, mode: .historical) == nil,
+            "available has no learning status copy")
+        expect(
+            AgentLimitsCard.PacePresentation.statusText(
+                state: .learningHistory, reason: nil, mode: .off) == nil
+                    && AgentLimitsCard.PacePresentation.statusText(
+                        state: .unavailable, reason: .history, mode: .off) == nil
+                    && AgentLimitsCard.PacePresentation.statusText(
+                        state: .legacyMissing, reason: nil, mode: .off) == nil,
+            "off hides pace status")
+
         expect(UsagePace.compute(window: availableWindow, mode: .off, now: now) == nil,
             "pace mode off")
         let linear = UsagePace.compute(window: availableWindow, mode: .linear, now: now)
@@ -186,6 +240,11 @@ enum SelfTest {
             "linear mode ignores available historical")
         expect(UsagePace.compute(window: availableWindow, now: now)?.basis == .linear,
             "direct pace compute stays linear")
+        expect(
+            AgentLimitsCard.PacePresentation.isHistoricalDeficit(risky)
+                && !AgentLimitsCard.PacePresentation.isHistoricalDeficit(learningEstimate)
+                && !AgentLimitsCard.PacePresentation.isHistoricalDeficit(linear),
+            "UI warning color requires historical-basis deficit")
         let unavailableWindow = v3Window(used: 50, state: .unavailable)
         expect(UsagePace.compute(
             window: unavailableWindow, mode: .historical, now: now) == nil,
