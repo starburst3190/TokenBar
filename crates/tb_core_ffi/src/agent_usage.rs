@@ -914,44 +914,48 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Dat
 
 async fn fetch_claude() -> AgentUsageSnapshot {
     let now = Utc::now();
-    let mut snapshot = if let Some(blocked_until) = claude_gate_blocked_until(now) {
-        claude_gate_fallback(blocked_until, now)
-    } else {
-        match fetch_claude_inner().await {
-            Ok(snapshot) => {
-                claude_gate_record_success(&snapshot);
-                snapshot
-            }
-            Err(error) => {
-                // A 429 inside fetch_claude_inner arms the gate; fall back to the
-                // cached snapshot rather than blanking the card.
-                let now = Utc::now();
-                if let Some(blocked_until) = claude_gate_blocked_until(now) {
-                    claude_gate_fallback(blocked_until, now)
-                } else {
-                    // "unconfigured" == no credential at all, so the UI shows a setup
-                    // prompt; every other error is a real failure of a present credential.
-                    let source = if error.as_str() == CLAUDE_UNCONFIGURED_ERROR {
-                        "unconfigured"
-                    } else {
-                        "oauth"
-                    };
-                    AgentUsageSnapshot {
-                        client_id: "claude".to_string(),
-                        source: source.to_string(),
-                        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                        identity: None,
-                        account_scope: Err(AccountScopeError::NoTrustedEvidence),
-                        windows: Vec::new(),
-                        credits: None,
-                        error: Some(error),
-                    }
-                }
-            }
+    if let Some(blocked_until) = claude_gate_blocked_until(now) {
+        return claude_gate_fallback(blocked_until, now);
+    }
+
+    match fetch_claude_inner().await {
+        Ok(mut snapshot) => {
+            enrich_snapshot(&mut snapshot, now.timestamp());
+            // Cache the display-ready snapshot. A later 429 fallback returns it
+            // without another enrichment pass, so no history write occurs and
+            // the last-good typed pace remains intact.
+            claude_gate_record_success(&snapshot);
+            snapshot
         }
-    };
-    enrich_snapshot(&mut snapshot, now.timestamp());
-    snapshot
+        Err(error) => {
+            // A 429 inside fetch_claude_inner arms the gate; fall back to the
+            // cached, already-enriched snapshot rather than blanking the card.
+            let now = Utc::now();
+            if let Some(blocked_until) = claude_gate_blocked_until(now) {
+                return claude_gate_fallback(blocked_until, now);
+            }
+
+            // "unconfigured" == no credential at all, so the UI shows a setup
+            // prompt; every other error is a real failure of a present credential.
+            let source = if error.as_str() == CLAUDE_UNCONFIGURED_ERROR {
+                "unconfigured"
+            } else {
+                "oauth"
+            };
+            let mut snapshot = AgentUsageSnapshot {
+                client_id: "claude".to_string(),
+                source: source.to_string(),
+                updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                identity: None,
+                account_scope: Err(AccountScopeError::NoTrustedEvidence),
+                windows: Vec::new(),
+                credits: None,
+                error: Some(error),
+            };
+            enrich_snapshot(&mut snapshot, now.timestamp());
+            snapshot
+        }
+    }
 }
 
 async fn fetch_codex_inner() -> Result<AgentUsageSnapshot, String> {
@@ -3321,13 +3325,15 @@ mod tests {
         let later = now + chrono::Duration::seconds(301);
         assert!(claude_gate_blocked_until(later).is_none());
 
-        // Success caches the snapshot; a later OAuth 429 serves the display
-        // rows but drops the stale account scope before generic enrichment.
+        // Success caches the display-ready snapshot; a later OAuth 429 serves
+        // those rows unchanged while dropping the stale account scope. The
+        // fetch path returns this fallback without another enrichment/history
+        // pass, preserving the last-good typed pace.
         let scope = TestRefreshScope::new("claude", "cached-429");
         let account_scope = scope
             .resolve_current("fixture", "cached-429", b"cached-429-marker")
             .unwrap();
-        let snapshot = AgentUsageSnapshot {
+        let mut snapshot = AgentUsageSnapshot {
             client_id: "claude".to_string(),
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -3348,26 +3354,39 @@ mod tests {
             credits: None,
             error: None,
         };
+        snapshot.windows[0].pace_status = PaceStatusPayload {
+            state: PaceState::Available,
+            window_key: Some("session.v1".to_string()),
+            duration_seconds: Some(300 * 60),
+            duration_source: Some(DurationSource::Contract),
+            complete_cycles: 6,
+            reason: None,
+        };
+        snapshot.windows[0].historical_pace = Some(HistoricalPacePayload {
+            expected_used_percent: 35.0,
+            eta_seconds: Some(1_800.0),
+            will_last_to_reset: false,
+            run_out_probability: Some(0.42),
+        });
         claude_gate_record_success(&snapshot);
         assert!(claude_gate_blocked_until(later).is_none());
         claude_gate_record_rate_limit(Some(later + chrono::Duration::seconds(60)), later);
         let until = claude_gate_blocked_until(later).unwrap();
-        let mut fallback = claude_gate_fallback(until, later);
+        let fallback = claude_gate_fallback(until, later);
         assert!(fallback.error.is_none());
         assert_eq!(fallback.windows.len(), 1);
         assert!(matches!(
             &fallback.account_scope,
             Err(AccountScopeError::NoTrustedEvidence)
         ));
-        let calls = std::cell::Cell::new(0);
-        enrich_snapshot_with(&mut fallback, later.timestamp(), |_, _, _| {
-            calls.set(calls.get() + 1);
-            Ok(Vec::new())
-        });
-        assert_eq!(calls.get(), 0);
+        assert_eq!(fallback.windows[0].pace_status.state, PaceState::Available);
+        assert_eq!(fallback.windows[0].pace_status.complete_cycles, 6);
         assert_eq!(
-            fallback.windows[0].pace_status.reason.as_deref(),
-            Some("accountScope")
+            fallback.windows[0]
+                .historical_pace
+                .as_ref()
+                .map(|pace| pace.expected_used_percent),
+            Some(35.0)
         );
 
         // Leave the gate clean for any other test touching the static.
