@@ -14,10 +14,13 @@
 //! names (TokenBar-tokcat/src-tauri/src/*.rs) with the Tauri command plumbing
 //! stripped; keep them diffable against the originals.
 
+mod agent_account_scope;
 mod agent_antigravity;
 mod agent_copilot;
 mod agent_grok;
 mod agent_history;
+mod agent_quota_duration;
+mod agent_quota_history;
 mod agent_usage;
 mod agents_report;
 mod hourly_report;
@@ -395,9 +398,7 @@ pub extern "C" fn tb_agent_usage() -> *mut c_char {
         // the providers that already succeeded — and could cut off the legitimate
         // expired-token path (sequential refresh + fetch, up to ~60s).
         let payload = RUNTIME.block_on(agent_usage::run());
-        envelope(
-            serde_json::to_value(payload).map_err(|e| format!("serialize agent usage: {}", e)),
-        )
+        envelope(serde_json::to_value(payload).map_err(|e| format!("serialize agent usage: {}", e)))
     })
 }
 
