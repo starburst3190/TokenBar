@@ -197,8 +197,7 @@ private struct MenuBarMock: View {
         let selection = QuotaSelectionPolicy.effectiveSelection(
             payload: agentUsage,
             persistedSelection: quotaSource,
-            excluding: excluded,
-            fallbackUnknownExplicit: source.fallsBackUnknownQuotaSelectionToAuto)
+            excluding: excluded)
         if let value = QuotaResolver.resolve(
             payload: agentUsage, selection: selection, excluding: excluded)?
             .window.remainingPercent

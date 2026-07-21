@@ -1,37 +1,37 @@
 import TokenBarCore
 
-/// Shared quota-selection policy for the tray and Settings preview. Live mode
-/// preserves an explicit persisted selection exactly; demo mode may locally
-/// substitute Auto when a dynamic provider label is absent from its fixture.
+/// Shared quota-selection policy for the tray and Settings preview. Both live
+/// and demo callers use the same payload-aware canonical migration.
 enum QuotaSelectionPolicy {
     static func effectiveSelection(
         payload: AgentUsagePayload?,
         persistedSelection: String,
-        excluding: Set<String>,
-        fallbackUnknownExplicit: Bool
+        excluding: Set<String>
     ) -> String {
-        guard fallbackUnknownExplicit,
-              !persistedSelection.isEmpty,
-              persistedSelection != QuotaResolver.auto,
-              QuotaResolver.resolve(
-                  payload: payload, selection: persistedSelection, excluding: excluding) == nil
-        else {
-            return persistedSelection
-        }
-        return QuotaResolver.auto
+        QuotaResolver.canonicalSelection(payload: payload, selection: persistedSelection)
+    }
+
+    /// Returns a stable card-id selection only when the current payload proves
+    /// that a persisted pre-v3 label has one unambiguous migration target.
+    static func migrationToPersist(
+        payload: AgentUsagePayload?,
+        persistedSelection: String
+    ) -> String? {
+        let canonical = QuotaResolver.canonicalSelection(
+            payload: payload, selection: persistedSelection)
+        guard canonical != QuotaResolver.auto, canonical != persistedSelection else { return nil }
+        return canonical
     }
 
     static func resolve(
         payload: AgentUsagePayload?,
         persistedSelection: String,
-        excluding: Set<String>,
-        fallbackUnknownExplicit: Bool
+        excluding: Set<String>
     ) -> (clientId: String, window: UsageWindow)? {
         let selection = effectiveSelection(
             payload: payload,
             persistedSelection: persistedSelection,
-            excluding: excluding,
-            fallbackUnknownExplicit: fallbackUnknownExplicit)
+            excluding: excluding)
         return QuotaResolver.resolve(
             payload: payload, selection: selection, excluding: excluding)
     }

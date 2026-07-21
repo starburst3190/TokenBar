@@ -745,7 +745,7 @@ fn interpolate(curve: &[f64], u: f64) -> f64 {
     }
 }
 
-fn weighted_median(values: &[f64], weights: &[f64]) -> f64 {
+pub(crate) fn weighted_median(values: &[f64], weights: &[f64]) -> f64 {
     if values.len() != weights.len() || values.is_empty() {
         return 0.0;
     }

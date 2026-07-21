@@ -113,7 +113,7 @@ enum Smoke {
                 if let error = snapshot.error {
                     return "\(snapshot.clientId)=error(\(error))"
                 }
-                return "\(snapshot.clientId)=\(snapshot.windows.count) windows"
+                return "\(snapshot.clientId)=\(snapshot.uniqueCardWindows.count) windows"
             }
             let subs = usage.opencodeSubscriptions ?? []
             return cards.joined(separator: ", ")

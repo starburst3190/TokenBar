@@ -4,7 +4,7 @@ id: kb-vendor-tokscale
 kind: canonical
 scope: repository
 read_when: assessing upstream commits, re-vendoring, changing parser output, or updating the vendor ledger
-last_verified: 2026-07-16
+last_verified: 2026-07-19
 sources: ["vendor/README.md", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public issue #45"]
 ---
 
@@ -63,16 +63,16 @@ flowchart TD
 
 | Family | Contract |
 |---|---|
-| Streaming reports | `scan_messages_streaming`, per-client dedup sets, `StreamingAggregator`, `SessionizeAccumulator`, and Agents report parity remain local seams |
-| Cache | Fingerprints, mtime probes, sibling dependencies, pruning exceptions, schema decisions, and cached attribution rebuilds are local until upstream has the same architecture |
+| Streaming reports | `scan_messages_streaming`, per-client dedup sets, cross-source authority selectors, `StreamingAggregator`, `SessionizeAccumulator`, and Agents report parity remain local seams |
+| Cache | Fingerprints, mtime probes, topology-sensitive in-process report tokens, sibling dependencies, pruning exceptions, schema decisions, and cached attribution rebuilds are local until upstream has the same architecture |
 | Pricing | Cache-rate backfill and refreshable pricing are local behavior; upstream cost-provenance ports must not erase them |
 | FFI | Report client slices, hourly/Agents filtering, bounded totals, and thin mappers are TokenBar-specific consumers |
 | Discovery | Cowork, local client lanes, and platform-specific scanner roots may be local even when the parser originates upstream |
-| Defensive fixes | Saturating folds, placeholder-row removal, trace-scoped identity, and malformed-input handling require their own regression evidence |
+| Defensive fixes | Saturating folds, placeholder-row removal, trace-scoped identity, malformed-input handling, and bounded Windows atomic-replacement retries require their own regression evidence |
 
 ## Schema and parser output
 
-The vendor owns its cache-schema counter. It is currently schema 29 after the Codex non-overlapping-duration parser change and incremental cursor addition. Do not mirror an upstream schema number merely because the same upstream commit is being ported. Bump the local schema when serialized message fields, parser output, dedup keys, attribution, or parser-resume state changes make old cached values semantically stale; do not bump for report-time-only arithmetic changes.
+The vendor owns its cache-schema counter. It is schema **32** after the Grok Build `turn_completed.usage` primary path (parser output for existing Grok sources changes under the same fingerprint, so schema-31 context-only rows must rebuild). Historical trail: M20 advanced 29 → 30 for OpenCode v2 hybrid databases, M15-B kept 30 for a new Kiro source, M16 advanced 30 → 31 because existing Codex, Claude, Copilot, Jcode, provider, and Antigravity outputs changed under unchanged source fingerprints, M19-A kept 31 because bounded Windows atomic replacement changes only write transport, and M17 kept 31 because its independently fingerprinted unified source selects authority after raw cache retrieval without changing legacy serialized output. M18 also kept 31: routed and long-context pricing is applied only after raw source-message cache retrieval, so model IDs, fingerprints, parser output, and serialized layout remain unchanged. M21/M25 kept 31 for new clients and post-cache grouping aliases. Do not mirror an upstream schema number merely because the same upstream commit is being ported. Bump the local schema when serialized message fields, parser output, dedup keys, attribution, or parser-resume state changes make old cached values semantically stale; do not bump for a new independently fingerprinted source, post-cache pricing/report arithmetic, or filesystem retry changes.
 
 A parser-output change must include a same-fingerprint stale-cache regression. A test that only parses a fresh source does not prove that existing users receive the correction.
 

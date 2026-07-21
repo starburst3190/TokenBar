@@ -82,126 +82,364 @@ enum SelfTest {
         let s3 = Streaks.compute(perDayMap: [:], rangeStart: "2026-06-10", rangeEnd: "2026-06-01")
         expect(s3.longest == 0 && s3.current == 0, "inverted range is empty")
 
-        // UsagePace: expected-vs-actual classification, ETA projection, modes.
-        // Fixture: 60-minute window, 30 minutes elapsed (linear expected 50%).
+        // UsagePace: explicit v3 state fixtures, exact duration timing, and
+        // mode/basis policy. No pace assertion uses the legacy constructor.
         let now = Date(timeIntervalSince1970: 1_750_000_000)
-        func window(
-            used: Double, minutes: Int64 = 60, untilReset: TimeInterval = 1800,
-            historicalPace: HistoricalPace? = nil
+        func v3Window(
+            used: Double,
+            durationSeconds: Int64 = 3_600,
+            untilReset: TimeInterval = 1_800,
+            state: UsagePaceState = .learningHistory,
+            historicalPace: HistoricalPace? = nil,
+            windowMinutes: Int64? = nil
         ) -> UsageWindow {
-            UsageWindow(
+            let duration: Int64? = state == .learningDuration || state == .unavailable
+                ? nil : durationSeconds
+            let durationSource: UsagePaceDurationSource? = duration == nil
+                ? (state == .learningDuration ? .observed : nil) : .contract
+            let status = PaceStatus(
+                state: state, windowKey: "session.v3", durationSeconds: duration,
+                durationSource: durationSource,
+                completeCycles: state == .available ? 5 : 0,
+                reason: state == .unavailable ? .nonRecurring : nil)
+            return UsageWindow(
                 label: "Session", usedPercent: used, remainingPercent: 100 - used,
                 resetsAt: ISO8601DateFormatter().string(from: now.addingTimeInterval(untilReset)),
-                windowMinutes: minutes, historicalPace: historicalPace)
+                windowMinutes: windowMinutes ?? duration.map { $0 / 60 },
+                historicalPace: historicalPace,
+                cardId: "session.v3", durationSeconds: duration, paceStatus: status)
         }
-        let onPace = UsagePace.compute(window: window(used: 50), now: now)
-        expect(onPace?.stage == .onTrack && onPace?.label == "On pace", "pace on track at 50%/50%")
-        let ahead = UsagePace.compute(window: window(used: 80), now: now)
-        expect(ahead?.stage == .farAhead && ahead?.label == "30% in deficit", "pace far ahead label")
+
+        let onPace = UsagePace.compute(window: v3Window(used: 50), now: now)
+        expect(onPace?.stage == .onTrack && onPace?.basis == .linear
+            && onPace?.label == "On pace", "pace on track at 50%/50%")
+        let ahead = UsagePace.compute(window: v3Window(used: 80), now: now)
+        expect(ahead?.stage == .farAhead && ahead?.label == "30% in deficit"
+            && ahead?.basis == .linear, "pace far ahead label")
         // 80% in 30min → 100% in 37.5min, before the 30min reset → ETA 7.5min.
         expect(ahead?.willLastToReset == false && abs((ahead?.etaSeconds ?? 0) - 450) < 1, "pace eta 450s")
         expect(ahead?.etaText == "Projected empty in 8m", "pace eta text")
-        let reserve = UsagePace.compute(window: window(used: 40), now: now)
+        let reserve = UsagePace.compute(window: v3Window(used: 40), now: now)
         expect(reserve?.stage == .behind && reserve?.label == "10% in reserve", "pace reserve label")
         expect(reserve?.willLastToReset == true && reserve?.etaText == "Lasts until reset", "slow burn lasts")
-        expect(UsagePace.compute(window: window(used: 50, minutes: 0), now: now) == nil, "no window length, no pace")
-        expect(UsagePace.compute(window: window(used: 50, untilReset: -10), now: now) == nil, "past reset, no pace")
-        // Modes: off → nil; a missing/null historical result falls back to
-        // linear; nested historical values replace only expected/stage/delta
-        // while ETA and lasts-to-reset remain backend-owned.
-        expect(UsagePace.compute(window: window(used: 50), mode: .off, now: now) == nil, "pace mode off")
+        let learningDurationWindow = v3Window(used: 50, state: .learningDuration)
+        expect(UsagePace.compute(window: learningDurationWindow, now: now) == nil,
+            "learning duration has no pace")
+        expect(UsagePace.compute(
+            window: learningDurationWindow, mode: .historical, now: now) == nil,
+            "historical learningDuration has no pace")
+        expect(UsagePace.compute(
+            window: learningDurationWindow, mode: .linear, now: now) == nil,
+            "linear learningDuration has no pace")
+        expect(UsagePace.compute(window: v3Window(used: 50, untilReset: -10), now: now) == nil,
+            "past reset, no pace")
+        expect(UsagePace.compute(window: v3Window(used: 50, untilReset: 3_600), now: now) == nil,
+            "elapsed-zero positive usage has no pace")
+
+        // A non-minute duration proves timing uses exact v3 seconds rather than
+        // the compatibility windowMinutes field.
+        let exactDuration = UsagePace.compute(
+            window: v3Window(used: 50, durationSeconds: 3_601, untilReset: 1_800), now: now)
+        let exactExpected = (Double(3_601 - 1_800) / Double(3_601)) * 100
+        expect(exactDuration?.expectedUsedPercent == exactExpected
+            && exactDuration?.expectedUsedPercent != 50,
+            "pace uses exact duration seconds")
+
         let historicalLasts = HistoricalPace(
             expectedUsedPercent: 80, etaSeconds: nil,
             willLastToReset: true, runOutProbability: nil)
+        let availableWindow = v3Window(
+            used: 50, state: .available, historicalPace: historicalLasts)
         let hist = UsagePace.compute(
-            window: window(used: 50, historicalPace: historicalLasts), mode: .historical, now: now)
-        expect(hist?.expectedUsedPercent == 80 && hist?.stage == .farBehind, "historical expected override")
-        expect(hist?.willLastToReset == true && hist?.etaSeconds == nil, "historical lasts result is trusted")
-        let risky = UsagePace.compute(
-            window: window(
-                used: 90,
-                historicalPace: HistoricalPace(
-                    expectedUsedPercent: 50, etaSeconds: 120,
-                    willLastToReset: false, runOutProbability: 0.8)),
-            mode: .historical, now: now)
-        expect(
-            risky?.willLastToReset == false && risky?.etaSeconds == 120,
-            "historical projected empty trusts backend eta")
+            window: availableWindow, mode: .historical, now: now)
+        expect(hist?.expectedUsedPercent == 80 && hist?.stage == .farBehind
+            && hist?.basis == .historical, "historical available uses backend expected")
+        expect(hist?.willLastToReset == true && hist?.etaSeconds == nil,
+            "historical lasts result is trusted")
+        expect(hist?.isHistoricalDeficit == false, "historical reserve is not a deficit")
+
+        let riskyWindow = v3Window(
+            used: 90, state: .available,
+            historicalPace: HistoricalPace(
+                expectedUsedPercent: 50, etaSeconds: 120,
+                willLastToReset: false, runOutProbability: 0.8))
+        let risky = UsagePace.compute(window: riskyWindow, mode: .historical, now: now)
+        expect(risky?.willLastToReset == false && risky?.etaSeconds == 120
+            && risky?.basis == .historical && risky?.isHistoricalDeficit == true,
+            "historical projected empty trusts backend eta and deficit gate")
         expect(risky?.etaText == "Projected empty in 2m", "historical projected empty text")
-        let fallback = UsagePace.compute(window: window(used: 50), mode: .historical, now: now)
-        expect(fallback?.expectedUsedPercent == 50, "missing historical result falls back to linear")
-        let linear = UsagePace.compute(
-            window: window(used: 50, historicalPace: historicalLasts), mode: .linear, now: now)
-        expect(linear?.expectedUsedPercent == 50, "linear mode ignores historical")
+
+        let learningHistoryWindow = v3Window(used: 80, state: .learningHistory)
+        let learningEstimate = UsagePace.compute(
+            window: learningHistoryWindow, mode: .historical, now: now)
+        expect(learningEstimate?.basis == .linear
+            && learningEstimate?.stage.isDeficit == true
+            && learningEstimate?.isHistoricalDeficit == false,
+            "historical learningHistory is identifiable Linear estimate")
+        expect(learningEstimate?.expectedUsedPercent == 50,
+            "learningHistory historical mode uses Linear estimate")
+
+        // Stage 5D UI presentation: typed state copy and mode gates are pure
+        // helper behavior, so these contracts do not depend on SwiftUI layout.
+        for mode in [PaceMode.historical, PaceMode.linear] {
+            expect(
+                AgentLimitsCard.PacePresentation.statusText(
+                    state: .learningDuration, reason: nil, mode: mode)
+                    == "Learning reset duration",
+                "learningDuration copy in \(mode.rawValue) mode")
+            expect(
+                AgentLimitsCard.PacePresentation.statusText(
+                    state: .legacyMissing, reason: nil, mode: mode)
+                    == "Pace unavailable · legacy data",
+                "legacy pace copy in \(mode.rawValue) mode")
+        }
         expect(
-            UsagePace.compute(window: window(used: 50, historicalPace: historicalLasts), now: now)?
-                .expectedUsedPercent == 50,
+            AgentLimitsCard.PacePresentation.statusText(
+                state: .learningHistory, reason: nil, mode: .historical)
+                == "Learning history · Linear estimate",
+            "learningHistory uses exact Linear estimate copy")
+        expect(
+            AgentLimitsCard.PacePresentation.statusText(
+                state: .learningHistory, reason: nil, mode: .linear) == "Linear"
+                && AgentLimitsCard.PacePresentation.statusText(
+                    state: .available, reason: nil, mode: .linear) == "Linear",
+            "linear mode labels duration-ready cards")
+
+        let unavailableCopies: [(UsagePaceUnavailableReason, String)] = [
+            (.windowIdentity, "Pace unavailable · unknown quota window"),
+            (.missingReset, "Pace unavailable · missing reset"),
+            (.invalidEvidence, "Pace unavailable · invalid quota data"),
+            (.accountScope, "Pace unavailable · account identity unavailable"),
+            (.storeCapacity, "Pace unavailable · history storage full"),
+            (.history, "Pace unavailable · history unavailable"),
+            (.nonRecurring, "Pace unavailable · non-recurring quota"),
+        ]
+        for (reason, copy) in unavailableCopies {
+            expect(
+                AgentLimitsCard.PacePresentation.statusText(
+                    state: .unavailable, reason: reason, mode: .historical) == copy,
+                "typed unavailable \(reason.rawValue) copy")
+        }
+        expect(
+            AgentLimitsCard.PacePresentation.statusText(
+                state: .available, reason: nil, mode: .historical) == nil,
+            "available has no learning status copy")
+        expect(
+            AgentLimitsCard.PacePresentation.statusText(
+                state: .learningHistory, reason: nil, mode: .off) == nil
+                    && AgentLimitsCard.PacePresentation.statusText(
+                        state: .unavailable, reason: .history, mode: .off) == nil
+                    && AgentLimitsCard.PacePresentation.statusText(
+                        state: .legacyMissing, reason: nil, mode: .off) == nil,
+            "off hides pace status")
+
+        expect(UsagePace.compute(window: availableWindow, mode: .off, now: now) == nil,
+            "pace mode off")
+        let linear = UsagePace.compute(window: availableWindow, mode: .linear, now: now)
+        expect(linear?.expectedUsedPercent == 50 && linear?.basis == .linear,
+            "linear mode ignores available historical")
+        expect(UsagePace.compute(window: availableWindow, now: now)?.basis == .linear,
             "direct pace compute stays linear")
-        expect(runOutRiskLabel(window: window(used: 50)) == nil, "missing historical risk is nil")
-        let lastingRisk = HistoricalPace(
-            expectedUsedPercent: 80, etaSeconds: nil,
-            willLastToReset: true, runOutProbability: 0.2)
-        let lastingRiskWindow = window(used: 50, historicalPace: lastingRisk)
+        expect(
+            AgentLimitsCard.PacePresentation.isHistoricalDeficit(risky)
+                && !AgentLimitsCard.PacePresentation.isHistoricalDeficit(learningEstimate)
+                && !AgentLimitsCard.PacePresentation.isHistoricalDeficit(linear),
+            "UI warning color requires historical-basis deficit")
+        let unavailableWindow = v3Window(used: 50, state: .unavailable)
+        expect(UsagePace.compute(
+            window: unavailableWindow, mode: .historical, now: now) == nil,
+            "historical unavailable has no silent Linear fallback")
+        expect(UsagePace.compute(
+            window: unavailableWindow, mode: .linear, now: now) == nil,
+            "linear unavailable has no pace")
+
+        // Stage 0 old-fail/new-pass baseline: legacy windowMinutes cannot
+        // restore pace when the typed paceStatus key is absent.
+        let legacyWindow = try? JSONDecoder().decode(
+            UsageWindow.self,
+            from: Data(#"{"label":"Weekly","usedPercent":80,"remainingPercent":20,"windowMinutes":60}"#.utf8))
+        expect(legacyWindow.flatMap {
+            UsagePace.compute(window: $0, mode: .historical, now: now)
+        } == nil, "stage0 legacy payload has no silent historical Linear fallback")
+        expect(legacyWindow.flatMap {
+            UsagePace.compute(window: $0, now: now)
+        } == nil, "legacy windowMinutes cannot revive direct pace")
+
+        let lastingRiskWindow = v3Window(
+            used: 50, state: .available,
+            historicalPace: HistoricalPace(
+                expectedUsedPercent: 80, etaSeconds: nil,
+                willLastToReset: true, runOutProbability: 0.2))
         let lastingRiskPace = UsagePace.compute(
             window: lastingRiskWindow, mode: .historical, now: now)!
         let lastingRiskPresentation = UsagePace.presentation(
             window: lastingRiskWindow, mode: .historical, pace: lastingRiskPace)
-        expect(
-            lastingRiskPace.etaText == "Lasts until reset" &&
-                lastingRiskPresentation.etaText == nil &&
-                lastingRiskPresentation.riskText == "≈ 20% run-out risk",
-            "visible historical risk suppresses lasts text")
-        let lastingNoRiskPresentation = UsagePace.presentation(
-            window: window(used: 50, historicalPace: historicalLasts),
-            mode: .historical, pace: hist!)
-        expect(
-            lastingNoRiskPresentation.etaText == "Lasts until reset" &&
-                lastingNoRiskPresentation.riskText == nil,
-            "historical lasting without risk keeps lasts text")
-        let exhaustedWindow = window(
-            used: 100,
+        expect(lastingRiskPresentation.etaText == nil
+            && lastingRiskPresentation.riskText == "≈ 20% run-out risk",
+            "historical available risk suppresses lasts text")
+        expect(runOutRiskLabel(window: riskyWindow) == "≈ 80% run-out risk",
+            "risk belongs to historical available")
+        expect(runOutRiskLabel(window: riskyWindow, pace: linear) == nil,
+            "Linear basis cannot display nested risk")
+        expect(UsagePace.presentation(
+            window: riskyWindow, mode: .linear, pace: linear!).riskText == nil,
+            "linear presentation cannot display nested risk")
+        expect(UsagePace.presentation(
+            window: learningHistoryWindow, mode: .historical, pace: learningEstimate!).riskText == nil,
+            "learningHistory Linear estimate cannot display nested risk")
+        expect(runOutRiskLabel(window: v3Window(used: 50, state: .learningHistory)) == nil,
+            "learningHistory has no historical risk")
+
+        let exhaustedWindow = v3Window(
+            used: 100, state: .available,
             historicalPace: HistoricalPace(
                 expectedUsedPercent: 80, etaSeconds: 0,
                 willLastToReset: false, runOutProbability: 1))
         let exhausted = UsagePace.compute(
             window: exhaustedWindow, mode: .historical, now: now)
-        expect(
-            exhausted?.etaSeconds == 0 && exhausted?.willLastToReset == false &&
-                exhausted?.etaText == "Projected empty now" &&
-                runOutRiskLabel(window: exhaustedWindow) == "≈ 100% run-out risk",
+        expect(exhausted?.etaSeconds == 0 && exhausted?.willLastToReset == false
+            && exhausted?.etaText == "Projected empty now"
+            && runOutRiskLabel(window: exhaustedWindow) == "≈ 100% run-out risk",
             "historical exhausted result is coherent")
         expect(UsagePace.durationText(130 * 60) == "2h 10m", "duration text h m")
         expect(UsagePace.durationText(26 * 3600) == "1d 2h", "duration text d h")
 
-        // Production decoder shape: nested result decodes as one object;
-        // missing/null historicalPace stays nil, and legacy top-level scalar
-        // fields are ignored rather than becoming a second source of truth.
-        let nestedWindowJSON = """
-        {"label":"Weekly","usedPercent":50,"remainingPercent":50,
-         "resetsAt":"2025-05-15T01:13:20Z","windowMinutes":60,
-         "historicalPace":{"expectedUsedPercent":80,"etaSeconds":120,
-         "willLastToReset":false,"runOutProbability":0.8}}
+        // Stage 5A production decoder: v3 pace states are typed and strict;
+        // only an entirely missing paceStatus key takes the internal legacy path.
+        func decodeWindow(_ json: String) -> UsageWindow? {
+            try? JSONDecoder().decode(UsageWindow.self, from: Data(json.utf8))
+        }
+        let learningDurationJSON = """
+        {"cardId":"session.v1","label":"Session","usedPercent":20,"remainingPercent":80,
+         "resetsAt":"2026-07-17T05:00:00Z",
+         "paceStatus":{"state":"learningDuration","windowKey":"session.v1",
+         "durationSource":"observed","completeCycles":0}}
         """
-        let nestedDecoded = try! JSONDecoder().decode(
-            UsageWindow.self, from: Data(nestedWindowJSON.utf8))
+        let learningHistoryJSON = """
+        {"cardId":"weekly.v1","label":"Weekly","usedPercent":35,"remainingPercent":65,
+         "resetsAt":"2026-07-24T00:00:00Z","windowMinutes":300,
+         "paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+         "durationSeconds":18000,"durationSource":"contract","completeCycles":2}}
+        """
+        let availableJSON = """
+        {"cardId":"daily.v1","label":"Daily","usedPercent":60,"remainingPercent":40,
+         "resetsAt":"2026-07-24T00:00:00Z","windowMinutes":300,
+         "paceStatus":{"state":"available","windowKey":"daily.v1",
+         "durationSeconds":18000,"durationSource":"contract","completeCycles":4},
+         "historicalPace":{"expectedUsedPercent":55,"etaSeconds":900,
+         "willLastToReset":false,"runOutProbability":0.25}}
+        """
+        let unavailableJSON = """
+        {"cardId":"extra_usage.v1","label":"Extra usage","usedPercent":70,"remainingPercent":30,
+         "paceStatus":{"state":"unavailable","windowKey":"extra_usage.v1",
+         "completeCycles":0,"reason":"nonRecurring"}}
+        """
+        let learningDuration = decodeWindow(learningDurationJSON)
+        let learningHistory = decodeWindow(learningHistoryJSON)
+        let available = decodeWindow(availableJSON)
+        let unavailable = decodeWindow(unavailableJSON)
         expect(
-            nestedDecoded.historicalPace?.expectedUsedPercent == 80 &&
-                nestedDecoded.historicalPace?.etaSeconds == 120 &&
-                nestedDecoded.historicalPace?.willLastToReset == false &&
-                nestedDecoded.historicalPace?.runOutProbability == 0.8,
-            "nested historical pace decodes")
-        let missingDecoded = try! JSONDecoder().decode(
-            UsageWindow.self,
-            from: Data("{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50}".utf8))
-        let nullDecoded = try! JSONDecoder().decode(
-            UsageWindow.self,
-            from: Data("{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50,\"historicalPace\":null}".utf8))
-        let legacyDecoded = try! JSONDecoder().decode(
-            UsageWindow.self,
-            from: Data("{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50,\"historicalExpectedPercent\":80,\"runOutProbability\":0.8}".utf8))
-        expect(missingDecoded.historicalPace == nil, "missing historical pace decodes as nil")
-        expect(nullDecoded.historicalPace == nil, "null historical pace decodes as nil")
-        expect(legacyDecoded.historicalPace == nil, "legacy scalar fields are not a fallback")
+            learningDuration?.paceStatus.state == UsagePaceState.learningDuration &&
+                learningDuration?.durationSeconds == nil &&
+                learningDuration?.paceStatus.durationSource == .observed,
+            "v3 learningDuration decodes with observed source")
+        expect(
+            learningHistory?.paceStatus.state == UsagePaceState.learningHistory &&
+                learningHistory?.durationSeconds == 18_000 &&
+                learningHistory?.historicalPace == nil,
+            "v3 learningHistory decodes with exact duration")
+        expect(
+            available?.paceStatus.state == UsagePaceState.available &&
+                available?.durationSeconds == 18_000 &&
+                available?.historicalPace?.expectedUsedPercent == 55,
+            "v3 available decodes with historical result")
+        expect(
+            unavailable?.paceStatus.state == UsagePaceState.unavailable &&
+                unavailable?.paceStatus.reason == .nonRecurring &&
+                unavailable?.durationSeconds == nil,
+            "v3 unavailable decodes with typed reason")
+
+        let legacyDecoded = decodeWindow(
+            "{\"label\":\"Weekly\",\"usedPercent\":50,\"remainingPercent\":50,\"windowMinutes\":60}")
+        expect(
+            legacyDecoded?.paceStatus.state == UsagePaceState.legacyMissing &&
+                legacyDecoded?.cardId == "legacy.missing.v1" &&
+                legacyDecoded?.durationSeconds == nil && legacyDecoded?.windowMinutes == 60,
+            "missing whole paceStatus uses fixed legacy identity without duration inference")
+
+        let invalidFixtures: [(String, String)] = [
+            ("present null paceStatus", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":null}
+             """),
+            ("unknown state", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"futureState","windowKey":"weekly.v1","completeCycles":0}}
+             """),
+            ("unknown source", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"calendar","completeCycles":0}}
+             """),
+            ("unknown reason", """
+             {"cardId":"extra_usage.v1","label":"Extra usage","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"unavailable","windowKey":"extra_usage.v1",
+              "completeCycles":0,"reason":"unsupported"}}
+             """),
+            ("missing cardId", """
+             {"label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"learningDuration","windowKey":"weekly.v1","completeCycles":0}}
+             """),
+            ("contradictory percentages", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":80,"remainingPercent":80,
+              "paceStatus":{"state":"learningDuration","windowKey":"weekly.v1","completeCycles":0}}
+             """),
+            ("available without historicalPace", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "windowMinutes":300,"paceStatus":{"state":"available","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"contract","completeCycles":0}}
+             """),
+            ("learningHistory with historicalPace", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "windowMinutes":300,"paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"contract","completeCycles":0},
+              "historicalPace":{"expectedUsedPercent":50,"willLastToReset":true}}
+             """),
+            ("windowKey and reason contradiction", """
+             {"cardId":"unknown.v1","label":"Unknown","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"unavailable","windowKey":null,"completeCycles":0,
+              "reason":"accountScope"}}
+             """),
+            ("duration and windowMinutes contradiction", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "windowMinutes":301,"paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"contract","completeCycles":0}}
+             """),
+            ("duration without derived windowMinutes", """
+             {"cardId":"weekly.v1","label":"Weekly","usedPercent":50,"remainingPercent":50,
+              "paceStatus":{"state":"learningHistory","windowKey":"weekly.v1",
+              "durationSeconds":18000,"durationSource":"contract","completeCycles":0}}
+             """),
+        ]
+        for (label, json) in invalidFixtures {
+            expect(decodeWindow(json) == nil, "v3 rejects \(label)")
+        }
+
+        let productionPayloadJSON = """
+        {"generatedAt":"2026-07-17T00:00:00Z","agents":[
+          {"clientId":"codex","source":"oauth","updatedAt":"2026-07-17T00:00:00Z",
+           "identity":{"email":"fixture@example.invalid","plan":"plus"},
+           "windows":[\(learningDurationJSON),\(learningHistoryJSON),\(availableJSON),\(unavailableJSON)],
+           "credits":{"remaining":12.5,"unlimited":false},"error":null}
+        ],"opencodeSubscriptions":["Codex"]}
+        """
+        let productionPayload = try? JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data(productionPayloadJSON.utf8))
+        expect(
+            productionPayload?.agents.count == 1 &&
+                productionPayload?.agents.first?.windows.count == 4 &&
+                productionPayload?.agents.first?.windows[2].paceStatus.state == .available,
+            "complete AgentUsagePayload v3 shape decodes")
 
         // Contribution grid: GitHub layout, col 0 row 0 = Sunday on/before
         // Jan 1; out-of-year cells are never active; max tracks active only.
@@ -271,6 +509,9 @@ enum SelfTest {
         expect(ClientRegistry.canonicalClient("antigravity-cli") == "antigravity-cli", "canonical preserves registered antigravity-cli")
         expect(ClientRegistry.canonicalClient("droid-cli") == "droid-cli", "canonical does NOT strip a generic -cli")
         expect(ClientRegistry.canonicalClient("claude") == "claude", "canonical short id passes through")
+        expect(ClientRegistry.style("kimi").displayName == "Kimi", "Kimi registry covers CLI and Code")
+        expect(ClientRegistry.style("junie").displayName == "Junie", "Junie registry metadata")
+        expect(ClientRegistry.style("opencodereview").displayName == "OpenCodeReview", "OpenCodeReview registry metadata")
         // AgentLimitsCard keeps its own generic "-cli" fold for quota-card
         // attribution: explicit aliases via the registry, then a local strip so
         // antigravity-cli shares the antigravity quota snapshot — this fold must
@@ -278,19 +519,20 @@ enum SelfTest {
         expect(AgentLimitsCard.normalizeTraceClient("codex-cli") == "codex", "limits wrapper applies explicit alias")
         expect(AgentLimitsCard.normalizeTraceClient("antigravity-cli") == "antigravity", "limits wrapper folds generic -cli for quota attribution")
 
-        // Quota resolver: auto picks the tightest window across agents,
-        // erroring agents are skipped, explicit selections parse. The payload
-        // builds via JSON (the snapshot types have no memberwise inits).
+        // Quota resolver: card IDs are explicit and missing paceStatus remains
+        // a valid legacy fixture. Selection tests intentionally read only
+        // identity and percentage fields.
         let quotaJSON = """
         {"generatedAt":"now","agents":[
           {"clientId":"codex","source":"oauth","updatedAt":"now",
-           "windows":[{"label":"Session","usedPercent":20,"remainingPercent":80},
-                      {"label":"Weekly","usedPercent":65,"remainingPercent":35}]},
+           "windows":[{"cardId":"session.v1","label":"Session","usedPercent":20,"remainingPercent":80},
+                      {"cardId":"weekly.v1","label":"Weekly","usedPercent":65,"remainingPercent":35},
+                      {"cardId":"model.gpt|preview.v1","label":"Delimiter","usedPercent":5,"remainingPercent":95}]},
           {"clientId":"claude","source":"oauth","updatedAt":"now",
-           "windows":[{"label":"Session","usedPercent":88,"remainingPercent":12},
-                      {"label":"Weekly","usedPercent":10,"remainingPercent":90}]},
+           "windows":[{"cardId":"session.v1","label":"Session","usedPercent":88,"remainingPercent":12},
+                      {"cardId":"weekly.v1","label":"Weekly","usedPercent":10,"remainingPercent":90}]},
           {"clientId":"broken","source":"oauth","updatedAt":"now",
-           "windows":[{"label":"Session","usedPercent":99,"remainingPercent":1}],
+           "windows":[{"cardId":"session.v1","label":"Session","usedPercent":99,"remainingPercent":1}],
            "error":"401"}
         ]}
         """
@@ -298,26 +540,120 @@ enum SelfTest {
             AgentUsagePayload.self, from: Data(quotaJSON.utf8))
         let tightest = QuotaResolver.resolve(payload: quotaPayload, selection: "auto")
         expect(
-            tightest?.clientId == "claude" && tightest?.window.label == "Session",
-            "auto resolves the tightest healthy window")
+            tightest?.clientId == "claude" && tightest?.window.cardId == "session.v1",
+            "auto resolves the tightest healthy card")
         expect(
-            QuotaResolver.resolve(payload: quotaPayload, selection: "codex|Weekly")?
-                .window.remainingPercent == 35,
-            "explicit quota selection resolves")
+            QuotaResolver.selection(clientId: "codex", cardId: "weekly.v1") == "codex|weekly.v1",
+            "canonical selection stores cardId")
+        let delimiterSelection = QuotaResolver.selection(
+            clientId: "codex", cardId: "model.gpt|preview.v1")
         expect(
-            QuotaResolver.resolve(payload: quotaPayload, selection: "nope|Session") == nil,
-            "unknown quota selection is nil")
+            delimiterSelection == "codex|model.gpt|preview.v1"
+                && QuotaResolver.canonicalSelection(
+                    payload: quotaPayload, selection: delimiterSelection) == delimiterSelection
+                && QuotaResolver.resolve(payload: quotaPayload, selection: delimiterSelection)?
+                    .window.cardId == "model.gpt|preview.v1",
+            "card selection preserves delimiters inside cardId")
+        expect(
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|Weekly")
+                == "codex|weekly.v1"
+                && QuotaResolver.resolve(payload: quotaPayload, selection: "codex|Weekly")?
+                    .window.cardId == "weekly.v1",
+            "unique legacy label migrates to cardId")
+        expect(
+            QuotaSelectionPolicy.migrationToPersist(
+                payload: quotaPayload, persistedSelection: "codex|Weekly") == "codex|weekly.v1"
+                && QuotaSelectionPolicy.migrationToPersist(
+                    payload: quotaPayload, persistedSelection: "codex|weekly.v1") == nil
+                && QuotaSelectionPolicy.migrationToPersist(
+                    payload: quotaPayload, persistedSelection: "codex|stale") == nil,
+            "selection policy persists only a proven legacy migration")
+        expect(
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|stale")
+                == "codex|stale"
+                && QuotaResolver.resolve(payload: quotaPayload, selection: "codex|stale") == nil,
+            "temporarily absent explicit card stays selected instead of following Auto")
+        expect(
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "nope|Session")
+                == "nope|Session"
+                && QuotaResolver.resolve(payload: quotaPayload, selection: "nope|Session") == nil,
+            "temporarily absent explicit client stays selected instead of following Auto")
+        expect(
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "codex|Weekly|extra")
+                == "codex|Weekly|extra"
+                && QuotaResolver.resolve(
+                    payload: quotaPayload, selection: "codex|Weekly|extra") == nil,
+            "unmatched explicit selection preserves delimiter characters")
+        expect(
+            QuotaResolver.canonicalSelection(payload: nil, selection: "future|legacy-card.v1")
+                == "future|legacy-card.v1"
+                && QuotaResolver.canonicalSelection(payload: nil, selection: "future|legacy|extra")
+                    == "future|legacy|extra",
+            "payload nil preserves explicit selection delimiters")
+        expect(
+            QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "future")
+                == QuotaResolver.auto
+                && QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "|card")
+                    == QuotaResolver.auto
+                && QuotaResolver.canonicalSelection(payload: quotaPayload, selection: "future|")
+                    == QuotaResolver.auto,
+            "structurally malformed selections normalize to Auto")
         expect(QuotaResolver.resolve(payload: nil, selection: "auto") == nil, "no payload, no quota")
+
+        let duplicateJSON = """
+        {"generatedAt":"now","agents":[
+          {"clientId":"dupe","source":"fixture","updatedAt":"now",
+           "windows":[
+             {"cardId":"same.v1","label":"Ambiguous","usedPercent":20,"remainingPercent":80},
+             {"cardId":"same.v1","label":"Ambiguous","usedPercent":99,"remainingPercent":1},
+             {"cardId":"other.v1","label":"Ambiguous","usedPercent":70,"remainingPercent":30},
+             {"cardId":"Session","label":"Other","usedPercent":90,"remainingPercent":10},
+             {"cardId":"other-session.v1","label":"Session","usedPercent":75,"remainingPercent":25}
+           ]}
+        ]}
+        """
+        let duplicatePayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data(duplicateJSON.utf8))
+        let duplicateAgent = duplicatePayload.agents[0]
+        expect(
+            duplicateAgent.uniqueCardWindows.map(\.cardId)
+                == ["same.v1", "other.v1", "Session", "other-session.v1"],
+            "unique card view keeps first occurrence order")
+        expect(
+            duplicateAgent.uniqueCardWindows.allSatisfy { $0.cardId != "same.v1" || $0.remainingPercent == 80 }
+                && duplicateAgent.uniqueCardWindows.count == 4,
+            "duplicate card later occurrence fails closed")
+        expect(
+            QuotaResolver.canonicalSelection(payload: duplicatePayload, selection: "dupe|Ambiguous")
+                == "dupe|Ambiguous",
+            "ambiguous legacy label cannot be migrated")
+        expect(
+            QuotaResolver.resolve(payload: duplicatePayload, selection: "dupe|Ambiguous") == nil,
+            "ambiguous legacy label stays explicit instead of following Auto")
+        expect(
+            QuotaResolver.resolve(payload: duplicatePayload, selection: "dupe|same.v1")?
+                .window.remainingPercent == 80
+                && QuotaResolver.resolve(payload: duplicatePayload, selection: "auto")?.window.cardId
+                    == "Session",
+            "duplicate card is not rendered or considered by Auto")
+        expect(
+            QuotaResolver.canonicalSelection(payload: duplicatePayload, selection: "dupe|Other")
+                == "dupe|Session"
+                && QuotaResolver.canonicalSelection(payload: duplicatePayload, selection: "dupe|Session")
+                    == "dupe|Session",
+            "exact cardId wins over same-named legacy label")
+
         // Auto pick excludes hidden clients (issue #36): hiding the tightest
-        // (claude|Session, 12%) makes auto fall to the next healthy window
+        // (claude|Session, 12%) makes auto fall to the next healthy card
         // (codex|Weekly, 35%); an EXPLICIT pick of a hidden client is honored;
         // empty exclusion is byte-identical to the default.
         let autoExClaude = QuotaResolver.resolve(
             payload: quotaPayload, selection: "auto", excluding: ["claude"])
-        expect(autoExClaude?.clientId == "codex" && autoExClaude?.window.label == "Weekly",
+        expect(autoExClaude?.clientId == "codex" && autoExClaude?.window.cardId == "weekly.v1",
             "auto skips a hidden tightest-window client")
         expect(
-            QuotaResolver.resolve(payload: quotaPayload, selection: "claude|Session", excluding: ["claude"])?
+            QuotaResolver.resolve(
+                payload: quotaPayload, selection: "claude|session.v1", excluding: ["claude"])?
                 .window.remainingPercent == 12,
             "explicit selection of a hidden client still resolves")
         expect(
@@ -337,11 +673,15 @@ enum SelfTest {
                 payload: quotaPayload, selection: "auto", excluding: ["claude"]),
             "excludedAllCandidates false while a visible candidate survives")
         expect(
+            !QuotaResolver.excludedAllCandidates(
+                payload: duplicatePayload, selection: "dupe|Ambiguous", excluding: ["dupe"]),
+            "unresolved explicit selection does not acquire Auto exclusion semantics")
+        expect(
             !QuotaResolver.excludedAllCandidates(payload: nil, selection: "auto", excluding: ["claude"]),
             "excludedAllCandidates false with no payload (fetch-failure keeps the cache)")
         expect(
             !QuotaResolver.excludedAllCandidates(
-                payload: quotaPayload, selection: "claude|Session", excluding: ["claude"]),
+                payload: quotaPayload, selection: "claude|session.v1", excluding: ["claude"]),
             "excludedAllCandidates false for an explicit selection")
         expect(
             !QuotaResolver.excludedAllCandidates(payload: quotaPayload, selection: "auto", excluding: []),
@@ -799,30 +1139,76 @@ enum SelfTest {
             summaryClients == registryClients && contributionClients == registryClients
                 && quotaClients == registryClients,
             "demo summary contributions and quota share the client set")
-        let dynamicLabelSelection = "\(ClientRegistry.allIds.first ?? "claude")|Sonnet"
-        let demoQuotaSelection = QuotaSelectionPolicy.effectiveSelection(
-            payload: quota,
-            persistedSelection: dynamicLabelSelection,
-            excluding: [],
-            fallbackUnknownExplicit: demoSource.fallsBackUnknownQuotaSelectionToAuto)
-        let liveQuotaSelection = QuotaSelectionPolicy.effectiveSelection(
-            payload: quota,
-            persistedSelection: dynamicLabelSelection,
-            excluding: [],
-            fallbackUnknownExplicit: liveSource.fallsBackUnknownQuotaSelectionToAuto)
         expect(
-            demoQuotaSelection == QuotaResolver.auto && liveQuotaSelection == dynamicLabelSelection
-                && QuotaSelectionPolicy.resolve(
-                    payload: quota,
-                    persistedSelection: dynamicLabelSelection,
-                    excluding: [],
-                    fallbackUnknownExplicit: true) != nil
-                && QuotaSelectionPolicy.resolve(
-                    payload: quota,
-                    persistedSelection: dynamicLabelSelection,
-                    excluding: [],
-                    fallbackUnknownExplicit: false) == nil,
-            "demo unknown quota labels fall back locally while live stays exact")
+            quota.agents.count == ClientRegistry.allIds.count
+                && quota.agents.allSatisfy { agent in
+                    let windows = agent.uniqueCardWindows
+                    return windows.count == 2
+                        && windows[0].cardId == "session.v1"
+                        && windows[1].cardId == "weekly.v1"
+                },
+            "demo quota cards use unique canonical window identities")
+
+        let firstDemoWindows = quota.agents.first?.uniqueCardWindows ?? []
+        let secondDemoWindows = quota.agents.dropFirst().first?.uniqueCardWindows ?? []
+        let demoLearningDuration = firstDemoWindows.first
+        let demoLearningHistory = firstDemoWindows.dropFirst().first
+        let demoAvailable = secondDemoWindows.first
+        let demoUnavailable = secondDemoWindows.dropFirst().first
+        expect(
+            firstDemoWindows.count == 2
+                && demoLearningDuration?.paceStatus.state == .learningDuration
+                && demoLearningDuration?.durationSeconds == nil
+                && demoLearningDuration?.windowMinutes == nil
+                && demoLearningDuration?.paceStatus.durationSource == .observed
+                && demoLearningHistory?.paceStatus.state == .learningHistory
+                && demoLearningHistory?.durationSeconds == 604_800
+                && demoLearningHistory?.windowMinutes == 10_080
+                && demoLearningHistory?.historicalPace == nil,
+            "demo fixture exposes learning-duration and learning-history rows")
+        expect(
+            secondDemoWindows.count == 2
+                && demoAvailable?.paceStatus.state == .available
+                && demoAvailable?.durationSeconds == 18_000
+                && demoAvailable?.historicalPace?.expectedUsedPercent == 35
+                && demoUnavailable?.paceStatus.state == .unavailable
+                && demoUnavailable?.paceStatus.reason == .missingReset
+                && demoUnavailable?.resetsAt == nil,
+            "demo fixture exposes historical-available and typed-unavailable rows")
+
+        let demoLearningEstimate = demoLearningHistory.flatMap {
+            UsagePace.compute(window: $0, mode: .historical)
+        }
+        let demoHistoricalAhead = demoAvailable.flatMap {
+            UsagePace.compute(window: $0, mode: .historical)
+        }
+        expect(
+            demoLearningEstimate?.basis == .linear
+                && demoLearningEstimate?.isHistoricalDeficit == false,
+            "demo learning-history estimate cannot trigger historical warning color")
+        expect(
+            demoHistoricalAhead?.basis == .historical
+                && demoHistoricalAhead?.stage.isDeficit == true
+                && demoHistoricalAhead?.isHistoricalDeficit == true,
+            "demo available row is a historical deficit acceptance fixture")
+        expect(
+            demoLearningDuration.flatMap {
+                UsagePace.compute(window: $0, mode: .historical)
+            } == nil
+                && demoUnavailable.flatMap {
+                    UsagePace.compute(window: $0, mode: .historical)
+                } == nil,
+            "demo learning-duration and unavailable rows suppress projections")
+        expect(
+            quota.agents.dropFirst(2).allSatisfy { agent in
+                agent.uniqueCardWindows.allSatisfy {
+                    $0.paceStatus.state == .learningHistory
+                        && $0.paceStatus.durationSource == .contract
+                        && $0.paceStatus.completeCycles == 0
+                        && $0.historicalPace == nil
+                }
+            },
+            "remaining demo quota cards stay on canonical learning-history fixtures")
 
         let modelReport = DemoData.modelReport
         let hourlyReport = DemoData.hourlyReport
@@ -884,13 +1270,19 @@ enum SelfTest {
 
         expect(
             quota.agents.allSatisfy { agent in
-                !agent.windows.isEmpty && agent.windows.allSatisfy {
-                    $0.windowMinutes ?? 0 > 0
-                        && $0.usedPercent >= 0 && $0.remainingPercent > 0
-                        && abs($0.usedPercent + $0.remainingPercent - 100) < 0.000_001
+                !agent.windows.isEmpty && agent.windows.allSatisfy { window in
+                    let durationShapeIsValid = switch window.paceStatus.state {
+                    case .learningHistory, .available:
+                        (window.windowMinutes ?? 0) > 0
+                    case .learningDuration, .unavailable, .legacyMissing:
+                        window.windowMinutes == nil
+                    }
+                    return durationShapeIsValid
+                        && window.usedPercent >= 0 && window.remainingPercent > 0
+                        && abs(window.usedPercent + window.remainingPercent - 100) < 0.000_001
                 }
             },
-            "demo quota windows have valid labels and used-plus-remaining totals")
+            "demo quota windows have valid duration and percentage shapes")
         let rawDemoRate = DemoData.tokensPerMin
         let traceRate = trace.reduce(0.0) { $0 + $1.tokensPerMin }
         let selectedTraceRate = trace.first { $0.client == selectedClient }?.tokensPerMin ?? 0

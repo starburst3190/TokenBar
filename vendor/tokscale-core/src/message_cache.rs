@@ -61,7 +61,20 @@ use std::time::UNIX_EPOCH;
 // snapshot instead of repeatedly measuring from the turn start. Schema-28
 // caches can replay overlapping duration_ms values or resume an incremental
 // parse without the new cursor, so unchanged sources must be rebuilt.)
-const CACHE_SCHEMA_VERSION: u32 = 29;
+// 30 (M20: OpenCode now reads v2 session_message rows. A hybrid database can
+// already have a non-empty schema-29 cache containing only its v1 message rows;
+// because the database fingerprint is unchanged, that entry must be rejected so
+// the same source is rebuilt with both v1 and v2 output.)
+// 31 (M16: existing Codex, Claude, Copilot, Jcode, provider, and Antigravity
+// sources now emit corrected fork boundaries, explicit-token handling, start
+// anchors, duration merges, provider identity, or model aliases. Schema-30
+// entries can replay stale output under unchanged fingerprints, so rebuild them
+// once instead of importing upstream's per-parser shard versions.)
+// 32 (Grok Build: prefer turn_completed.params.update.usage over the
+// context-window _meta.totalTokens delta. Schema-31 caches can replay
+// undercounted context-only rows for sessions that already have authoritative
+// per-turn usage, so unchanged sources must be rebuilt.)
+const CACHE_SCHEMA_VERSION: u32 = 32;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -257,8 +270,8 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, related_paths)
     }
 
-    /// Fingerprint a Kiro CLI session header together with its same-stem
-    /// message sidecar.
+    /// Fingerprint a Kiro file source together with the message sidecar it reads:
+    /// same-stem JSONL for CLI sessions, sibling `messages.jsonl` for IDE sessions.
     pub(crate) fn from_kiro_path(path: &Path) -> Option<Self> {
         let Some(messages) = crate::sessions::kiro::kiro_related_messages_path(path) else {
             return Self::from_path(path);
@@ -267,23 +280,19 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, related_paths)
     }
 
-    /// Fingerprint for a Grok `updates.jsonl` session and every sibling
-    /// `read_metadata` consults. `parse_grok_updates_file` reconciles session
-    /// totals from `signals.json` (compaction), and `read_metadata` additionally
-    /// reads `summary.json` (model id + `updated_at`/`created_at` timestamp) and
-    /// `events.jsonl` (model id, session id, `ts` timestamp) — so a sibling that
-    /// is written or rewritten after the last `updates.jsonl` write must still
-    /// invalidate the cache. An `updates.jsonl`-only (or `signals.json`-only)
-    /// fingerprint would leave a session pinned to its fallback model forever
-    /// when a late-arriving `summary.json`/`events.jsonl` is the only carrier of
-    /// the real model id.
+    /// Fingerprint a Grok source. Legacy `updates.jsonl` output also depends on
+    /// sibling `signals.json`, `summary.json`, and `events.jsonl`; the global
+    /// `unified.jsonl` source is self-contained and uses the normal fingerprint.
     ///
     /// LOCAL DIVERGENCE from upstream junhoyeo/tokscale, which fingerprints only
-    /// `signals.json` here even though its `read_metadata` reads all three — the
-    /// same class of gap as our reported #741 (roo history sibling). Must be
-    /// re-applied on any re-vendor of `message_cache.rs`; candidate to report
-    /// upstream. See vendor/README.md.
+    /// `signals.json` for legacy sessions even though `read_metadata` reads all
+    /// three siblings — the same class of gap as our reported #741 (roo history
+    /// sibling). Must be re-applied on any re-vendor of `message_cache.rs`.
     pub(crate) fn from_grok_path(path: &Path) -> Option<Self> {
+        if path.file_name().and_then(|name| name.to_str()) == Some("unified.jsonl") {
+            return Self::from_path(path);
+        }
+
         let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let related_paths = GROK_METADATA_SIBLINGS
             .into_iter()
@@ -765,8 +774,12 @@ impl SourceMessageCache {
                 .map_err(std::io::Error::other)?;
             writer.flush()?;
             writer.get_ref().sync_all()?;
+            drop(writer);
             crate::fs_atomic::replace_file(&tmp_path, &final_path)?;
-            let final_file = File::open(&final_path)?;
+            let final_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&final_path)?;
             final_file.sync_all()?;
             Ok(())
         })();
@@ -1224,6 +1237,38 @@ mod tests {
     }
 
     #[test]
+    fn m15b_kiro_ide_fingerprint_tracks_messages_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let sess_dir = dir.path().join("workspace-a/sess_02f1c107");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        let session = sess_dir.join("session.json");
+        std::fs::write(&session, br#"{"schemaVersion":"1.0.0"}"#).unwrap();
+
+        let before = SourceFingerprint::from_kiro_path(&session).unwrap();
+        let plain_before = SourceFingerprint::from_path(&session).unwrap();
+        let messages = crate::sessions::kiro::kiro_related_messages_path(&session).unwrap();
+        assert_eq!(messages, sess_dir.join("messages.jsonl"));
+        assert!(before.related_files.is_empty());
+
+        std::fs::write(&messages, b"first turn\n").unwrap();
+        let after = SourceFingerprint::from_kiro_path(&session).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            plain_before,
+            SourceFingerprint::from_path(&session).unwrap()
+        );
+        assert_eq!(after.related_files[0].suffix, "messages.jsonl");
+
+        std::fs::write(&messages, b"first turn\nsecond turn\n").unwrap();
+        let rewritten = SourceFingerprint::from_kiro_path(&session).unwrap();
+        assert_ne!(after, rewritten);
+        assert_eq!(
+            plain_before,
+            SourceFingerprint::from_path(&session).unwrap()
+        );
+    }
+
+    #[test]
     fn from_grok_path_invalidates_on_summary_only_change() {
         // read_metadata reads the model id (and timestamp) from the sibling
         // summary.json when updates.jsonl carries no per-turn model, so a
@@ -1279,53 +1324,120 @@ mod tests {
         );
     }
 
-    fn restore_env_var(key: &str, value: Option<impl AsRef<std::ffi::OsStr>>) {
-        unsafe {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
+    #[test]
+    fn from_grok_path_treats_unified_log_as_self_contained() {
+        let dir = TempDir::new().unwrap();
+        let unified = dir.path().join("unified.jsonl");
+        let unrelated_signals = dir.path().join("signals.json");
+        std::fs::write(&unified, b"first\n").unwrap();
+        std::fs::write(&unrelated_signals, b"one\n").unwrap();
+
+        let before = SourceFingerprint::from_grok_path(&unified).unwrap();
+        std::fs::write(&unrelated_signals, b"unrelated sibling rewrite\n").unwrap();
+        assert_eq!(
+            before,
+            SourceFingerprint::from_grok_path(&unified).unwrap(),
+            "unified.jsonl must not inherit legacy session siblings"
+        );
+
+        std::fs::write(&unified, b"first\nsecond\n").unwrap();
+        assert_ne!(before, SourceFingerprint::from_grok_path(&unified).unwrap());
+    }
+
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+
+        fn set(&mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        fn remove(&mut self, key: &'static str) {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
             }
         }
     }
 
     /// Pin every env var the cache resolvers consult so the test stays
-    /// inside `temp_home`. CI runners can leak `XDG_CONFIG_HOME` /
-    /// `XDG_CACHE_HOME` from the host, in which case `paths::get_cache_dir`
-    /// resolves outside the sandbox and the legacy fallback never gets
-    /// exercised. Returns the previous values so the caller can restore.
-    fn sandbox_cache_env(
-        temp_home: &std::path::Path,
-    ) -> (
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-    ) {
-        let prev_home = std::env::var_os("HOME");
-        let prev_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
-        let prev_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
-        let prev_override = std::env::var_os("TOKSCALE_CONFIG_DIR");
-        unsafe {
-            std::env::set_var("HOME", temp_home);
-            std::env::set_var("XDG_CONFIG_HOME", temp_home.join(".config"));
-            std::env::set_var("XDG_CACHE_HOME", temp_home.join(".cache"));
-            std::env::remove_var("TOKSCALE_CONFIG_DIR");
-        }
-        (prev_home, prev_xdg_config, prev_xdg_cache, prev_override)
+    /// inside `temp_home`, including on Windows where HOME/XDG do not control
+    /// the platform known folders. The override also keeps canonical cache
+    /// tests from reading or writing a real profile.
+    fn sandbox_cache_env(temp_home: &std::path::Path) -> EnvGuard {
+        let config_dir = temp_home.join(".config");
+        let cache_dir = temp_home.join(".cache");
+        let mut guard = EnvGuard::capture(&[
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "TOKSCALE_CONFIG_DIR",
+        ]);
+        guard.set("HOME", temp_home);
+        guard.set("XDG_CONFIG_HOME", &config_dir);
+        guard.set("XDG_CACHE_HOME", &cache_dir);
+        guard.set("TOKSCALE_CONFIG_DIR", temp_home);
+        guard
     }
 
-    fn restore_cache_env(
-        prev: (
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-        ),
-    ) {
-        restore_env_var("HOME", prev.0);
-        restore_env_var("XDG_CONFIG_HOME", prev.1);
-        restore_env_var("XDG_CACHE_HOME", prev.2);
-        restore_env_var("TOKSCALE_CONFIG_DIR", prev.3);
+    /// Set legacy roots without the override for the non-Windows migration
+    /// tests. The returned guard restores every process environment variable
+    /// on normal return and during unwinding.
+    fn legacy_cache_env(
+        temp_home: &std::path::Path,
+        xdg_cache: Option<&std::path::Path>,
+    ) -> EnvGuard {
+        let config_dir = temp_home.join(".config");
+        let mut guard = EnvGuard::capture(&[
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "TOKSCALE_CONFIG_DIR",
+        ]);
+        guard.set("HOME", temp_home);
+        guard.set("XDG_CONFIG_HOME", &config_dir);
+        match xdg_cache {
+            Some(path) => guard.set("XDG_CACHE_HOME", path),
+            None => guard.remove("XDG_CACHE_HOME"),
+        }
+        guard.remove("TOKSCALE_CONFIG_DIR");
+        guard
+    }
+
+    fn restore_cache_env(guard: EnvGuard) {
+        drop(guard);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_guard_restores_after_unwind() {
+        const KEY: &str = "TOKSCALE_MESSAGE_CACHE_ENV_GUARD_SELF_CHECK";
+        let mut outer = EnvGuard::capture(&[KEY]);
+        outer.set(KEY, "before");
+        let result = std::panic::catch_unwind(|| {
+            let mut inner = EnvGuard::capture(&[KEY]);
+            inner.set(KEY, "during");
+            panic!("exercise EnvGuard unwinding");
+        });
+        assert!(result.is_err());
+        assert_eq!(std::env::var_os(KEY), Some("before".into()));
     }
 
     fn write_temp_file(content: &[u8]) -> NamedTempFile {
@@ -1359,7 +1471,14 @@ mod tests {
         let file = write_temp_file(b"aaaa\nbbbb\ncccc\n");
         let before = SourceFingerprint::from_path(file.path()).unwrap();
 
-        std::fs::write(file.path(), b"aaaa\nzzzz\ncccc\n").unwrap();
+        // Windows can retain the same timestamp for a fast same-size rewrite;
+        // use a changed-length fixture there instead of sleeping or changing
+        // the production fingerprint memo semantics.
+        #[cfg(not(target_os = "windows"))]
+        let rewritten = b"aaaa\nzzzz\ncccc\n";
+        #[cfg(target_os = "windows")]
+        let rewritten = b"aaaa\nzzzz\ncccc\nchanged-length\n";
+        std::fs::write(file.path(), rewritten).unwrap();
 
         let after = SourceFingerprint::from_path(file.path()).unwrap();
         assert_ne!(before, after);
@@ -1374,6 +1493,11 @@ mod tests {
 
         let mut rewritten = original.clone();
         rewritten[73 * 1024] = b'z';
+        // Keep the unsampled same-size rewrite on Unix. Windows filesystem
+        // timestamp precision can memoize a rapid rewrite, so make its
+        // fixture length-changing without adding a sleep.
+        #[cfg(target_os = "windows")]
+        rewritten.extend_from_slice(b"changed-length\n");
         std::fs::write(file.path(), &rewritten).unwrap();
 
         let after = SourceFingerprint::from_path(file.path()).unwrap();
@@ -1393,7 +1517,7 @@ mod tests {
         let with_wal = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
         assert_ne!(base, with_wal);
 
-        std::fs::write(&wal_path, b"wal-2").unwrap();
+        std::fs::write(&wal_path, b"wal-2-changed-length").unwrap();
         let updated_wal = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
         assert_ne!(with_wal, updated_wal);
 
@@ -1435,7 +1559,7 @@ mod tests {
             SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
         assert_ne!(base, with_parent);
 
-        std::fs::write(&parent_path, b"parent transcript 2\n").unwrap();
+        std::fs::write(&parent_path, b"parent transcript 2 with changed length\n").unwrap();
         let updated_parent =
             SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
         assert_ne!(with_parent, updated_parent);
@@ -1468,7 +1592,7 @@ mod tests {
             SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
         assert_ne!(base, with_parent);
 
-        std::fs::write(&parent_path, b"flat parent 2\n").unwrap();
+        std::fs::write(&parent_path, b"flat parent 2 with changed length\n").unwrap();
         let updated_parent =
             SourceFingerprint::from_claude_code_path_with_home(&sidechain_path, None).unwrap();
         assert_ne!(with_parent, updated_parent);
@@ -1531,10 +1655,12 @@ mod tests {
         let variant_path = variant_dir.join("variant.json");
         std::fs::write(
             &variant_path,
-            format!(
-                r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
-                config_dir.display()
-            ),
+            serde_json::json!({
+                "name": "kimi-code",
+                "provider": "kimi",
+                "configDir": config_dir,
+            })
+            .to_string(),
         )
         .unwrap();
         let with_kimi =
@@ -1542,10 +1668,12 @@ mod tests {
 
         std::fs::write(
             &variant_path,
-            format!(
-                r#"{{"name":"kimi-code","provider":"minimax","configDir":"{}"}}"#,
-                config_dir.display()
-            ),
+            serde_json::json!({
+                "name": "kimi-code",
+                "provider": "minimax",
+                "configDir": config_dir,
+            })
+            .to_string(),
         )
         .unwrap();
         let with_minimax =
@@ -1571,10 +1699,12 @@ mod tests {
         let variant_path = variant_dir.join("variant.json");
         std::fs::write(
             &variant_path,
-            format!(
-                r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
-                config_dir.display()
-            ),
+            serde_json::json!({
+                "name": "kimi-code",
+                "provider": "kimi",
+                "configDir": config_dir,
+            })
+            .to_string(),
         )
         .unwrap();
         let with_kimi =
@@ -1583,10 +1713,12 @@ mod tests {
 
         std::fs::write(
             &variant_path,
-            format!(
-                r#"{{"name":"kimi-code","provider":"minimax","configDir":"{}"}}"#,
-                config_dir.display()
-            ),
+            serde_json::json!({
+                "name": "kimi-code",
+                "provider": "minimax",
+                "configDir": config_dir,
+            })
+            .to_string(),
         )
         .unwrap();
         let with_minimax =
@@ -1714,20 +1846,15 @@ mod tests {
     #[serial_test::serial]
     fn test_load_ignores_oversized_cache_file() {
         let temp_home = TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        restore_env_var("HOME", Some(temp_home.path()));
+        let _env = sandbox_cache_env(temp_home.path());
 
-        {
-            let cache_file = cache_path().unwrap();
-            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
-            let file = File::create(&cache_file).unwrap();
-            file.set_len(MAX_CACHE_FILE_BYTES + 1).unwrap();
+        let cache_file = cache_path().unwrap();
+        ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+        let file = File::create(&cache_file).unwrap();
+        file.set_len(MAX_CACHE_FILE_BYTES + 1).unwrap();
 
-            let loaded = SourceMessageCache::load();
-            assert!(loaded.entries.is_empty());
-        }
-
-        restore_env_var("HOME", original_home);
+        let loaded = SourceMessageCache::load();
+        assert!(loaded.entries.is_empty());
     }
 
     #[test]
@@ -2303,86 +2430,72 @@ mod tests {
     #[serial_test::serial]
     fn test_fallback_cache_dir_prefers_runtime_dir() {
         let runtime_dir = TempDir::new().unwrap();
-        let original_xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
-        restore_env_var("XDG_RUNTIME_DIR", Some(runtime_dir.path()));
+        let mut _env = EnvGuard::capture(&["XDG_RUNTIME_DIR"]);
+        _env.set("XDG_RUNTIME_DIR", runtime_dir.path());
 
-        {
-            assert_eq!(
-                fallback_cache_dir(),
-                Some(runtime_dir.path().join("tokscale"))
-            );
-        }
-
-        restore_env_var("XDG_RUNTIME_DIR", original_xdg_runtime_dir);
+        assert_eq!(
+            fallback_cache_dir(),
+            Some(runtime_dir.path().join("tokscale"))
+        );
     }
 
     #[test]
     #[serial_test::serial]
     fn test_save_if_dirty_marks_cache_clean() {
         let temp_home = TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        restore_env_var("HOME", Some(temp_home.path()));
+        let _env = sandbox_cache_env(temp_home.path());
 
         let mut cache = SourceMessageCache::default();
         assert!(!cache.dirty);
 
-        {
-            let file = write_temp_file(b"{}\n");
-            let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
-            cache.insert(CachedSourceEntry::new(
-                file.path(),
-                fingerprint,
-                Vec::new(),
-                Vec::new(),
-                None,
-            ));
-            assert!(cache.dirty);
+        let file = write_temp_file(b"{}\n");
+        let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
+        cache.insert(CachedSourceEntry::new(
+            file.path(),
+            fingerprint,
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
+        assert!(cache.dirty);
 
-            cache.save_if_dirty();
-            assert!(!cache.dirty);
-        }
-
-        restore_env_var("HOME", original_home);
+        cache.save_if_dirty();
+        assert!(!cache.dirty);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_save_if_dirty_merges_concurrent_writers() {
         let temp_home = TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        restore_env_var("HOME", Some(temp_home.path()));
+        let _env = sandbox_cache_env(temp_home.path());
 
-        {
-            let file_one = write_temp_file(b"{\"id\":1}\n");
-            let file_two = write_temp_file(b"{\"id\":2}\n");
+        let file_one = write_temp_file(b"{\"id\":1}\n");
+        let file_two = write_temp_file(b"{\"id\":2}\n");
 
-            let mut writer_one = SourceMessageCache::load();
-            let mut writer_two = SourceMessageCache::load();
+        let mut writer_one = SourceMessageCache::load();
+        let mut writer_two = SourceMessageCache::load();
 
-            writer_one.insert(CachedSourceEntry::new(
-                file_one.path(),
-                SourceFingerprint::from_path(file_one.path()).unwrap(),
-                Vec::new(),
-                Vec::new(),
-                None,
-            ));
-            writer_two.insert(CachedSourceEntry::new(
-                file_two.path(),
-                SourceFingerprint::from_path(file_two.path()).unwrap(),
-                Vec::new(),
-                Vec::new(),
-                None,
-            ));
+        writer_one.insert(CachedSourceEntry::new(
+            file_one.path(),
+            SourceFingerprint::from_path(file_one.path()).unwrap(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
+        writer_two.insert(CachedSourceEntry::new(
+            file_two.path(),
+            SourceFingerprint::from_path(file_two.path()).unwrap(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
 
-            writer_one.save_if_dirty();
-            writer_two.save_if_dirty();
+        writer_one.save_if_dirty();
+        writer_two.save_if_dirty();
 
-            let loaded = SourceMessageCache::load();
-            assert!(loaded.get(file_one.path()).is_some());
-            assert!(loaded.get(file_two.path()).is_some());
-        }
-
-        restore_env_var("HOME", original_home);
+        let loaded = SourceMessageCache::load();
+        assert!(loaded.get(file_one.path()).is_some());
+        assert!(loaded.get(file_two.path()).is_some());
     }
 
     #[test]
@@ -2463,18 +2576,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    #[cfg(not(target_os = "windows"))]
     fn load_falls_back_to_legacy_dirs_cache_path() {
         let temp_home = TempDir::new().unwrap();
         let temp_xdg_cache = TempDir::new().unwrap();
-        let original_home = std::env::var_os("HOME");
-        let original_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
-        let original_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
-        let original_override = std::env::var_os("TOKSCALE_CONFIG_DIR");
-
-        restore_env_var("HOME", Some(temp_home.path()));
-        restore_env_var("XDG_CACHE_HOME", Some(temp_xdg_cache.path()));
-        restore_env_var("XDG_CONFIG_HOME", Some(temp_home.path().join(".config")));
-        restore_env_var("TOKSCALE_CONFIG_DIR", None::<&str>);
+        let _env = legacy_cache_env(temp_home.path(), Some(temp_xdg_cache.path()));
 
         let source = write_temp_file(b"legacy-dirs\n");
         let entry = CachedSourceEntry::new(
@@ -2498,26 +2604,14 @@ mod tests {
 
         let loaded = SourceMessageCache::load();
         assert!(loaded.get(source.path()).is_some());
-
-        restore_env_var("HOME", original_home);
-        restore_env_var("XDG_CACHE_HOME", original_xdg_cache);
-        restore_env_var("XDG_CONFIG_HOME", original_xdg_config);
-        restore_env_var("TOKSCALE_CONFIG_DIR", original_override);
     }
 
     #[test]
     #[serial_test::serial]
+    #[cfg(not(target_os = "windows"))]
     fn load_falls_back_to_legacy_dot_cache_path() {
         let temp_home = TempDir::new().unwrap();
-        let original_home = std::env::var_os("HOME");
-        let original_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
-        let original_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
-        let original_override = std::env::var_os("TOKSCALE_CONFIG_DIR");
-
-        restore_env_var("HOME", Some(temp_home.path()));
-        restore_env_var("XDG_CACHE_HOME", None::<&str>);
-        restore_env_var("XDG_CONFIG_HOME", Some(temp_home.path().join(".config")));
-        restore_env_var("TOKSCALE_CONFIG_DIR", None::<&str>);
+        let _env = legacy_cache_env(temp_home.path(), None);
 
         let source = write_temp_file(b"legacy-dot\n");
         let entry = CachedSourceEntry::new(
@@ -2541,11 +2635,35 @@ mod tests {
 
         let loaded = SourceMessageCache::load();
         assert!(loaded.get(source.path()).is_some());
+    }
 
-        restore_env_var("HOME", original_home);
-        restore_env_var("XDG_CACHE_HOME", original_xdg_cache);
-        restore_env_var("XDG_CONFIG_HOME", original_xdg_config);
-        restore_env_var("TOKSCALE_CONFIG_DIR", original_override);
+    #[cfg(windows)]
+    #[test]
+    #[serial_test::serial]
+    fn legacy_cache_paths_are_ordered_and_override_gated_without_io() {
+        let temp_home = TempDir::new().unwrap();
+        let _env = legacy_cache_env(temp_home.path(), None);
+        let candidates = legacy_cache_paths();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0],
+            dirs::cache_dir()
+                .expect("Windows exposes a cache directory")
+                .join("tokscale")
+                .join(CACHE_FILENAME)
+        );
+        assert_eq!(
+            candidates[1],
+            dirs::home_dir()
+                .expect("Windows exposes a home directory")
+                .join(".cache")
+                .join("tokscale")
+                .join(CACHE_FILENAME)
+        );
+
+        let mut override_env = EnvGuard::capture(&["TOKSCALE_CONFIG_DIR"]);
+        override_env.set("TOKSCALE_CONFIG_DIR", temp_home.path());
+        assert!(legacy_cache_paths().is_empty());
     }
 
     #[cfg(unix)]

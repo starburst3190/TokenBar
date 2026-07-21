@@ -364,33 +364,115 @@ enum DemoData {
     }
 
     private static func makeAgentUsage() -> AgentUsagePayload {
-        let updated = "\(Format.todayKey())T00:00:00Z"
+        let now = Date()
+        let formatter = ISO8601DateFormatter()
+        let updated = formatter.string(from: now)
+        let sessionDuration: Int64 = 18_000
+        let weeklyDuration: Int64 = 604_800
+
+        func learningHistoryWindow(
+            cardId: String, label: String, used: Double, duration: Int64
+        ) -> [String: Any] {
+            [
+                "cardId": cardId,
+                "label": label,
+                "usedPercent": used,
+                "remainingPercent": 100 - used,
+                "resetsAt": formatter.string(
+                    from: now.addingTimeInterval(TimeInterval(duration / 2))),
+                "resetText": duration == sessionDuration ? "in 2h 30m" : "in 3d 12h",
+                "windowMinutes": duration / 60,
+                "paceStatus": [
+                    "state": "learningHistory",
+                    "windowKey": cardId,
+                    "durationSeconds": duration,
+                    "durationSource": "contract",
+                    "completeCycles": 0,
+                ],
+            ]
+        }
+
         let agents = ClientRegistry.allIds.enumerated().map { index, id in
             let sessionUsed = Double(12 + (index * 7) % 76)
             let weeklyUsed = max(5, sessionUsed * 0.58)
+            let windows: [[String: Any]]
+            switch index {
+            case 0:
+                windows = [
+                    [
+                        "cardId": "session.v1",
+                        "label": "Session · Learning duration",
+                        "usedPercent": 18.0,
+                        "remainingPercent": 82.0,
+                        "resetsAt": formatter.string(
+                            from: now.addingTimeInterval(TimeInterval(sessionDuration / 2))),
+                        "resetText": "in 2h 30m",
+                        "paceStatus": [
+                            "state": "learningDuration",
+                            "windowKey": "session.v1",
+                            "durationSource": "observed",
+                            "completeCycles": 0,
+                        ],
+                    ],
+                    learningHistoryWindow(
+                        cardId: "weekly.v1", label: "Weekly · Learning history",
+                        used: 35, duration: weeklyDuration),
+                ]
+            case 1:
+                windows = [
+                    [
+                        "cardId": "session.v1",
+                        "label": "Session · Historical ahead",
+                        "usedPercent": 72.0,
+                        "remainingPercent": 28.0,
+                        "resetsAt": formatter.string(
+                            from: now.addingTimeInterval(TimeInterval(sessionDuration / 2))),
+                        "resetText": "in 2h 30m",
+                        "windowMinutes": sessionDuration / 60,
+                        "paceStatus": [
+                            "state": "available",
+                            "windowKey": "session.v1",
+                            "durationSeconds": sessionDuration,
+                            "durationSource": "contract",
+                            "completeCycles": 6,
+                        ],
+                        "historicalPace": [
+                            "expectedUsedPercent": 35.0,
+                            "etaSeconds": 1_800.0,
+                            "willLastToReset": false,
+                            "runOutProbability": 0.42,
+                        ],
+                    ],
+                    [
+                        "cardId": "weekly.v1",
+                        "label": "Weekly · Typed unavailable",
+                        "usedPercent": 20.0,
+                        "remainingPercent": 80.0,
+                        "resetText": "reset unavailable",
+                        "paceStatus": [
+                            "state": "unavailable",
+                            "windowKey": "weekly.v1",
+                            "completeCycles": 0,
+                            "reason": "missingReset",
+                        ],
+                    ],
+                ]
+            default:
+                windows = [
+                    learningHistoryWindow(
+                        cardId: "session.v1", label: "Session",
+                        used: sessionUsed, duration: sessionDuration),
+                    learningHistoryWindow(
+                        cardId: "weekly.v1", label: "Weekly",
+                        used: weeklyUsed, duration: weeklyDuration),
+                ]
+            }
             return [
                 "clientId": id,
-                "source": "demo",
+                "source": "fixture",
                 "updatedAt": updated,
-                "identity": ["email": "demo@\(id).local", "plan": "Demo"],
-                "windows": [
-                    [
-                        "label": "Session",
-                        "usedPercent": sessionUsed,
-                        "remainingPercent": 100 - sessionUsed,
-                        "resetsAt": "\(Format.todayKey())T23:59:59Z",
-                        "resetText": "today",
-                        "windowMinutes": 300,
-                    ],
-                    [
-                        "label": "Weekly",
-                        "usedPercent": weeklyUsed,
-                        "remainingPercent": 100 - weeklyUsed,
-                        "resetsAt": "\(Format.todayKey())T23:59:59Z",
-                        "resetText": "this week",
-                        "windowMinutes": 10080,
-                    ],
-                ],
+                "identity": ["email": "demo@\(id).local", "plan": "Demo pace fixture"],
+                "windows": windows,
             ] as [String: Any]
         }
         return decode(

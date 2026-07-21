@@ -4,8 +4,8 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-07-16
-sources: ["Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "Sources/TokenBarCore", "Sources/TokenBar", "vendor/README.md"]
+last_verified: 2026-07-19
+sources: ["Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/TokenBar", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md"]
 ---
 
 # Runtime architecture and data flow
@@ -79,10 +79,25 @@ The local streaming path is a cache-aware, per-file pass. Each client lane parse
 | Source identity | Fingerprint the source and relevant siblings | A metadata-only rewrite must invalidate a cached parse |
 | Change probe | Compare the latest source mtime, including SQLite WAL or parser-specific siblings | A cache hit must not hide a live-tail write |
 | Mtime pruning | Keep append-only and SQLite-backed lanes according to their source semantics | Main-file mtime is not sufficient for WAL or sibling updates |
-| Message cache | Rebuild when serialized parser output or resume state changes | Cache schema 29 is local to this vendor and must not mirror upstream numbers |
+| Message cache | Rebuild when serialized parser output or resume state changes | Cache schema is **32** after the Grok `turn_completed.usage` path (was 31 after M16); the counter is local to this vendor and must not mirror upstream numbers |
 | Report fold | Feed filtered, deduped, priced messages into report-specific sinks | All report consumers need a documented arithmetic and client-set contract |
 
 A parser that reads a secondary file must update all four related seams together: fingerprint, active lane, latest-mtime probe, and mtime pruning. SQLite lanes also probe the WAL. This is the sibling rule captured in [`verification.md`](verification.md) and [`vendor-tokscale.md`](vendor-tokscale.md).
+
+### Kiro globalStorage precedence
+
+The M15-A macOS Kiro IDE lane is a special multi-source lane, not a normal per-file dedup pass. The scanner discovers the two macOS `globalStorage/kiro.kiroagent` casing roots and follows the known storage layouts: direct `<workspace>/*.chat` snapshots, `.json` or extensionless execution records one store directory deeper, and `workspace-sessions/<workspace>/*.json`. Deeper mirrored-project trees, root-level JSON/extensionless artifacts, index databases, and unrelated extensions are excluded. Generic role/content traversal is `.chat`-only; JSON and extensionless sources must match an execution shape, and workspace-session parsing is gated to the exact `workspace-sessions/<workspace>/*.json` subtree. Parsing keeps snapshots, successful execution records (including status-bearing non-`.chat` `context.messages` records without an `actions` array), and workspace-session records as separate raw source messages. Numeric-string execution epochs use the same seconds-versus-milliseconds discrimination as JSON numbers. A legacy `.chat` snapshot is not reclassified as an execution by `status` alone. Workspace-session attribution comes from the nested workspace component rather than the literal `workspace-sessions` directory.
+
+The source of truth for precedence is the raw batch, not a downstream report. Materialized and streaming consumers follow the same order:
+
+```text
+scan -> fingerprint/cache raw messages per source -> collect every Kiro source
+     -> suppress snapshots covered by successful executions
+     -> cohort-scoped exact dedup -> refresh derived fields -> reprice
+     -> exact client gate -> report/date filter -> sink/report fold
+```
+
+Suppressed snapshots are never written as an aggregate cache value. A later execution failure, rewrite, or removal can therefore invalidate only that execution source and reveal the still-cached raw snapshot. Source paths remain attached through suppression and exact deduplication, so only execution messages parsed from globalStorage or `.chat` sources seed suppression and only IDE-cohort messages are eligible suppression targets, while identical dedup strings are scoped to the IDE or CLI cohort and successful execution dedup is additionally workspace-scoped; Kiro CLI and SQLite keys cannot be suppressed by, suppress, or collide with IDE snapshots, and repeated execution IDs in different workspaces remain distinct usage. Count and representative model/monthly/hourly/Agents reports consume the same post-suppression identity, preserving model, session, workspace, timestamp, duration, and message-count parity. Kiro globalStorage has no related JSONL sibling, so each primary file mtime is its change signal. Because precedence crosses files, `modified_after` retains the complete IDE cohort whenever any IDE source passes the threshold; this keeps older authoritative executions available to suppress newer snapshots. Kiro CLI sources remain independently prunable, and missing-file stat remains fail-open.
 
 ## Pre-aggregation filters
 
@@ -112,13 +127,14 @@ Pricing and quota are separate flows. Vendored tokscale pricing resolves model c
 | Token counts, model cost, active days | Rust core and FFI reports | Decode and display; do not reprice raw sessions |
 | Price freshness | Vendored pricing service | Show the timestamp supplied by the model report |
 | OAuth or subscription windows | Rust FFI provider modules | Preserve last good data when refresh fails and display an actionable error only when no good value exists |
-| Tray quota selection | Swift `QuotaResolver` | Select from already decoded windows; do not make a second provider request |
-| Linear pace projections | Swift `TokenBarCore` | Derive elapsed／duration fallback from the current provider window |
-| Codex Weekly historical pace | Rust FFI v2 history evaluator | Decode one optional nested expected／ETA／will-last／risk result; derive display stage only, and use Linear when absent |
+| Quota account scope | Rust `agent_account_scope` | Treat the opaque scope as history identity only；do not derive it from labels、paths or token hashes |
+| Duration lifecycle and historical pace | Rust `agent_quota_duration` and `agent_quota_history` | Decode typed `paceStatus` and the optional coherent expected／ETA／will-last／risk result；do not recompute historical output |
+| Tray quota selection | Swift `QuotaResolver` | Select from already decoded windows by `clientId|cardId`；do not make a second provider request |
+| Linear pace policy | Swift `TokenBarCore` | Use Rust-owned positive `durationSeconds` only for explicit Linear mode or `learningHistory`；never revive `learningDuration`、`unavailable` or legacy payloads from `windowMinutes` |
 
 Authoritative provider-reported costs use the vendored cost-provenance contract. The local cache schema must be bumped whenever serialized message output changes, while report-time-only arithmetic changes do not require a cache bump.
 
-Codex Weekly history uses the dedicated `codex-weekly-history-v2.json` store. Rust normalizes and validates raw quota samples, admits only complete account-scoped weeks, and owns the coherent historical projection. The legacy v1 file is not a migration input and remains untouched; during the v2 learning period, Swift receives no historical result and uses the Linear calculation.
+Provider-wide history uses `quota-pace-history-v3.json` keyed by provider、opaque account scope and semantic window key. Rust owns duration evidence、sampling、retention、expected pace、ETA、will-last and risk；Swift owns mode selection、display stage and copy. The installation HMAC key is an exact 32-byte owner-only file in the hardened Application Support directory；the directory is `0700`、the file is `0600`、creation is atomic and cross-process locked、and every resolution reloads the persisted winner without a process cache. The old development Keychain item is ignored. Codex v2 remains read-only migration input for byte-exact current-account matches；v1 is never imported and both legacy files remain untouched.
 
 Pricing metadata is refreshable rather than frozen for the process lifetime; the current refresh cadence is approximately one hour. When provider-hinted lookup selects an entry without cache rates, local cache-rate backfill preserves the correct cache pricing.
 

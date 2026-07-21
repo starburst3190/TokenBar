@@ -26,8 +26,15 @@ public enum PaceStage: Sendable, Equatable {
     }
 }
 
+/// The source of the expected-usage projection.
+public enum UsagePaceBasis: Sendable, Equatable {
+    case linear
+    case historical
+}
+
 public struct UsagePace: Sendable {
     public let stage: PaceStage
+    public let basis: UsagePaceBasis
     /// actual − expected, in percentage points (>0 = ahead/deficit).
     public let deltaPercent: Double
     public let expectedUsedPercent: Double
@@ -37,6 +44,11 @@ public struct UsagePace: Sendable {
     public let etaSeconds: Double?
     /// True if the current rate lasts past the reset (won't run out).
     public let willLastToReset: Bool
+
+    /// Yellow historical deficit is valid only for a backend historical result.
+    public var isHistoricalDeficit: Bool {
+        basis == .historical && stage.isDeficit
+    }
 
     /// Short left-hand label: "On pace" / "12% in deficit" / "8% in reserve".
     public var label: String {
@@ -97,26 +109,41 @@ func parseRFC3339(_ s: String) -> Date? {
 }
 
 extension UsagePace {
-    /// Compute *linear* pace for a window, or nil if it can't be derived yet.
+    /// Compute *linear* pace for a duration-ready v3 window.
     public static func compute(window: UsageWindow, now: Date = Date()) -> UsagePace? {
-        computeCore(window: window, now: now)
+        guard isDurationReady(window.paceStatus.state) else { return nil }
+        return computeCore(window: window, now: now)
     }
 
     /// Compute pace under the user's chosen mode:
-    /// - `off`        → nil (no pace marker).
-    /// - `historical` → use the backend's nested result if present, otherwise
-    ///                  transparently fall back to linear.
-    /// - `linear`     → naive elapsed/duration pace.
+    /// - `off`             → nil (no pace marker).
+    /// - `historical`      → backend projection for `available`, exact-duration
+    ///                       Linear only while `learningHistory`.
+    /// - `linear`          → exact-duration Linear for duration-ready states.
     public static func compute(
         window: UsageWindow, mode: PaceMode, now: Date = Date()
     ) -> UsagePace? {
-        if mode == .off { return nil }
-        if mode == .historical, let historical = window.historicalPace {
-            return computeHistorical(window: window, historical: historical, now: now)
+        switch mode {
+        case .off:
+            return nil
+        case .historical:
+            switch window.paceStatus.state {
+            case .available:
+                guard let historical = window.historicalPace else { return nil }
+                return computeHistorical(window: window, historical: historical, now: now)
+            case .learningHistory:
+                return computeCore(window: window, now: now)
+            case .learningDuration, .unavailable, .legacyMissing:
+                return nil
+            }
+        case .linear:
+            guard isDurationReady(window.paceStatus.state) else { return nil }
+            return computeCore(window: window, now: now)
         }
-        // A missing historical result is the learning-period fallback. Linear
-        // mode intentionally ignores a nested result too.
-        return computeCore(window: window, now: now)
+    }
+
+    private static func isDurationReady(_ state: UsagePaceState) -> Bool {
+        state == .learningHistory || state == .available
     }
 
     /// Assemble display-only projection strings. Historical ETA and
@@ -125,7 +152,9 @@ extension UsagePace {
     public static func presentation(
         window: UsageWindow, mode: PaceMode, pace: UsagePace
     ) -> UsagePacePresentation {
-        let risk = mode == .historical ? runOutRiskLabel(window: window) : nil
+        let risk = mode == .historical
+            ? runOutRiskLabel(window: window, pace: pace)
+            : nil
         let eta = pace.willLastToReset && risk != nil ? nil : pace.etaText
         return UsagePacePresentation(etaText: eta, riskText: risk)
     }
@@ -142,7 +171,7 @@ extension UsagePace {
         let expected = clamp(historical.expectedUsedPercent, 0, 100)
         let delta = actual - expected
         return UsagePace(
-            stage: stageFor(delta), deltaPercent: delta,
+            stage: stageFor(delta), basis: .historical, deltaPercent: delta,
             expectedUsedPercent: expected, actualUsedPercent: actual,
             etaSeconds: historical.etaSeconds,
             willLastToReset: historical.willLastToReset)
@@ -175,7 +204,7 @@ extension UsagePace {
         }
 
         return UsagePace(
-            stage: stageFor(delta), deltaPercent: delta,
+            stage: stageFor(delta), basis: .linear, deltaPercent: delta,
             expectedUsedPercent: expected, actualUsedPercent: actual,
             etaSeconds: etaSeconds, willLastToReset: willLastToReset)
     }
@@ -188,11 +217,12 @@ extension UsagePace {
 
     private static func timing(for window: UsageWindow, now: Date) -> WindowTiming? {
         guard let resetsAtRaw = window.resetsAt,
-              let windowMinutes = window.windowMinutes, windowMinutes > 0,
+              let durationSeconds = window.paceStatus.durationSeconds,
+              durationSeconds > 0,
               let resetsAt = parseRFC3339(resetsAtRaw)
         else { return nil }
 
-        let duration = Double(windowMinutes) * 60
+        let duration = Double(durationSeconds)
         let timeUntilReset = resetsAt.timeIntervalSince(now)
         if timeUntilReset <= 0 || timeUntilReset > duration { return nil }
         return WindowTiming(
@@ -203,8 +233,12 @@ extension UsagePace {
 }
 
 /// codexbar-style historical run-out risk, e.g. "≈ 30% run-out risk", or nil.
-public func runOutRiskLabel(window: UsageWindow) -> String? {
-    guard let probability = window.historicalPace?.runOutProbability else { return nil }
+/// A supplied pace lets presentation suppress backend risk for a Linear result.
+public func runOutRiskLabel(window: UsageWindow, pace: UsagePace? = nil) -> String? {
+    guard window.paceStatus.state == .available,
+          pace?.basis != .linear,
+          let probability = window.historicalPace?.runOutProbability
+    else { return nil }
     let pct = Int((clamp(probability, 0, 1) * 100).rounded())
     if pct <= 0 { return nil }
     return "≈ \(pct)% run-out risk"

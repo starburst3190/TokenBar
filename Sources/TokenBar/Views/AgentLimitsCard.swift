@@ -46,6 +46,58 @@ struct AgentLimitsCard: View {
     private var paceMode: PaceMode { PaceMode(rawValue: paceModeRaw) ?? .historical }
     private var classic: Bool { LimitsLayout(rawValue: layoutRaw) ?? .full == .classic }
 
+    /// Pure state presentation shared by every AgentLimitsCard consumer.
+    enum PacePresentation {
+        static let learningHistoryText = "Learning history · Linear estimate"
+        static let learningDurationText = "Learning reset duration"
+        static let linearText = "Linear"
+        static let legacyText = "Pace unavailable · legacy data"
+
+        static func statusText(
+            state: UsagePaceState,
+            reason: UsagePaceUnavailableReason?,
+            mode: PaceMode
+        ) -> String? {
+            guard mode != .off else { return nil }
+            switch state {
+            case .learningHistory:
+                return mode == .historical ? learningHistoryText : linearText
+            case .learningDuration:
+                return learningDurationText
+            case .available:
+                return mode == .linear ? linearText : nil
+            case .unavailable:
+                return unavailableText(reason)
+            case .legacyMissing:
+                return legacyText
+            }
+        }
+
+        static func unavailableText(_ reason: UsagePaceUnavailableReason?) -> String {
+            guard let reason else { return "Pace unavailable · unavailable reason" }
+            switch reason {
+            case .windowIdentity:
+                return "Pace unavailable · unknown quota window"
+            case .missingReset:
+                return "Pace unavailable · missing reset"
+            case .invalidEvidence:
+                return "Pace unavailable · invalid quota data"
+            case .accountScope:
+                return "Pace unavailable · account identity unavailable"
+            case .storeCapacity:
+                return "Pace unavailable · history storage full"
+            case .history:
+                return "Pace unavailable · history unavailable"
+            case .nonRecurring:
+                return "Pace unavailable · non-recurring quota"
+            }
+        }
+
+        static func isHistoricalDeficit(_ pace: UsagePace?) -> Bool {
+            pace?.isHistoricalDeficit == true
+        }
+    }
+
     /// Placeholder window labels for agents we know carry quotas but have no
     /// snapshot yet (LIMIT_ROWS in the web card).
     private static let placeholderRows: [String: [String]] = [
@@ -234,6 +286,7 @@ struct AgentLimitsCard: View {
     @ViewBuilder private func agentSection(_ id: String, visible: [String]) -> some View {
         let style = ClientRegistry.style(id)
         let snapshot = snapshots[id]
+        let uniqueWindows = snapshot?.uniqueCardWindows ?? []
         let isLive = liveClients.contains(id)
         let edge = dropEdge(id, in: visible)
         VStack(alignment: .leading, spacing: 6) {
@@ -262,9 +315,10 @@ struct AgentLimitsCard: View {
                         .help(snapshot?.error ?? detail)
                 }
                 VStack(spacing: 8) {
-                    if let snapshot, !snapshot.windows.isEmpty {
-                        ForEach(snapshot.windows, id: \.label) { window in
+                    if !uniqueWindows.isEmpty {
+                        ForEach(uniqueWindows, id: \.cardId) { window in
                             windowRow(window, brand: style.color)
+                                .id("\(id):\(window.cardId)")
                         }
                     } else {
                         ForEach(Self.placeholderRows[id] ?? ["Limit"], id: \.self) { label in
@@ -339,7 +393,7 @@ struct AgentLimitsCard: View {
         } else if snapshot?.error != nil {
             text = "Error"
             color = .red
-        } else if let snapshot, !snapshot.windows.isEmpty {
+        } else if let snapshot, !snapshot.uniqueCardWindows.isEmpty {
             text = snapshot.source.uppercased()
         } else if isLive {
             text = "Live"
@@ -420,7 +474,7 @@ struct AgentLimitsCard: View {
                         let left = asUsed ? $0.expectedUsedPercent : 100 - $0.expectedUsedPercent
                         return min(100, max(0, left))
                     },
-                    paceIsDeficit: pace?.stage.isDeficit ?? false)
+                    paceIsDeficit: Self.PacePresentation.isHistoricalDeficit(pace))
                 paceFooter(window: window, leftLabel: leftLabel, pace: pace)
             }
         }
@@ -429,47 +483,52 @@ struct AgentLimitsCard: View {
     @ViewBuilder private func paceFooter(
         window: UsageWindow, leftLabel: String, pace: UsagePace?
     ) -> some View {
-        if let pace {
-            // Historical ETA/lasts and risk are composed together so a visible
-            // risk suppresses the generic "Lasts until reset" phrase when the
-            // backend reports both.
-            let projection = UsagePace.presentation(
-                window: window, mode: paceMode, pace: pace)
-            let projectionText = [projection.etaText, projection.riskText]
-                .compactMap(\.self).joined(separator: " · ")
+        let status = Self.PacePresentation.statusText(
+            state: window.paceStatus.state,
+            reason: window.paceStatus.reason,
+            mode: paceMode)
+        // Historical ETA/lasts and risk are composed together so a visible
+        // risk suppresses the generic "Lasts until reset" phrase when the
+        // backend reports both.
+        let projection = pace.map {
+            UsagePace.presentation(window: window, mode: paceMode, pace: $0)
+        }
+        let projectionText = [projection?.etaText, projection?.riskText]
+            .compactMap(\.self).joined(separator: " · ")
+        let paceText = [status, pace?.label]
+            .compactMap(\.self).joined(separator: " · ")
 
-            if projectionText.isEmpty {
-                HStack(spacing: 8) {
-                    paceLeftLabel(leftLabel)
-                    Spacer(minLength: 8)
-                    paceText(pace.label, pace: pace)
-                }
-            } else {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 8) {
-                        paceLeftLabel(leftLabel)
-                            .fixedSize(horizontal: true, vertical: false)
-                        Spacer(minLength: 8)
-                        paceText("\(pace.label) · \(projectionText)", pace: pace)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-
-                    VStack(alignment: .trailing, spacing: 1) {
-                        HStack(spacing: 8) {
-                            paceLeftLabel(leftLabel)
-                            Spacer(minLength: 8)
-                            paceText(pace.label, pace: pace)
-                        }
-                        paceText(projectionText, pace: pace)
-                            .multilineTextAlignment(.trailing)
-                            .frame(maxWidth: .infinity, alignment: .trailing)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
+        if paceText.isEmpty {
+            paceLeftLabel(leftLabel)
+        } else if projectionText.isEmpty {
+            HStack(spacing: 8) {
+                paceLeftLabel(leftLabel)
+                Spacer(minLength: 8)
+                paceTextLabel(paceText, pace: pace)
             }
         } else {
-            paceLeftLabel(leftLabel)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    paceLeftLabel(leftLabel)
+                        .fixedSize(horizontal: true, vertical: false)
+                    Spacer(minLength: 8)
+                    paceTextLabel("\(paceText) · \(projectionText)", pace: pace)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+
+                VStack(alignment: .trailing, spacing: 1) {
+                    HStack(spacing: 8) {
+                        paceLeftLabel(leftLabel)
+                        Spacer(minLength: 8)
+                        paceTextLabel(paceText, pace: pace)
+                    }
+                    paceTextLabel(projectionText, pace: pace)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 
@@ -479,14 +538,14 @@ struct AgentLimitsCard: View {
             .foregroundStyle(.secondary)
     }
 
-    private func paceText(_ text: String, pace: UsagePace) -> some View {
+    private func paceTextLabel(_ text: String, pace: UsagePace?) -> some View {
         Text(text)
             .font(.caption2)
             // Reserve hint sits one notch under .secondary so it
             // stays brighter than .tertiary yet reads distinct from
             // the '% left' label (.secondary) beside it.
             .foregroundStyle(
-                pace.stage.isDeficit
+                Self.PacePresentation.isHistoricalDeficit(pace)
                     ? AnyShapeStyle(.orange)
                     : AnyShapeStyle(Color.primary.opacity(0.45)))
     }
@@ -517,10 +576,14 @@ struct AgentLimitsCard: View {
     ) -> some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(.quaternary.opacity(0.6))
+                Capsule()
+                    .fill(.quaternary.opacity(0.6))
+                    .frame(height: geo.size.height)
                 Capsule()
                     .fill(color.opacity(0.85))
-                    .frame(width: geo.size.width * fillPercent / 100)
+                    .frame(
+                        width: geo.size.width * fillPercent / 100,
+                        height: geo.size.height)
                 if let paceLeft {
                     // Reserve marker: light mode keeps the original .secondary
                     // tick (translucent black reads as a darker shade of the

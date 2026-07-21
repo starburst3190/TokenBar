@@ -59,27 +59,50 @@ fn subscription_label(provider: &str) -> String {
 }
 
 fn auth_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".local/share/opencode/auth.json"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/opencode/auth.json"))
 }
 
-/// The durable GitHub OAuth token opencode stored for its github-copilot login
-/// (its `refresh` field), used to query Copilot quota. `None` if opencode isn't
-/// authed against Copilot.
-pub fn github_copilot_token() -> Option<String> {
-    let raw = std::fs::read_to_string(auth_path()?).ok()?;
+pub(crate) struct GitHubCopilotCredential {
+    pub(crate) request_token: String,
+    pub(crate) marker: Vec<u8>,
+    pub(crate) semantic_source: &'static str,
+    pub(crate) canonical_location: String,
+}
+
+/// The durable GitHub OAuth credential opencode stored for its Copilot login.
+/// A non-empty refresh string is both the request token and lineage marker;
+/// missing or invalid refresh values fall back to a non-empty access string.
+pub(crate) fn github_copilot_credential() -> Option<GitHubCopilotCredential> {
+    let path = auth_path()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
     let json = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    github_copilot_credential_from(&path, &json)
+}
+
+fn github_copilot_credential_from(
+    path: &std::path::Path,
+    json: &serde_json::Value,
+) -> Option<GitHubCopilotCredential> {
     let entry = json.get("github-copilot")?;
     if entry.get("type").and_then(|t| t.as_str()) != Some("oauth") {
         return None;
     }
-    entry
-        .get("refresh")
-        .or_else(|| entry.get("access"))
-        .and_then(|t| t.as_str())
+    let token = ["refresh", "access"]
+        .into_iter()
+        .filter_map(|key| entry.get(key).and_then(serde_json::Value::as_str))
         .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
+        .find(|token| !token.is_empty())?
+        .to_string();
+    Some(GitHubCopilotCredential {
+        request_token: token.clone(),
+        marker: token.into_bytes(),
+        semantic_source: "opencode-auth-json",
+        canonical_location: crate::agent_account_scope::canonical_file_location(
+            path,
+            Some("github-copilot"),
+        )
+        .ok()?,
+    })
 }
 
 #[cfg(test)]
@@ -91,6 +114,101 @@ mod tests {
         assert_eq!(subscription_label("openai"), "Codex");
         assert_eq!(subscription_label("github-copilot"), "Copilot");
         assert_eq!(subscription_label("anthropic"), "Claude");
-        assert_eq!(subscription_label("minimax-coding-plan"), "Minimax-coding-plan");
+        assert_eq!(
+            subscription_label("minimax-coding-plan"),
+            "Minimax-coding-plan"
+        );
+    }
+
+    #[test]
+    fn copilot_lineage_marker_uses_first_valid_refresh_or_access() {
+        let path = std::env::temp_dir().join("fixture-opencode-auth.json");
+        let cases = [
+            (
+                "refresh preferred",
+                serde_json::json!({
+                    "github-copilot": {
+                        "type": "oauth",
+                        "refresh": " refresh-marker ",
+                        "access": "access-marker"
+                    }
+                }),
+                Some("refresh-marker"),
+            ),
+            (
+                "refresh missing",
+                serde_json::json!({
+                    "github-copilot": { "type": "oauth", "access": " access-marker " }
+                }),
+                Some("access-marker"),
+            ),
+            (
+                "refresh null",
+                serde_json::json!({
+                    "github-copilot": {
+                        "type": "oauth",
+                        "refresh": null,
+                        "access": "access-marker"
+                    }
+                }),
+                Some("access-marker"),
+            ),
+            (
+                "refresh empty",
+                serde_json::json!({
+                    "github-copilot": {
+                        "type": "oauth",
+                        "refresh": "",
+                        "access": "access-marker"
+                    }
+                }),
+                Some("access-marker"),
+            ),
+            (
+                "refresh whitespace",
+                serde_json::json!({
+                    "github-copilot": {
+                        "type": "oauth",
+                        "refresh": " \t\n ",
+                        "access": "access-marker"
+                    }
+                }),
+                Some("access-marker"),
+            ),
+            (
+                "refresh non-string",
+                serde_json::json!({
+                    "github-copilot": {
+                        "type": "oauth",
+                        "refresh": { "unexpected": true },
+                        "access": "access-marker"
+                    }
+                }),
+                Some("access-marker"),
+            ),
+            (
+                "both invalid",
+                serde_json::json!({
+                    "github-copilot": {
+                        "type": "oauth",
+                        "refresh": false,
+                        "access": "   "
+                    }
+                }),
+                None,
+            ),
+        ];
+
+        for (label, json, expected) in cases {
+            let credential = github_copilot_credential_from(&path, &json);
+            match expected {
+                Some(expected) => {
+                    let credential = credential.unwrap_or_else(|| panic!("{label}"));
+                    assert_eq!(credential.request_token, expected, "{label}");
+                    assert_eq!(credential.marker, expected.as_bytes(), "{label}");
+                }
+                None => assert!(credential.is_none(), "{label}"),
+            }
+        }
     }
 }

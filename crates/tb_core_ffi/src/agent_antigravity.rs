@@ -15,11 +15,15 @@
 //!
 //! Both yield per-model "remaining fraction + reset" which map to `UsageWindow`s.
 
+use crate::agent_account_scope::{
+    self, AccountScope, AccountScopeError, AuthoritativeIdKind, RefreshCheckpoint,
+    RefreshScopeTransaction,
+};
 use crate::agent_usage::{clean_plan, parse_datetime, percent_encode, AgentIdentity, UsageWindow};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use serde_json::{json, value::RawValue, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -32,6 +36,7 @@ const REFRESH_SAFETY_SECS: i64 = 60;
 pub(crate) struct Fetched {
     pub source: String,
     pub identity: Option<AgentIdentity>,
+    pub account_scope: Result<AccountScope, AccountScopeError>,
     pub windows: Vec<UsageWindow>,
 }
 
@@ -80,8 +85,10 @@ async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
 
     // language-server ports use the language-server CSRF; the extension server
     // (if advertised) carries its own token.
-    let mut candidates: Vec<(u16, String)> =
-        ports.iter().map(|p| (*p, proc.csrf_token.clone())).collect();
+    let mut candidates: Vec<(u16, String)> = ports
+        .iter()
+        .map(|p| (*p, proc.csrf_token.clone()))
+        .collect();
     if let Some(port) = proc.extension_port {
         if let Some(csrf) = proc.extension_csrf.as_ref() {
             candidates.push((port, csrf.clone()));
@@ -115,8 +122,9 @@ async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
             continue;
         };
         match parse_user_status(&text, now) {
-            Ok(fetched) if !fetched.windows.is_empty() || fetched.identity.is_some() => {
-                return Ok(fetched)
+            Ok(mut fetched) if !fetched.windows.is_empty() || fetched.identity.is_some() => {
+                fetched.account_scope = resolve_local_account_scope(fetched.identity.as_ref());
+                return Ok(fetched);
             }
             Ok(_) => last_err = "local API returned no model quotas".to_string(),
             Err(e) => last_err = e,
@@ -152,7 +160,8 @@ fn detect_process() -> Result<ProcInfo, String> {
         return Ok(ProcInfo {
             pid,
             csrf_token: csrf,
-            extension_port: extract_flag(cmd, "--extension_server_port").and_then(|s| s.parse().ok()),
+            extension_port: extract_flag(cmd, "--extension_server_port")
+                .and_then(|s| s.parse().ok()),
             extension_csrf: extract_flag(cmd, "--extension_server_csrf_token"),
         });
     }
@@ -250,29 +259,44 @@ struct NamedTier {
 #[derive(Debug, Deserialize)]
 struct ModelConfigData {
     #[serde(rename = "clientModelConfigs")]
-    client_model_configs: Option<Vec<ModelConfig>>,
+    client_model_configs: Option<Vec<Box<RawValue>>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ModelConfig {
-    label: Option<String>,
-    #[serde(rename = "modelOrAlias")]
-    model_or_alias: Option<ModelAlias>,
-    #[serde(rename = "quotaInfo")]
-    quota_info: Option<QuotaInfo>,
+struct AvailableModelsResponse {
+    #[serde(default)]
+    models: BTreeMap<String, Box<RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ModelAlias {
-    model: Option<String>,
+struct QuotaBucketsResponse {
+    #[serde(default)]
+    buckets: Vec<Box<RawValue>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct QuotaInfo {
-    #[serde(rename = "remainingFraction")]
-    remaining_fraction: Option<f64>,
-    #[serde(rename = "resetTime")]
-    reset_time: Option<String>,
+#[derive(Debug)]
+struct ModelCandidate {
+    model_id: Option<String>,
+    fraction: f64,
+    reset: Option<DateTime<Utc>>,
+    source_index: usize,
+    label: String,
+}
+
+fn valid_remaining_fraction(fraction: f64) -> bool {
+    fraction.is_finite() && (0.0..=1.0).contains(&fraction)
+}
+
+fn quota_window(
+    label: String,
+    fraction: f64,
+    reset: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    card_id: String,
+    window_key: Option<String>,
+) -> Option<UsageWindow> {
+    UsageWindow::try_from_provider_fraction(label, fraction, reset, now)
+        .map(|window| window.with_identity(card_id, window_key, None, None))
 }
 
 fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> {
@@ -286,18 +310,86 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
         .cascade_model_config_data
         .and_then(|d| d.client_model_configs)
         .unwrap_or_default();
-    let windows: Vec<UsageWindow> = configs
+    let mut selected: BTreeMap<String, ModelCandidate> = BTreeMap::new();
+    let mut missing_model = Vec::new();
+    for (index, config) in configs.into_iter().enumerate() {
+        let Ok(config) = serde_json::from_str::<Value>(config.get()) else {
+            continue;
+        };
+        let Some(quota) = config.get("quotaInfo") else {
+            continue;
+        };
+        let Some(fraction) = quota.get("remainingFraction").and_then(Value::as_f64) else {
+            continue;
+        };
+        let reset = quota
+            .get("resetTime")
+            .and_then(Value::as_str)
+            .and_then(parse_datetime);
+        let model_id = config
+            .pointer("/modelOrAlias/model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
+        let label = config
+            .get("label")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| model_id.clone())
+            .unwrap_or_else(|| "Model".to_string());
+        let candidate = ModelCandidate {
+            model_id: model_id.clone(),
+            fraction,
+            reset,
+            source_index: index,
+            label,
+        };
+        let Some(model_id) = model_id else {
+            missing_model.push(candidate);
+            continue;
+        };
+        match selected.get(&model_id) {
+            Some(current)
+                if !binding_candidate_is_better(
+                    candidate.fraction,
+                    candidate.reset,
+                    candidate.source_index,
+                    current.fraction,
+                    current.reset,
+                    current.source_index,
+                    now,
+                ) => {}
+            _ => {
+                selected.insert(model_id, candidate);
+            }
+        }
+    }
+    let mut candidates: Vec<ModelCandidate> = selected.into_values().collect();
+    candidates.extend(missing_model);
+    candidates.sort_by_key(|candidate| candidate.source_index);
+    let windows: Vec<UsageWindow> = candidates
         .into_iter()
-        .filter_map(|config| {
-            let quota = config.quota_info?;
-            let fraction = quota.remaining_fraction?;
-            let reset = quota.reset_time.as_deref().and_then(parse_datetime);
-            let label = config
-                .label
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| config.model_or_alias.and_then(|m| m.model))
-                .unwrap_or_else(|| "Model".to_string());
-            Some(UsageWindow::from_fraction(label, fraction, reset, now))
+        .filter_map(|candidate| {
+            let (card_id, window_key) = match candidate.model_id {
+                Some(model_id) => {
+                    let key = format!("model.{model_id}.v1");
+                    (key.clone(), Some(key))
+                }
+                None => (
+                    format!("row.cli.config.{}.v1", candidate.source_index),
+                    None,
+                ),
+            };
+            quota_window(
+                candidate.label,
+                candidate.fraction,
+                candidate.reset,
+                now,
+                card_id,
+                window_key,
+            )
         })
         .collect();
 
@@ -305,16 +397,31 @@ fn parse_user_status(body: &str, now: DateTime<Utc>) -> Result<Fetched, String> 
         .user_tier
         .and_then(|t| t.name)
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| status.plan_status.and_then(|p| p.plan_info).and_then(local_plan_name));
+        .or_else(|| {
+            status
+                .plan_status
+                .and_then(|p| p.plan_info)
+                .and_then(local_plan_name)
+        });
 
+    let email = status.email.filter(|value| !value.trim().is_empty());
     Ok(Fetched {
         source: "cli".to_string(),
-        identity: Some(AgentIdentity {
-            email: status.email.filter(|s| !s.trim().is_empty()),
-            plan,
-        }),
+        identity: Some(AgentIdentity { email, plan }),
+        // Parsing remains pure and hermetic. fetch_local_ide resolves this only
+        // after the authenticated loopback response has been accepted.
+        account_scope: Err(AccountScopeError::NoTrustedEvidence),
         windows,
     })
+}
+
+fn resolve_local_account_scope(
+    identity: Option<&AgentIdentity>,
+) -> Result<AccountScope, AccountScopeError> {
+    let email = identity
+        .and_then(|identity| identity.email.as_deref())
+        .ok_or(AccountScopeError::NoTrustedEvidence)?;
+    agent_account_scope::resolve_authoritative("antigravity", AuthoritativeIdKind::Email, email)
 }
 
 fn local_plan_name(info: LocalPlanInfo) -> Option<String> {
@@ -334,30 +441,17 @@ fn local_plan_name(info: LocalPlanInfo) -> Option<String> {
 
 async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
     let creds_path = gemini_home()
-        .map(|h| h.join("oauth_creds.json"))
+        .map(|home| home.join("oauth_creds.json"))
         .ok_or_else(|| "Could not resolve ~/.gemini".to_string())?;
-    let raw = std::fs::read_to_string(&creds_path)
-        .map_err(|_| "Antigravity not logged in (no ~/.gemini/oauth_creds.json)".to_string())?;
-    let mut creds: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("decode oauth_creds.json: {e}"))?;
+    let mut creds = load_remote_credentials(&creds_path)?;
+    let mut access_token = remote_access_token(&creds)?;
+    let mut refreshed_scope = None;
 
-    let mut access_token = creds
-        .get("access_token")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "Antigravity creds have no access token".to_string())?;
-
-    let expiry_ms = creds.get("expiry_date").and_then(Value::as_f64);
-    let now_ms = now.timestamp_millis() as f64;
-    if expiry_ms.is_none_or(|exp| exp <= now_ms + (REFRESH_SAFETY_SECS * 1000) as f64) {
-        let refresh_token = creds
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| "Antigravity access token expired and no refresh token".to_string())?
-            .to_string();
-        access_token = refresh_access_token(&refresh_token, &mut creds, now, &creds_path).await?;
+    if remote_credentials_need_refresh(&creds, now) {
+        let refreshed = refresh_access_token(&creds_path, now).await?;
+        creds = refreshed.0;
+        access_token = refreshed.1;
+        refreshed_scope = Some(refreshed.2);
     }
 
     let client = reqwest::Client::builder()
@@ -365,7 +459,7 @@ async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
         .build()
         .map_err(|e| format!("build Antigravity client: {e}"))?;
 
-    let code_assist = code_assist_post(
+    let code_assist_body = code_assist_post(
         &client,
         "loadCodeAssist",
         &json!({
@@ -374,25 +468,95 @@ async fn fetch_oauth_remote(now: DateTime<Utc>) -> Result<Fetched, String> {
         &access_token,
     )
     .await?;
+    let code_assist: Value = serde_json::from_str(&code_assist_body)
+        .map_err(|e| format!("decode Antigravity loadCodeAssist: {e}"))?;
     let project = project_id(&code_assist);
     let plan = resolve_remote_plan(&code_assist);
-
     let windows = fetch_model_quotas(&client, &access_token, project.as_deref(), now).await?;
-    let email = gemini_active_email();
+    let account_scope =
+        refreshed_scope.unwrap_or_else(|| resolve_remote_account_scope(&creds_path, &creds));
 
     Ok(Fetched {
         source: "oauth".to_string(),
-        identity: Some(AgentIdentity { email, plan }),
+        // google_accounts.active is unrelated local state, not authenticated by
+        // the credential that fetched these quotas. It is neither presentation
+        // identity nor account-scope evidence for the remote route.
+        identity: Some(remote_identity(plan)),
+        account_scope,
         windows,
     })
 }
 
+fn remote_identity(plan: Option<String>) -> AgentIdentity {
+    AgentIdentity { email: None, plan }
+}
+
+fn load_remote_credentials(path: &Path) -> Result<Value, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|_| "Antigravity not logged in (no ~/.gemini/oauth_creds.json)".to_string())?;
+    serde_json::from_str(&raw).map_err(|e| format!("decode oauth_creds.json: {e}"))
+}
+
+fn remote_access_token(creds: &Value) -> Result<String, String> {
+    creds
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Antigravity creds have no access token".to_string())
+}
+
+fn remote_refresh_marker(creds: &Value) -> Option<&[u8]> {
+    creds
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::as_bytes)
+}
+
+fn remote_credentials_need_refresh(creds: &Value, now: DateTime<Utc>) -> bool {
+    let expiry_ms = creds.get("expiry_date").and_then(Value::as_f64);
+    let now_ms = now.timestamp_millis() as f64;
+    expiry_ms.is_none_or(|expiry| expiry <= now_ms + (REFRESH_SAFETY_SECS * 1000) as f64)
+}
+
+fn remote_scope_location(path: &Path) -> Result<String, AccountScopeError> {
+    agent_account_scope::canonical_file_location(path, Some("refresh_token"))
+}
+
+fn resolve_remote_account_scope(
+    path: &Path,
+    creds: &Value,
+) -> Result<AccountScope, AccountScopeError> {
+    let marker = remote_refresh_marker(creds).ok_or(AccountScopeError::NoTrustedEvidence)?;
+    agent_account_scope::resolve_credential(
+        "antigravity",
+        "google-oauth-creds",
+        &remote_scope_location(path)?,
+        marker,
+    )
+}
+
 async fn refresh_access_token(
-    refresh_token: &str,
-    creds: &mut Value,
-    now: DateTime<Utc>,
     creds_path: &Path,
-) -> Result<String, String> {
+    now: DateTime<Utc>,
+) -> Result<(Value, String, Result<AccountScope, AccountScopeError>), String> {
+    let refresh = agent_account_scope::begin_refresh("antigravity")
+        .map_err(|_| "Antigravity credential refresh lock is unavailable.".to_string())?;
+    refresh_access_token_with(
+        creds_path,
+        now,
+        &refresh,
+        request_access_token,
+        |creds| write_creds_atomic(creds_path, creds),
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn request_access_token(refresh_token: String) -> Result<Value, String> {
     let client = resolve_oauth_client()
         .ok_or_else(|| "Antigravity OAuth client not found. Install Antigravity.app or set ANTIGRAVITY_OAUTH_CLIENT_ID/SECRET.".to_string())?;
     let http = reqwest::Client::builder()
@@ -403,7 +567,7 @@ async fn refresh_access_token(
         "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
         percent_encode(&client.0),
         percent_encode(&client.1),
-        percent_encode(refresh_token),
+        percent_encode(&refresh_token),
     );
     let response = http
         .post(GOOGLE_TOKEN_URL)
@@ -418,19 +582,54 @@ async fn refresh_access_token(
     if !response.status().is_success() {
         return Err("Antigravity token refresh rejected. Re-login in Antigravity.".to_string());
     }
-    let json: Value = response
+    response
         .json()
         .await
-        .map_err(|e| format!("decode refresh response: {e}"))?;
+        .map_err(|e| format!("decode refresh response: {e}"))
+}
+
+async fn refresh_access_token_with<R, Request, RequestFuture, Save, Checkpoint>(
+    creds_path: &Path,
+    now: DateTime<Utc>,
+    refresh: &R,
+    request: Request,
+    save: Save,
+    mut checkpoint: Checkpoint,
+) -> Result<(Value, String, Result<AccountScope, AccountScopeError>), String>
+where
+    R: RefreshScopeTransaction + ?Sized,
+    Request: FnOnce(String) -> RequestFuture,
+    RequestFuture: std::future::Future<Output = Result<Value, String>>,
+    Save: FnOnce(&Value) -> std::io::Result<()>,
+    Checkpoint: FnMut(RefreshCheckpoint) -> Result<(), String>,
+{
+    let mut creds = load_remote_credentials(creds_path)?;
+    checkpoint(RefreshCheckpoint::Reloaded)?;
+    let location = remote_scope_location(creds_path)
+        .map_err(|_| "Antigravity auth location cannot be scoped safely.".to_string())?;
+    if !remote_credentials_need_refresh(&creds, Utc::now()) {
+        let access_token = remote_access_token(&creds)?;
+        let scope = match remote_refresh_marker(&creds) {
+            Some(marker) => refresh.resolve_current("google-oauth-creds", &location, marker),
+            None => Err(AccountScopeError::NoTrustedEvidence),
+        };
+        return Ok((creds, access_token, scope));
+    }
+
+    let old_marker = remote_refresh_marker(&creds)
+        .ok_or_else(|| "Antigravity access token expired and no refresh token".to_string())?
+        .to_vec();
+    let refresh_token = std::str::from_utf8(&old_marker)
+        .map_err(|_| "Antigravity refresh credential is not valid text.".to_string())?
+        .to_string();
+    let json = request(refresh_token).await?;
+    checkpoint(RefreshCheckpoint::NetworkReturned)?;
     let access_token = json
         .get("access_token")
         .and_then(Value::as_str)
         .ok_or_else(|| "refresh response missing access_token".to_string())?
         .to_string();
 
-    // Persist back to ~/.gemini/oauth_creds.json so we share a single source of
-    // truth with Antigravity. Preserve every original field; only touch the ones
-    // the refresh changed. A write failure is non-fatal (use the token in-memory).
     if let Some(obj) = creds.as_object_mut() {
         obj.insert("access_token".into(), Value::String(access_token.clone()));
         if let Some(expires_in) = json.get("expires_in").and_then(Value::as_f64) {
@@ -440,21 +639,77 @@ async fn refresh_access_token(
         if let Some(id_token) = json.get("id_token").and_then(Value::as_str) {
             obj.insert("id_token".into(), Value::String(id_token.to_string()));
         }
+        if let Some(replacement) = json
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            obj.insert(
+                "refresh_token".into(),
+                Value::String(replacement.to_string()),
+            );
+        }
     }
-    let _ = write_creds_atomic(creds_path, creds);
-    Ok(access_token)
+    let new_marker = remote_refresh_marker(&creds);
+    let marker_rotated = new_marker.is_some_and(|marker| marker != old_marker.as_slice());
+    let scope = match new_marker {
+        Some(new_marker) => {
+            refresh.transfer("google-oauth-creds", &location, &old_marker, new_marker)
+        }
+        None => Err(AccountScopeError::NoTrustedEvidence),
+    };
+    checkpoint(RefreshCheckpoint::MetadataHandled)?;
+    // A rotated marker may reach disk only after its lineage transfer is durable.
+    // The refreshed access token remains usable in memory for this poll.
+    if marker_rotated && scope.is_err() {
+        return Ok((creds, access_token, scope));
+    }
+    if let Err(error) = save(&creds) {
+        eprintln!("tb_core_ffi: failed to persist refreshed Antigravity credentials: {error}");
+    }
+    checkpoint(RefreshCheckpoint::CredentialsPersisted)?;
+    Ok((creds, access_token, scope))
 }
 
 fn write_creds_atomic(path: &Path, creds: &Value) -> std::io::Result<()> {
-    let data = serde_json::to_vec_pretty(creds).unwrap_or_default();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let data = serde_json::to_vec_pretty(creds).map_err(std::io::Error::other)?;
+    let directory = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "credential path has no parent",
+        )
+    })?;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = directory.join(format!(
+        ".oauth_creds.json.tokenbar.{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let staged = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&data)?;
+        file.sync_all()
+    })();
+    if let Err(error) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
-    std::fs::rename(&tmp, path)
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    std::fs::File::open(directory)?.sync_all()
 }
 
 async fn code_assist_post(
@@ -462,7 +717,7 @@ async fn code_assist_post(
     method: &str,
     body: &Value,
     access_token: &str,
-) -> Result<Value, String> {
+) -> Result<String, String> {
     let resp = client
         .post(format!("{CODE_ASSIST_BASE}:{method}"))
         .bearer_auth(access_token)
@@ -482,9 +737,9 @@ async fn code_assist_post(
     if !status.is_success() {
         return Err(format!("Antigravity {method} returned {}", status.as_u16()));
     }
-    resp.json()
+    resp.text()
         .await
-        .map_err(|e| format!("decode Antigravity {method}: {e}"))
+        .map_err(|e| format!("read Antigravity {method}: {e}"))
 }
 
 async fn fetch_model_quotas(
@@ -499,19 +754,14 @@ async fn fetch_model_quotas(
     };
     // Primary: fetchAvailableModels (per-model quotaInfo). Fall back to
     // retrieveUserQuota buckets if the catalog endpoint is denied.
-    match code_assist_post(client, "fetchAvailableModels", &body, access_token).await {
-        Ok(value) => {
-            let windows = models_from_available(&value, now);
-            if windows.is_empty() {
-                let quota = code_assist_post(client, "retrieveUserQuota", &body, access_token).await?;
-                Ok(buckets_from_quota(&quota, now))
-            } else {
-                Ok(windows)
-            }
-        }
-        Err(_) => {
+    match code_assist_post(client, "fetchAvailableModels", &body, access_token)
+        .await
+        .and_then(|body| models_from_available(&body, now))
+    {
+        Ok(windows) if !windows.is_empty() => Ok(windows),
+        _ => {
             let quota = code_assist_post(client, "retrieveUserQuota", &body, access_token).await?;
-            Ok(buckets_from_quota(&quota, now))
+            buckets_from_quota(&quota, now)
         }
     }
 }
@@ -555,50 +805,107 @@ fn resolve_remote_plan(code_assist: &Value) -> Option<String> {
     }
 }
 
-fn models_from_available(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
-    let Some(models) = value.get("models").and_then(Value::as_object) else {
-        return Vec::new();
-    };
-    models
-        .iter()
-        .filter_map(|(id, model)| {
-            let quota = model.get("quotaInfo")?;
-            let fraction = quota.get("remainingFraction").and_then(Value::as_f64)?;
-            let reset = quota
-                .get("resetTime")
-                .and_then(Value::as_str)
-                .and_then(parse_datetime);
-            let label = model
-                .get("displayName")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| {
-                    model
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .unwrap_or(id.as_str())
-                .to_string();
-            Some(UsageWindow::from_fraction(label, fraction, reset, now))
+fn models_from_available(body: &str, now: DateTime<Utc>) -> Result<Vec<UsageWindow>, String> {
+    let response: AvailableModelsResponse = serde_json::from_str(body)
+        .map_err(|e| format!("decode Antigravity fetchAvailableModels: {e}"))?;
+    let mut selected: BTreeMap<String, ModelCandidate> = BTreeMap::new();
+    let mut missing_model = Vec::new();
+    for (source_index, (raw_id, model)) in response.models.into_iter().enumerate() {
+        let Ok(model) = serde_json::from_str::<Value>(model.get()) else {
+            continue;
+        };
+        let Some(quota) = model.get("quotaInfo") else {
+            continue;
+        };
+        let Some(fraction) = quota.get("remainingFraction").and_then(Value::as_f64) else {
+            continue;
+        };
+        let reset = quota
+            .get("resetTime")
+            .and_then(Value::as_str)
+            .and_then(parse_datetime);
+        let model_id = raw_id.trim().to_string();
+        let model_id = (!model_id.is_empty()).then_some(model_id);
+        let label = model
+            .get("displayName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                model
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or(raw_id.as_str())
+            .to_string();
+        let candidate = ModelCandidate {
+            model_id: model_id.clone(),
+            fraction,
+            reset,
+            source_index,
+            label,
+        };
+        let Some(model_id) = model_id else {
+            missing_model.push(candidate);
+            continue;
+        };
+        match selected.get(&model_id) {
+            Some(current)
+                if !binding_candidate_is_better(
+                    candidate.fraction,
+                    candidate.reset,
+                    candidate.source_index,
+                    current.fraction,
+                    current.reset,
+                    current.source_index,
+                    now,
+                ) => {}
+            _ => {
+                selected.insert(model_id, candidate);
+            }
+        }
+    }
+
+    let mut candidates: Vec<ModelCandidate> = selected.into_values().collect();
+    candidates.extend(missing_model);
+    candidates.sort_by_key(|candidate| candidate.source_index);
+    Ok(candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let (card_id, window_key) = match candidate.model_id {
+                Some(model_id) => {
+                    let key = format!("model.{model_id}.v1");
+                    (key.clone(), Some(key))
+                }
+                None => (format!("row.models.{}.v1", candidate.source_index), None),
+            };
+            quota_window(
+                candidate.label,
+                candidate.fraction,
+                candidate.reset,
+                now,
+                card_id,
+                window_key,
+            )
         })
-        .collect()
+        .collect())
 }
 
-fn buckets_from_quota(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
-    let Some(buckets) = value.get("buckets").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    // Keep the lowest remaining fraction per model (the binding limit).
-    let mut by_model: std::collections::BTreeMap<String, (f64, Option<DateTime<Utc>>)> =
-        std::collections::BTreeMap::new();
-    for bucket in buckets {
-        let Some(model) = bucket
-            .get("modelId")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
+#[derive(Debug)]
+struct QuotaBucketCandidate {
+    model_id: Option<String>,
+    fraction: f64,
+    reset: Option<DateTime<Utc>>,
+    source_index: usize,
+}
+
+fn buckets_from_quota(body: &str, now: DateTime<Utc>) -> Result<Vec<UsageWindow>, String> {
+    let response: QuotaBucketsResponse = serde_json::from_str(body)
+        .map_err(|e| format!("decode Antigravity retrieveUserQuota: {e}"))?;
+    let mut selected: BTreeMap<String, QuotaBucketCandidate> = BTreeMap::new();
+    let mut missing = Vec::new();
+    for (source_index, bucket) in response.buckets.into_iter().enumerate() {
+        let Ok(bucket) = serde_json::from_str::<Value>(bucket.get()) else {
             continue;
         };
         let Some(fraction) = bucket.get("remainingFraction").and_then(Value::as_f64) else {
@@ -608,19 +915,109 @@ fn buckets_from_quota(value: &Value, now: DateTime<Utc>) -> Vec<UsageWindow> {
             .get("resetTime")
             .and_then(Value::as_str)
             .and_then(parse_datetime);
-        by_model
-            .entry(model.to_string())
-            .and_modify(|cur| {
-                if fraction < cur.0 {
-                    *cur = (fraction, reset);
-                }
-            })
-            .or_insert((fraction, reset));
+        let model_id = bucket
+            .get("modelId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
+        let candidate = QuotaBucketCandidate {
+            model_id: model_id.clone(),
+            fraction,
+            reset,
+            source_index,
+        };
+        let Some(model_id) = model_id else {
+            missing.push(candidate);
+            continue;
+        };
+        match selected.get(&model_id) {
+            Some(current) if !bucket_candidate_is_better(&candidate, current, now) => {}
+            _ => {
+                selected.insert(model_id, candidate);
+            }
+        }
     }
-    by_model
+
+    let mut chosen: Vec<QuotaBucketCandidate> = selected.into_values().collect();
+    chosen.extend(missing);
+    chosen.sort_by_key(|candidate| candidate.source_index);
+    Ok(chosen
         .into_iter()
-        .map(|(model, (fraction, reset))| UsageWindow::from_fraction(model, fraction, reset, now))
-        .collect()
+        .filter_map(|candidate| {
+            let label = candidate
+                .model_id
+                .clone()
+                .unwrap_or_else(|| "Model".to_string());
+            let (card_id, window_key) = match candidate.model_id {
+                Some(model_id) => {
+                    let key = format!("model.{model_id}.v1");
+                    (key.clone(), Some(key))
+                }
+                None => (
+                    format!("row.quota.bucket.{}.v1", candidate.source_index),
+                    None,
+                ),
+            };
+            quota_window(
+                label,
+                candidate.fraction,
+                candidate.reset,
+                now,
+                card_id,
+                window_key,
+            )
+        })
+        .collect())
+}
+
+fn bucket_candidate_is_better(
+    candidate: &QuotaBucketCandidate,
+    current: &QuotaBucketCandidate,
+    now: DateTime<Utc>,
+) -> bool {
+    binding_candidate_is_better(
+        candidate.fraction,
+        candidate.reset,
+        candidate.source_index,
+        current.fraction,
+        current.reset,
+        current.source_index,
+        now,
+    )
+}
+
+fn binding_candidate_is_better(
+    candidate_fraction: f64,
+    candidate_reset: Option<DateTime<Utc>>,
+    candidate_index: usize,
+    current_fraction: f64,
+    current_reset: Option<DateTime<Utc>>,
+    current_index: usize,
+    now: DateTime<Utc>,
+) -> bool {
+    match (
+        valid_remaining_fraction(candidate_fraction),
+        valid_remaining_fraction(current_fraction),
+    ) {
+        (true, false) => return true,
+        (false, true) => return false,
+        _ => {}
+    }
+    match candidate_fraction.total_cmp(&current_fraction) {
+        std::cmp::Ordering::Less => return true,
+        std::cmp::Ordering::Greater => return false,
+        std::cmp::Ordering::Equal => {}
+    }
+    let candidate_reset = candidate_reset.filter(|reset| *reset > now);
+    let current_reset = current_reset.filter(|reset| *reset > now);
+    match (candidate_reset, current_reset) {
+        (Some(candidate), Some(current)) if candidate != current => return candidate < current,
+        (Some(_), None) => return true,
+        (None, Some(_)) => return false,
+        _ => {}
+    }
+    candidate_index < current_index
 }
 
 // ── OAuth client discovery (scan installed Antigravity.app) ───────────────────
@@ -754,26 +1151,19 @@ fn gemini_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".gemini"))
 }
 
-fn gemini_active_email() -> Option<String> {
-    let path = gemini_home()?.join("google_accounts.json");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let json: Value = serde_json::from_str(&raw).ok()?;
-    json.get("active")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_account_scope::test_support::TestRefreshScope;
 
     #[test]
     fn extracts_flags_both_forms() {
         let cmd = "/x/language_server --app_data_dir /Users/me/.gemini/antigravity --csrf_token=ABC123 --extension_server_port 4567";
         assert_eq!(extract_flag(cmd, "--csrf_token").as_deref(), Some("ABC123"));
-        assert_eq!(extract_flag(cmd, "--extension_server_port").as_deref(), Some("4567"));
+        assert_eq!(
+            extract_flag(cmd, "--extension_server_port").as_deref(),
+            Some("4567")
+        );
         assert!(is_language_server(&cmd.to_lowercase()));
         assert!(is_antigravity(&cmd.to_lowercase()));
     }
@@ -790,7 +1180,10 @@ mod tests {
         let blob = b"junk\x00123-abcDEF_g.apps.googleusercontent.com\x00\x00GOCSPX-abcdefghijklmnopqrstuvwxyz12\x00tail";
         let ids = scan_client_ids(blob);
         let secrets = scan_client_secrets(blob);
-        assert_eq!(ids, vec!["123-abcDEF_g.apps.googleusercontent.com".to_string()]);
+        assert_eq!(
+            ids,
+            vec!["123-abcDEF_g.apps.googleusercontent.com".to_string()]
+        );
         assert_eq!(secrets.len(), 1);
         let client = preferred_client(&ids, &secrets).unwrap();
         assert_eq!(client.0, "123-abcDEF_g.apps.googleusercontent.com");
@@ -799,9 +1192,15 @@ mod tests {
 
     #[test]
     fn prefers_last_id_when_single_secret() {
-        let ids = vec!["1-a.apps.googleusercontent.com".into(), "2-b.apps.googleusercontent.com".into()];
+        let ids = vec![
+            "1-a.apps.googleusercontent.com".into(),
+            "2-b.apps.googleusercontent.com".into(),
+        ];
         let secrets = vec!["GOCSPX-only".into()];
-        assert_eq!(preferred_client(&ids, &secrets).unwrap().0, "2-b.apps.googleusercontent.com");
+        assert_eq!(
+            preferred_client(&ids, &secrets).unwrap().0,
+            "2-b.apps.googleusercontent.com"
+        );
     }
 
     #[test]
@@ -822,8 +1221,14 @@ mod tests {
         }"#;
         let fetched = parse_user_status(body, now).unwrap();
         assert_eq!(fetched.source, "cli");
-        assert_eq!(fetched.identity.as_ref().unwrap().email.as_deref(), Some("me@gmail.com"));
-        assert_eq!(fetched.identity.as_ref().unwrap().plan.as_deref(), Some("Pro"));
+        assert_eq!(
+            fetched.identity.as_ref().unwrap().email.as_deref(),
+            Some("me@gmail.com")
+        );
+        assert_eq!(
+            fetched.identity.as_ref().unwrap().plan.as_deref(),
+            Some("Pro")
+        );
         assert_eq!(fetched.windows.len(), 1);
         assert_eq!(fetched.windows[0].label_for_test(), "Gemini 3 Pro");
         assert!((fetched.windows[0].remaining_for_test() - 42.0).abs() < 0.01);
@@ -837,7 +1242,7 @@ mod tests {
                 "gemini-3-pro": { "displayName": "Gemini 3 Pro", "quotaInfo": { "remainingFraction": 0.5 } }
             }
         });
-        let w = models_from_available(&models, now);
+        let w = models_from_available(&models.to_string(), now).unwrap();
         assert_eq!(w.len(), 1);
 
         let quota = json!({
@@ -846,14 +1251,573 @@ mod tests {
                 { "modelId": "claude", "remainingFraction": 0.3 }
             ]
         });
-        let b = buckets_from_quota(&quota, now);
+        let b = buckets_from_quota(&quota.to_string(), now).unwrap();
         assert_eq!(b.len(), 1);
         assert!((b[0].remaining_for_test() - 30.0).abs() < 0.01); // lowest kept
     }
 
     #[test]
+    fn stage4_antigravity_identity_and_duplicate_rules_are_deterministic() {
+        let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let models = json!({
+            "models": {
+                "model-A": {
+                    "displayName": "Trimmed loser",
+                    "quotaInfo": { "remainingFraction": 0.5, "resetTime": "2026-07-12T00:00:00Z" }
+                },
+                "  model-A  ": {
+                    "displayName": "Trimmed winner",
+                    "quotaInfo": { "remainingFraction": 0.2, "resetTime": "2026-07-13T00:00:00Z" }
+                },
+                "model-B": {
+                    "displayName": "Shared label",
+                    "quotaInfo": { "remainingFraction": 0.4, "resetTime": "2026-07-12T00:00:00Z" }
+                },
+                "Model-Byte-Case": {
+                    "displayName": "Shared label",
+                    "quotaInfo": { "remainingFraction": 0.3, "resetTime": "2026-07-13T00:00:00Z" }
+                }
+            }
+        });
+        let windows = models_from_available(&models.to_string(), now).unwrap();
+        assert_eq!(windows.len(), 3);
+        let model_a = windows
+            .iter()
+            .find(|window| window.pace_window_key_for_test() == Some("model.model-A.v1"))
+            .unwrap();
+        assert_eq!(model_a.label_for_test(), "Trimmed winner");
+        assert!((model_a.remaining_for_test() - 20.0).abs() < 0.01);
+        assert_eq!(
+            windows
+                .iter()
+                .filter(|window| window.label_for_test() == "Shared label")
+                .count(),
+            2,
+            "display labels never merge distinct model IDs"
+        );
+        assert!(windows.iter().any(|window| {
+            window.pace_window_key_for_test() == Some("model.Model-Byte-Case.v1")
+        }));
+
+        let cli = r#"{
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "label": "CLI loser",
+                            "modelOrAlias": { "model": " Model-X " },
+                            "quotaInfo": { "remainingFraction": 0.6, "resetTime": "2026-07-12T00:00:00Z" }
+                        },
+                        {
+                            "label": "CLI winner",
+                            "modelOrAlias": { "model": "Model-X" },
+                            "quotaInfo": { "remainingFraction": 0.2, "resetTime": "2026-07-13T00:00:00Z" }
+                        },
+                        { "label": "Config only", "quotaInfo": { "remainingFraction": 0.7 } }
+                    ]
+                }
+            }
+        }"#;
+        let fetched = parse_user_status(cli, now).unwrap();
+        assert_eq!(fetched.windows.len(), 2);
+        assert_eq!(
+            fetched.windows[0].pace_window_key_for_test(),
+            Some("model.Model-X.v1")
+        );
+        assert_eq!(fetched.windows[0].label_for_test(), "CLI winner");
+        let missing_wire = serde_json::to_value(&fetched.windows[1]).unwrap();
+        assert_eq!(missing_wire["cardId"], "row.cli.config.2.v1");
+        assert_eq!(missing_wire["paceStatus"]["reason"], "windowIdentity");
+
+        let missing_remote = models_from_available(
+            &json!({
+                "models": {
+                    "   ": {
+                        "displayName": "Remote model",
+                        "quotaInfo": { "remainingFraction": 0.7 }
+                    }
+                }
+            })
+            .to_string(),
+            now,
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&missing_remote[0]).unwrap();
+        assert_eq!(wire["cardId"], "row.models.0.v1");
+        assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
+
+        let missing_bucket = buckets_from_quota(
+            &json!({
+                "buckets": [
+                    { "modelId": "   ", "remainingFraction": 0.7 }
+                ]
+            })
+            .to_string(),
+            now,
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&missing_bucket[0]).unwrap();
+        assert_eq!(wire["cardId"], "row.quota.bucket.0.v1");
+        assert_eq!(wire["paceStatus"]["reason"], "windowIdentity");
+
+        let duplicate = json!({
+            "buckets": [
+                {
+                    "modelId": "same-model",
+                    "remainingFraction": 0.25,
+                    "resetTime": "2026-07-09T00:00:00Z"
+                },
+                {
+                    "modelId": "same-model",
+                    "remainingFraction": 0.25,
+                    "resetTime": "2026-07-12T00:00:00Z"
+                },
+                {
+                    "modelId": "same-model",
+                    "remainingFraction": 0.25,
+                    "resetTime": "2026-07-11T00:00:00Z"
+                }
+            ]
+        });
+        let selected = buckets_from_quota(&duplicate.to_string(), now).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].resets_at_for_test(),
+            Some("2026-07-11T00:00:00.000Z"),
+            "future reset beats past reset, then earliest future reset wins"
+        );
+        let same_reset = parse_datetime("2026-07-11T00:00:00Z");
+        assert!(!binding_candidate_is_better(
+            0.25, same_reset, 1, 0.25, same_reset, 0, now
+        ));
+    }
+
+    #[test]
+    fn stage4_antigravity_rejects_invalid_fractions_at_every_source() {
+        assert!(!valid_remaining_fraction(f64::NAN));
+        assert!(!valid_remaining_fraction(f64::INFINITY));
+        assert!(!valid_remaining_fraction(-0.01));
+        assert!(!valid_remaining_fraction(1.01));
+        assert!(valid_remaining_fraction(0.0));
+        assert!(valid_remaining_fraction(1.0));
+
+        let now = DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let assert_rows = |windows: Vec<UsageWindow>| {
+            assert_eq!(windows.len(), 1);
+            assert_eq!(
+                windows[0].pace_window_key_for_test(),
+                Some("model.valid.v1")
+            );
+            for key in ["model.negative.v1", "model.over.v1"] {
+                assert!(
+                    windows
+                        .iter()
+                        .all(|window| window.pace_window_key_for_test() != Some(key)),
+                    "invalid quota row must not be published: {key}"
+                );
+            }
+        };
+
+        let cli = r#"{
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "modelOrAlias": { "model": "valid" },
+                            "quotaInfo": { "remainingFraction": 0.5 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "negative" },
+                            "quotaInfo": { "remainingFraction": -0.1 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "over" },
+                            "quotaInfo": { "remainingFraction": 1.1 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "missing" },
+                            "quotaInfo": {}
+                        }
+                    ]
+                }
+            }
+        }"#;
+        assert_rows(parse_user_status(cli, now).unwrap().windows);
+
+        let assert_overflowing_duplicate = |windows: Vec<UsageWindow>| {
+            assert_eq!(windows.len(), 1);
+            assert_eq!(
+                windows[0].pace_window_key_for_test(),
+                Some("model.same-model.v1")
+            );
+            assert!((windows[0].remaining_for_test() - 50.0).abs() < 0.01);
+        };
+        let overflowing_cli = r#"{
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "modelOrAlias": { "model": "same-model" },
+                            "quotaInfo": { "remainingFraction": 1e400 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "same-model" },
+                            "quotaInfo": { "remainingFraction": 0.5 }
+                        }
+                    ]
+                }
+            }
+        }"#;
+        assert_overflowing_duplicate(parse_user_status(overflowing_cli, now).unwrap().windows);
+
+        assert_rows(
+            models_from_available(
+                &json!({
+                    "models": {
+                        "valid": { "quotaInfo": { "remainingFraction": 0.5 } },
+                        "negative": { "quotaInfo": { "remainingFraction": -0.1 } },
+                        "over": { "quotaInfo": { "remainingFraction": 1.1 } },
+                        "missing": { "quotaInfo": {} }
+                    }
+                })
+                .to_string(),
+                now,
+            )
+            .unwrap(),
+        );
+
+        let overflowing_models = r#"{
+            "models": {
+                "same-model": {
+                    "quotaInfo": { "remainingFraction": 1e400 }
+                },
+                " same-model ": {
+                    "quotaInfo": { "remainingFraction": 0.5 }
+                }
+            }
+        }"#;
+        assert_overflowing_duplicate(models_from_available(overflowing_models, now).unwrap());
+
+        assert_rows(
+            buckets_from_quota(
+                &json!({
+                    "buckets": [
+                        { "modelId": "valid", "remainingFraction": 0.5 },
+                        { "modelId": "negative", "remainingFraction": -0.1 },
+                        { "modelId": "over", "remainingFraction": 1.1 },
+                        { "modelId": "missing" }
+                    ]
+                })
+                .to_string(),
+                now,
+            )
+            .unwrap(),
+        );
+
+        let overflowing_buckets = r#"{
+            "buckets": [
+                { "modelId": "same-model", "remainingFraction": 1e400 },
+                { "modelId": "same-model", "remainingFraction": 0.5 }
+            ]
+        }"#;
+        assert_overflowing_duplicate(buckets_from_quota(overflowing_buckets, now).unwrap());
+
+        let malformed_cli_row = r#"{
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "label": 1e400,
+                            "modelOrAlias": { "model": "same-model" },
+                            "quotaInfo": { "remainingFraction": 0.4 }
+                        },
+                        {
+                            "modelOrAlias": { "model": "same-model" },
+                            "quotaInfo": { "remainingFraction": 0.5 }
+                        }
+                    ]
+                }
+            }
+        }"#;
+        assert_overflowing_duplicate(parse_user_status(malformed_cli_row, now).unwrap().windows);
+
+        let malformed_model_row = r#"{
+            "models": {
+                "same-model": {
+                    "displayName": 1e400,
+                    "quotaInfo": { "remainingFraction": 0.4 }
+                },
+                " same-model ": {
+                    "quotaInfo": { "remainingFraction": 0.5 }
+                }
+            }
+        }"#;
+        assert_overflowing_duplicate(models_from_available(malformed_model_row, now).unwrap());
+
+        let malformed_bucket_fields = r#"{
+            "buckets": [
+                { "modelId": 42, "remainingFraction": 0.4 },
+                { "modelId": "valid", "remainingFraction": 0.5 }
+            ]
+        }"#;
+        let malformed_bucket_windows = buckets_from_quota(malformed_bucket_fields, now).unwrap();
+        assert_eq!(malformed_bucket_windows.len(), 2);
+        assert!(malformed_bucket_windows
+            .iter()
+            .any(|window| window.pace_window_key_for_test() == Some("model.valid.v1")));
+        let malformed_bucket_wire = serde_json::to_value(&malformed_bucket_windows[0]).unwrap();
+        assert_eq!(
+            malformed_bucket_wire["paceStatus"]["reason"],
+            "windowIdentity"
+        );
+
+        assert!(quota_window(
+            "Non-finite".to_string(),
+            f64::NAN,
+            None,
+            now,
+            "model.non-finite.v1".to_string(),
+            Some("model.non-finite.v1".to_string()),
+        )
+        .is_none());
+        assert!(!binding_candidate_is_better(
+            -0.1, None, 1, 0.5, None, 0, now
+        ));
+    }
+
+    #[test]
+    fn remote_scope_and_presentation_ignore_unbound_active_email() {
+        let stale_active_email = "stale-other-account@example.com";
+        let credentials = json!({
+            "access_token": "short-lived-access",
+            "refresh_token": "bound-google-refresh"
+        });
+        assert_eq!(
+            remote_refresh_marker(&credentials),
+            Some(b"bound-google-refresh".as_slice())
+        );
+        assert_ne!(
+            remote_refresh_marker(&credentials),
+            Some(stale_active_email.as_bytes())
+        );
+        let identity = remote_identity(Some("Paid".to_string()));
+        assert_eq!(identity.email, None);
+        assert_eq!(identity.plan.as_deref(), Some("Paid"));
+
+        let access_only = json!({ "access_token": "access-is-not-the-frozen-marker" });
+        assert_eq!(remote_refresh_marker(&access_only), None);
+    }
+
+    #[test]
+    fn local_route_fails_closed_without_authenticated_email() {
+        let fetched = parse_user_status(
+            r#"{"userStatus":{"cascadeModelConfigData":{"clientModelConfigs":[]}}}"#,
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            fetched.account_scope,
+            Err(AccountScopeError::NoTrustedEvidence)
+        );
+    }
+
+    #[test]
     fn resolves_remote_plan_from_tier() {
-        assert_eq!(resolve_remote_plan(&json!({"currentTier":{"id":"free-tier"}})).as_deref(), Some("Free"));
-        assert_eq!(resolve_remote_plan(&json!({"planInfo":{"planType":"standard"}})).as_deref(), Some("Standard"));
+        assert_eq!(
+            resolve_remote_plan(&json!({"currentTier":{"id":"free-tier"}})).as_deref(),
+            Some("Free")
+        );
+        assert_eq!(
+            resolve_remote_plan(&json!({"planInfo":{"planType":"standard"}})).as_deref(),
+            Some("Standard")
+        );
+    }
+
+    fn checkpoint_at(
+        target: Option<RefreshCheckpoint>,
+    ) -> impl FnMut(RefreshCheckpoint) -> Result<(), String> {
+        move |checkpoint| {
+            if Some(checkpoint) == target {
+                Err("injected crash".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    async fn test_refresh_response(refresh_token: String) -> Result<Value, String> {
+        assert_eq!(refresh_token, "antigravity-old-refresh");
+        Ok(json!({
+            "access_token": "antigravity-new-access",
+            "refresh_token": "antigravity-new-refresh",
+            "expires_in": 3600
+        }))
+    }
+
+    fn setup_refresh(tag: &str) -> (TestRefreshScope, PathBuf, AccountScope, Vec<u8>, String) {
+        let scope = TestRefreshScope::new("antigravity", tag);
+        let path = scope.root().join("antigravity/oauth_creds.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "access_token": "antigravity-old-access",
+                "refresh_token": "antigravity-old-refresh",
+                "expiry_date": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let location = remote_scope_location(&path).unwrap();
+        let old_scope = scope
+            .resolve_current("google-oauth-creds", &location, b"antigravity-old-refresh")
+            .unwrap();
+        let metadata = scope.metadata_bytes();
+        (scope, path, old_scope, metadata, location)
+    }
+
+    async fn run_refresh(
+        scope: &TestRefreshScope,
+        path: &Path,
+        crash: Option<RefreshCheckpoint>,
+    ) -> Result<(Value, String, Result<AccountScope, AccountScopeError>), String> {
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        refresh_access_token_with(
+            path,
+            now,
+            scope,
+            test_refresh_response,
+            |creds| write_creds_atomic(path, creds),
+            checkpoint_at(crash),
+        )
+        .await
+    }
+
+    fn stored_refresh_token(path: &Path) -> String {
+        let credentials = load_remote_credentials(path).unwrap();
+        std::str::from_utf8(remote_refresh_marker(&credentials).unwrap())
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn refresh_crash_boundaries_and_scope_gate_use_production_sequence() {
+        for boundary in [
+            RefreshCheckpoint::Reloaded,
+            RefreshCheckpoint::NetworkReturned,
+            RefreshCheckpoint::MetadataHandled,
+            RefreshCheckpoint::CredentialsPersisted,
+        ] {
+            let (scope, path, old_scope, before, location) = setup_refresh("antigravity-crash");
+            assert_eq!(
+                run_refresh(&scope, &path, Some(boundary))
+                    .await
+                    .unwrap_err(),
+                "injected crash"
+            );
+            assert_eq!(
+                stored_refresh_token(&path),
+                if boundary == RefreshCheckpoint::CredentialsPersisted {
+                    "antigravity-new-refresh"
+                } else {
+                    "antigravity-old-refresh"
+                }
+            );
+            if matches!(
+                boundary,
+                RefreshCheckpoint::Reloaded | RefreshCheckpoint::NetworkReturned
+            ) {
+                assert_eq!(scope.metadata_bytes(), before);
+            } else {
+                assert_ne!(scope.metadata_bytes(), before);
+                assert_eq!(
+                    scope
+                        .resolve_current(
+                            "google-oauth-creds",
+                            &location,
+                            b"antigravity-old-refresh",
+                        )
+                        .unwrap(),
+                    old_scope
+                );
+                assert_eq!(
+                    scope
+                        .resolve_current(
+                            "google-oauth-creds",
+                            &location,
+                            b"antigravity-new-refresh",
+                        )
+                        .unwrap(),
+                    old_scope
+                );
+            }
+            scope.cleanup();
+        }
+
+        let (scope, path, old_scope, before, location) = setup_refresh("antigravity-metadata-fail");
+        scope.fail_metadata_save();
+        let (refreshed, access_token, scope_outcome) =
+            run_refresh(&scope, &path, None).await.unwrap();
+        assert_eq!(access_token, "antigravity-new-access");
+        assert_eq!(remote_access_token(&refreshed).unwrap(), access_token);
+        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+        assert_eq!(scope.metadata_bytes(), before);
+        assert_eq!(stored_refresh_token(&path), "antigravity-old-refresh");
+        assert_eq!(
+            scope
+                .resolve_current("google-oauth-creds", &location, b"antigravity-old-refresh",)
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
+
+        let (scope, path, _old_scope, before, _) =
+            setup_refresh("antigravity-metadata-fail-unchanged");
+        scope.fail_metadata_save();
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let save_path = path.clone();
+        let (refreshed, access_token, scope_outcome) = refresh_access_token_with(
+            &path,
+            now,
+            &scope,
+            |refresh_token| async move {
+                assert_eq!(refresh_token, "antigravity-old-refresh");
+                Ok(json!({
+                    "access_token": "antigravity-new-access",
+                    "expires_in": 3600
+                }))
+            },
+            move |credentials| write_creds_atomic(&save_path, credentials),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scope_outcome, Err(AccountScopeError::MetadataWrite));
+        assert_eq!(scope.metadata_bytes(), before);
+        assert_eq!(access_token, "antigravity-new-access");
+        assert_eq!(remote_access_token(&refreshed).unwrap(), access_token);
+        let persisted = load_remote_credentials(&path).unwrap();
+        assert_eq!(remote_access_token(&persisted).unwrap(), access_token);
+        assert_eq!(stored_refresh_token(&path), "antigravity-old-refresh");
+        scope.cleanup();
+
+        let (scope, path, old_scope, _, location) = setup_refresh("antigravity-success");
+        let (_, _, scope_outcome) = run_refresh(&scope, &path, None).await.unwrap();
+        assert_eq!(scope_outcome.unwrap(), old_scope);
+        assert_eq!(
+            scope
+                .resolve_current("google-oauth-creds", &location, b"antigravity-new-refresh",)
+                .unwrap(),
+            old_scope
+        );
+        scope.cleanup();
     }
 }
