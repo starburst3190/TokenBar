@@ -75,7 +75,7 @@ struct SettingsWindowView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Live preview — settings apply immediately.")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
 
             section("Menu bar") {
                 VStack(spacing: 6) {
@@ -110,7 +110,7 @@ struct SettingsWindowView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label.uppercased())
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             content()
         }
     }
