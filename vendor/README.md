@@ -24,7 +24,7 @@ M25 merged in PR [#75](https://github.com/Nanako0129/TokenBar/pull/75) and moved
 
 M22 PR [#72](https://github.com/Nanako0129/TokenBar/pull/72) is closed and unmerged (`merged=false`), so none of its implementation is part of main. Its head is [`c41b864b2b867bd84b69e82ff391b0197177775e`](https://github.com/Nanako0129/TokenBar/commit/c41b864b2b867bd84b69e82ff391b0197177775e), spanning 17 commits and 12 files (`+4392/-52`), with production drift about 2.1–2.5x upstream and total drift about 3.1–3.5x, including 15 review-driven fixes and about 520 lines of custom cross-store matching. Under the fidelity rule, M22 is `DEFER` until upstream converges; do not treat its code as landed or assume `ClientId::Zcode` / `COUNT=34`.
 
-M23 is now split after PR #74 (`e274f2ad`) reached about 3.1x Copilot production drift and 14 review rounds without converging. M23-H takes only the faithful Hermes Windows discovery residual (`c1aef5e9`); M23-D will rebuild Copilot Desktop from `f6f7eced + 0b454e60`; M23-V moves VS Code `chatSessions` (`074619f7`) to `DEFER` until upstream fixes ObjectMutationLog replay. This checkpoint is `76/5/0/16/13/1`, with cache schema 32 unchanged.
+M23 is split after PR #74 (`e274f2ad`) reached about 3.1x Copilot production drift and 14 review rounds without converging. M23-H merged in PR [#82](https://github.com/Nanako0129/TokenBar/pull/82) at [`1a8ee0c6`](https://github.com/Nanako0129/TokenBar/commit/1a8ee0c62429472589308c2836c026d6e5432243) with only the faithful Hermes Windows discovery residual (`c1aef5e9`). The current M23-D checkpoint rebuilds Copilot Desktop from `f6f7eced + 0b454e60` with one pre-aggregation OTEL-session authority selector; M23-V keeps VS Code `chatSessions` (`074619f7`) in `DEFER` until upstream fixes ObjectMutationLog replay. This checkpoint is `78/3/0/16/13/1`, with cache schema 32 unchanged.
 
 The immutable audited set is the 111 hashes produced in a clean upstream clone:
 
@@ -38,8 +38,8 @@ The classification union has no duplicates and no symmetric difference from that
 
 | Classification | Count |
 |---|---:|
-| `ALREADY_VENDORED` | 76 |
-| `TAKE` | 5 |
+| `ALREADY_VENDORED` | 78 |
+| `TAKE` | 3 |
 | `ADAPT_FOR_STREAMING` | 0 |
 | `DEFER` | 16 |
 | `SKIP` | 13 |
@@ -49,7 +49,7 @@ The classification union has no duplicates and no symmetric difference from that
 ### Exact 111-commit classification
 
 <details>
-<summary><code>ALREADY_VENDORED</code> — 76</summary>
+<summary><code>ALREADY_VENDORED</code> — 78</summary>
 
 ```text
 6dfd79f5 d9f2a9b7 44055841 1a305f0f 5c1fe659 7500b303 8493048f 2d90f41d
@@ -61,16 +61,16 @@ d4a3bd32 1492b962 b43dc5f8 4101711b 28aec200 aebe4ea8 5017eefb 0ce3d73f
 d50da475 24e3771c e5cfbae2 b64e4f14 72bf6667 46e01977 31bfd167 09344531
 163ec570 a2f7cef5 a0929482 366ce643 405ded4a 315549b4 6899ea03 b59979c5
 9155018c 18cd13cc a87f0ab6 959cce84 6c804711 839ce378 052f43de 633ea946
-77948d9d 302d39c3 9a5aeb65 c1aef5e9
+77948d9d 302d39c3 9a5aeb65 c1aef5e9 f6f7eced 0b454e60
 ```
 
 </details>
 
 <details>
-<summary><code>TAKE</code> — 5</summary>
+<summary><code>TAKE</code> — 3</summary>
 
 ```text
-63a44d7c f6f7eced 0b454e60 ae36db5c cd07bf78
+63a44d7c ae36db5c cd07bf78
 ```
 
 </details>
@@ -116,7 +116,7 @@ b2b8c1fc 7ddfa748 b48af31e e644f966 010acd85 46f8fff9 c634d1a5
 
 ### Selected work
 
-M20 moved `366ce643` to `ALREADY_VENDORED`; M15-B moved `405ded4a` and `315549b4`; M16 moved `6899ea03`, `b59979c5`, `9155018c`, and `18cd13cc` to `ALREADY_VENDORED` while `34cfbb50` moved to `DEFER`; M19-A moved `a87f0ab6` after taking only its Windows atomic-replacement hunk; M17 used a non-main source and left the audited counts unchanged; M18 moved `959cce84` and `6c804711`; M21 moved `839ce378`, `052f43de`, `633ea946`, `77948d9d`, and `302d39c3` to `ALREADY_VENDORED`. M22 is closed unmerged, so no implementation row moved to `ALREADY_VENDORED`; the product decision instead reclassified its five Zcode-bearing rows from `TAKE` to `DEFER`. M25 moved `9a5aeb65` to `ALREADY_VENDORED`. M23-H moves `c1aef5e9` to `ALREADY_VENDORED` and reclassifies `074619f7` to `DEFER`; M23-D retains the two Desktop rows in `TAKE`. Mixed `b64d861e` remains one `DEFER` row because only its Kiro, Jcode, Junie, and OpenCodeReview hunks are vendored while Zcode and Devin remain excluded.
+M20 moved `366ce643` to `ALREADY_VENDORED`; M15-B moved `405ded4a` and `315549b4`; M16 moved `6899ea03`, `b59979c5`, `9155018c`, and `18cd13cc` to `ALREADY_VENDORED` while `34cfbb50` moved to `DEFER`; M19-A moved `a87f0ab6` after taking only its Windows atomic-replacement hunk; M17 used a non-main source and left the audited counts unchanged; M18 moved `959cce84` and `6c804711`; M21 moved `839ce378`, `052f43de`, `633ea946`, `77948d9d`, and `302d39c3` to `ALREADY_VENDORED`. M22 is closed unmerged, so no implementation row moved to `ALREADY_VENDORED`; the product decision instead reclassified its five Zcode-bearing rows from `TAKE` to `DEFER`. M25 moved `9a5aeb65` to `ALREADY_VENDORED`. M23-H moved `c1aef5e9` to `ALREADY_VENDORED` and reclassified `074619f7` to `DEFER`; the current M23-D checkpoint moves `f6f7eced` and `0b454e60` to `ALREADY_VENDORED`. Mixed `b64d861e` remains one `DEFER` row because only its Kiro, Jcode, Junie, and OpenCodeReview hunks are vendored while Zcode and Devin remain excluded.
 
 | Milestone | Selected scope | Audited-range commits |
 |---|---|---|
@@ -126,8 +126,8 @@ M20 moved `366ce643` to `ALREADY_VENDORED`; M15-B moved `405ded4a` and `315549b4
 | M17 — merged in PR #69 | Grok unified-log precedence across all cache/report lanes | Non-main `ed798642` |
 | M21 — merged in PR #71 | Kimi Code, Junie, and OpenCodeReview | `839ce378 052f43de 633ea946 77948d9d 302d39c3` + `b64d861e` Junie/OpenCodeReview hunks |
 | M22 — PR #72 closed unmerged / DEFER | Zcode legacy and v2; no implementation landed | `640e97b9 f7a124da ed6f8b95 65f8f3e2` + `b64d861e` Zcode hunk remain deferred |
-| M23-H — current checkpoint | Hermes Windows default/profile discovery | `c1aef5e9` |
-| M23-D — next serial milestone | Copilot Desktop token source | `f6f7eced 0b454e60` |
+| M23-H — merged in PR #82 | Hermes Windows default/profile discovery | `c1aef5e9` |
+| M23-D — current checkpoint | Copilot Desktop token source with OTEL whole-session authority | `f6f7eced 0b454e60` |
 | M23-V — DEFER | Copilot VS Code `chatSessions`; upstream ObjectMutationLog replay is not yet trustworthy | `074619f7` |
 | M18 — merged in PR #70 | Sakana/Fugu pricing and the full routed-pricing pipeline | `959cce84 6c804711` |
 | M25 — merged in PR #75 | Reloadable configurable model aliases | `9a5aeb65` |
@@ -189,7 +189,7 @@ flowchart TD
 | M21 | `839ce378 052f43de 633ea946 77948d9d 302d39c3: TAKE → ALREADY_VENDORED`; `b64d861e` remains `TAKE` |
 | M22 | Closed unmerged / DEFER; `640e97b9 f7a124da ed6f8b95 65f8f3e2 b64d861e: TAKE → DEFER` under the fidelity threshold |
 | M23-H | `c1aef5e9: TAKE → ALREADY_VENDORED`; `074619f7: TAKE → DEFER` after the PR #74 fidelity stop |
-| M23-D | `f6f7eced 0b454e60: TAKE → ALREADY_VENDORED` after the bounded Desktop milestone merges |
+| M23-D | Current checkpoint applies `f6f7eced 0b454e60: TAKE → ALREADY_VENDORED`; merge remains a separate authorization gate |
 | M23-V | No runtime branch; `074619f7` remains `DEFER` until upstream ObjectMutationLog semantics converge |
 | M18 | `959cce84 6c804711: TAKE → ALREADY_VENDORED`; non-main sources do not change counts |
 | M25 | `9a5aeb65: TAKE → ALREADY_VENDORED` |
@@ -202,7 +202,7 @@ If M23-D, M24, and M26 complete after this checkpoint, the terminal classificati
 
 The active monolithic cache is schema 32 after PR #77. M23-H changes discovery only, and M23-D adds a new independently fingerprinted source, so neither requires schema 33. M26 activates shard format 2 while leaving the legacy schema-32 monolith unread, unchanged, and available as provenance.
 
-Public issue #45 is the designated remote inventory. M25 merged in PR #75; M22 PR #72 is closed unmerged; PR #74 remains open and unmerged while M23-H and M23-D are rebuilt serially. Issue #45 must record M23-H only after its replacement PR actually merges, with the observed SHA, `76/5/0/16/13/1` ledger, unchanged schema 32, and M23-D as the next dependency. The private Project tracks executable milestones only; it does not duplicate the 111 commit rows.
+Public issue #45 is the designated remote inventory. M25 merged in PR #75; M22 PR #72 is closed unmerged; M23-H merged in PR #82 at `1a8ee0c6`; PR #74 remains open and unmerged while the local M23-D replacement is verified. Issue #45 still needs explicit remote authorization for the M23-H bookkeeping update, and must not record M23-D as landed until its own replacement PR merges. The private Project tracks executable milestones only; it does not duplicate the 111 commit rows.
 
 ## Cherry-picked upstream commits (ahead of baseline)
 
@@ -247,6 +247,7 @@ next sync should treat these as already-present and not re-apply them.
 | `#834` (`23cf62e0`, issue #829) — **M10-E** | Production baseline is upstream #834's final Copilot resolver: collect the full `parentSpanId` hierarchy and choose the first root `invoke_agent` span with an agent id, so nested sub-agent invokes exported first cannot hijack the trace fallback. The compact #821 reversed child-before-parent regression and its semantic are retained, without importing #821's intermediate `agent_from_invoke_agent` field. **TokenBar hardening over upstream #834, reported in issue [#879](https://github.com/junhoyeo/tokscale/issues/879) and merged via PR [#880](https://github.com/junhoyeo/tokscale/pull/880) (upstream commit `20d9096a68a40d4a4e83581b0e0dd308aadc5ab7`; GitHub merge commit `b7277d49a14ae905c17195be214d632e365b3ca6`):** first, collect every `traceId` + `spanId` + `parentSpanId` edge before the `attributes` gate, so attribute-less intermediate task/tool spans remain in the parent hierarchy; attributes are only used to identify `invoke_agent` and read agent ids. Second, scope `parent_of` and invoke-agent membership by `(traceId, spanId)` because OTel span ids are only unique within a trace, preventing reused ids in another trace from cross-contaminating the hierarchy. The local monolithic cache schema remains **27→28**; schema 28 is merged on TokenBar main, and both hardenings landed together in M10-E, so neither required an additional bump beyond 28. Preserves #723 cache-token aliases and #724/#751 per-record attribution. No scanner, fingerprint, FFI, Swift, or unrelated cache architecture changes. | `src/sessions/copilot.rs`, `src/message_cache.rs` |
 | `#833` (`85669602`) — **M10-F regression lock** | Codex scans both `~/.codex/sessions/` and `~/.codex/archived_sessions/`, and a transcript briefly present under both roots is counted once by content-derived session identity. The production scanner and dedup behavior were already present on the M10-F baseline, so this is deliberately a baseline-pass regression and parser-documentation lock rather than a production fix. **TokenBar adaptation:** one hermetic fixture proves live-only, archive-only, and duplicated shared sessions total exactly 3 messages / 150 input / 15 output across the materialized API, shipping streaming model report, and `parse_local_clients` count path. No parser output changed and cache schema remains 28. | `src/sessions/codex.rs`, `src/lib.rs` (tests) |
 | `#848` (`c1aef5e9`) — **M11 + M23-H** | Hermes root homes discover immediate `profiles/<profile>/state.db` databases even when the default DB is absent, while profile-scoped `HERMES_HOME=<root>/profiles/<name>` remains isolated from siblings/defaults, including through symlink aliases. M23-H completes the selected Windows residual: when `HERMES_HOME` is unset, discovery checks native `%LOCALAPPDATA%/hermes` and supplied-home `AppData/Local/hermes`; an explicit root or profile remains authoritative and never widens. The existing plural materialized/streaming/count, physical-path dedup, WAL probe, and fail-open pruning seams are reused unchanged. No parser output changed; M11 kept its then-active schema 28 and M23-H keeps the current schema 32. | `src/scanner.rs`, `src/sessions/hermes.rs`, `src/lib.rs` (tests) |
+| `#800` (`f6f7eced`) + follow-up `0b454e60` — **M23-D** | Adds the fixed `~/.copilot/data.db` token source, reads only token-bearing `sessions` rows, normalizes input-inclusive cache reads through the existing OTEL helper, parses SQLite fractional timestamps, and enriches model/workspace from sorted `session-state/*/events.jsonl` dependencies. **TokenBar adaptation:** `sessions.agent` is preserved as raw attribution; AIU-only rows, provider-reported cost, custom roots, and VS Code stores remain excluded. One raw `UnifiedMessage` selector gives OTEL whole-session authority before pricing, client/date filters, sessionization, and every report fold across materialized, shipping streaming, and count consumers. The Desktop fingerprint, latest-mtime probe, topology token, and fail-open pruning share the DB/WAL/event dependency set; a fresh Desktop source retains the complete OTEL suppressor cohort so incremental authority equals a full scan. Raw sources cache independently and the new source identity keeps schema 32. Hermetic fixtures cover agent attribution, AIU exclusion, date-window authority, cold/warm event and WAL invalidation, dependency-probe fail-open behavior, modified-after suppression, three-consumer projection, and graph/model/monthly/hourly/Agents parity. Parser production is 285 lines versus 261 lines in the final selected upstream `0b454e60` parser (+9.2%), within the M23 fidelity stop. | `src/sessions/copilot_desktop.rs`, `src/sessions/copilot.rs`, `src/sessions/mod.rs`, `src/scanner.rs`, `src/message_cache.rs`, `src/lib.rs` |
 | `#741` (`b49cec19`) — **M12 streaming-freshness completion** | RooCode, KiloCode, and Cline already used the specialized `from_roo_path` fingerprint in both materialized and streaming cache lanes, but TokenBar's live-tail change token and `modified_after` pruning still observed only `ui_messages.json`. A rewrite of the parser-read `api_conversation_history.json` could therefore leave model, agent, and pricing stale or prune an active task before fingerprint comparison. **TokenBar adaptation:** one parser-owned related-path helper now drives parsing, fingerprinting, latest-mtime probing, and sibling-aware fail-open pruning for all three wrappers. Hermetic regressions cover an absent-then-created sibling, history-only warm-cache refresh with materialized/streaming parity, all three change-token lanes, fresh-history pruning retention, and related-file stat failure. The fingerprint layout and parser output are unchanged, so cache schema remains 28. | `src/sessions/roocode.rs`, `src/message_cache.rs`, `src/lib.rs` |
 | `#856` (`ae36db5c`) — **M13 selective parser-dependency completion** | Existing Droid settings snapshots can read a same-session fallback JSONL for the model, legacy Kimi wire logs read the shared `~/.kimi/config.json`, and existing Kiro CLI session headers read a same-stem JSONL for estimated tokens, prompt time, and duration. Those dependencies were parser-only: both cache lanes, the live-tail token, and pruning still observed just the scanned primary. **TokenBar adaptation:** parser-owned path helpers now drive specialized monolithic fingerprints, materialized and shipping streaming lanes, latest-mtime probing, and sibling-aware fail-open pruning. Hermetic regressions cover absent-then-created and rewritten dependencies, independently warmed materialized/streaming caches, all three change-token lanes, fresh-dependency retention, missing-dependency pruning, and stat failure. The upstream shard cache, `CacheIdentity`, `parser_version`, Kimi Code, Kiro IDE/globalStorage/`.chat`/Windows sources, and unrelated client changes remain excluded. Related-file fingerprint storage already exists, so cache schema remains 28. | `src/sessions/droid.rs`, `src/sessions/kimi.rs`, `src/sessions/kiro.rs`, `src/message_cache.rs`, `src/lib.rs` |
 | `#878` (`3587f745`) — **M14** | Codex token snapshots now attribute `duration_ms` to non-overlapping intervals from the previous accepted snapshot rather than repeatedly measuring from the turn start. Invalid, equal, backward, replayed, duplicate, regressive, and zero-token rows do not advance the cursor; a new `turn_context` resets it. **TokenBar adaptation:** the cursor is serialized in the existing incremental state, the local monolithic cache schema bumps **28→29** so unchanged sources cannot replay overlapping durations or resume without the cursor, and hermetic regressions cover parser edge cases, incremental append parity, same-fingerprint schema-28 rebuild, materialized warm-cache parity, and shipping streaming cold/warm performance (`7,000 ms / 170 timed tokens / 3 samples`). Upstream's shard-cache `parser_version` bump is deliberately excluded; the existing Rust → FFI → Swift `ModelPerformance` shape is unchanged. | `src/sessions/codex.rs`, `src/message_cache.rs`, `src/lib.rs` (tests), `tests/fixtures/codex_duration_timing.jsonl` |

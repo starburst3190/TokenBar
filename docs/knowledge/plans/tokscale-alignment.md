@@ -4,7 +4,7 @@ id: kb-plan-tokscale-alignment
 kind: plan
 scope: repository
 read_when: planning the next vendor sync or reviewing issue #45 inventory
-last_verified: 2026-07-21
+last_verified: 2026-07-22
 sources: ["vendor/README.md", "public issue #45", "public tokscale history", "docs/knowledge/decisions/0003-selective-upstream-alignment.md"]
 ---
 
@@ -32,13 +32,13 @@ TokenBar follows upstream `tokscale` as a rolling source and selects bounded mil
 
 | Surface | Current value |
 |---|---|
-| TokenBar execution baseline | [`63fee93c`](https://github.com/Nanako0129/TokenBar/commit/63fee93cc48b75e0f92851b4dda5b81135ed99e1), including merged M25 PR #75, Grok PR #77, and v1.6.2 release metadata |
+| TokenBar execution baseline | [`1a8ee0c6`](https://github.com/Nanako0129/TokenBar/commit/1a8ee0c62429472589308c2836c026d6e5432243), including merged M23-H PR #82 |
 | tokscale target | [`366ce643`](https://github.com/junhoyeo/tokscale/commit/366ce64395594abf111e0409581d91016561b25a), 111 commits |
 | Fidelity stops | M22 PR #72 is closed unmerged; PR #74 remains open/unmerged at `e274f2ad` and is being replaced by M23-H + M23-D, with M23-V deferred |
-| 111-row classification | `ALREADY_VENDORED 76`, `TAKE 5`, `ADAPT_FOR_STREAMING 0`, `DEFER 16`, `SKIP 13`, `SUPERSEDED 1` |
-| Cache | Active monolithic schema is **32** after Grok `turn_completed.usage`; M23-H is discovery-only and does not bump it |
+| 111-row classification | `ALREADY_VENDORED 78`, `TAKE 3`, `ADAPT_FOR_STREAMING 0`, `DEFER 16`, `SKIP 13`, `SUPERSEDED 1` |
+| Cache | Active monolithic schema is **32** after Grok `turn_completed.usage`; M23-D adds a new independently fingerprinted source and does not bump it |
 
-The audited range and all referenced trees are readable from a clean upstream clone. The six categories are duplicate-free and have no symmetric difference from the 111-hash range. Through M25 the classification was `75/7/0/15/13/1`. M23-H now moves `c1aef5e9` to `ALREADY_VENDORED`, while the PR #74 fidelity decision moves VS Code `074619f7` to `DEFER`, producing `76/5/0/16/13/1`. Copilot Desktop rows `f6f7eced + 0b454e60` remain `TAKE` for the next serial milestone. Three non-main commits and one pre-anchor Warp commit are semantic sources only and do not enter the 111-row ledger.
+The audited range and all referenced trees are readable from a clean upstream clone. The six categories are duplicate-free and have no symmetric difference from the 111-hash range. Through M25 the classification was `75/7/0/15/13/1`. M23-H moved `c1aef5e9` to `ALREADY_VENDORED`, while the PR #74 fidelity decision moved VS Code `074619f7` to `DEFER`, producing `76/5/0/16/13/1`. The current M23-D checkpoint moves Copilot Desktop rows `f6f7eced + 0b454e60` to `ALREADY_VENDORED`, producing `78/3/0/16/13/1`. Three non-main commits and one pre-anchor Warp commit are semantic sources only and do not enter the 111-row ledger.
 
 ### Merged milestone drift audit
 
@@ -96,7 +96,7 @@ flowchart TD
     S --> WS[M19-B final TokenBar-Windows re-sync]
 ```
 
-The shared-parser critical path through M17, the money-correctness M18 checkpoint, the independent M19-A filesystem checkpoint, M21, and M25 are merged. M22 is closed unmerged and deferred. M23-H follows M21 directly and completes only Hermes Windows discovery; M23-D follows it serially for Copilot Desktop; M23-V is deferred and does not block M26. M24 can attach to M25's shared invalidation seam. M26 waits for M23-D, M24, and M19-A, then M19-B runs exactly once.
+The shared-parser critical path through M17, the money-correctness M18 checkpoint, the independent M19-A filesystem checkpoint, M21, M25, and M23-H are merged. M22 is closed unmerged and deferred. M23-D is the current local checkpoint for Copilot Desktop; M23-V is deferred and does not block M26. M24 can attach to M25's shared invalidation seam. M26 waits for M23-D, M24, and M19-A, then M19-B runs exactly once.
 
 ## Milestone queue
 
@@ -109,8 +109,8 @@ The shared-parser critical path through M17, the money-correctness M18 checkpoin
 | M17 | M16 | Merged as PR #69 at `d4ff968b`: select exact top-level Grok unified logs once over covered legacy sessions across materialized, shipping streaming, count, graph/time, and report lanes; retain legacy-only fallback, model/workspace carry-over, process/model authority, token/message semantics, topology-sensitive invalidation, and post-selector pricing | Kept schema 31 |
 | M21 | M17 | Merged as PR #71 at `471a7f239f0270b4ebfaed04894335c506d588d3`: add Kimi Code beside legacy Kimi through structural parser selection and `KIMI_CODE_HOME`; append Junie/OpenCodeReview as client IDs 31/32; preserve Junie provider-reported cost, prompt ownership, duration anchors, OpenCodeReview workspace metadata, and materialized/streaming/count/report parity | Keep schema 31 |
 | M22 | M21 | PR #72 closed unmerged; DEFER until upstream converges because its Zcode cross-store/parser/schema/provider/scanner scope exceeded the fidelity threshold | Keep schema 31; no rollback because it never merged |
-| M23-H | M21 | Current checkpoint: add only Hermes Windows `%LOCALAPPDATA%/hermes` and supplied-home `AppData/Local/hermes` candidates while preserving explicit `HERMES_HOME` isolation and all existing plural DB consumers | Keep current schema 32 |
-| M23-D | M23-H merged | Rebuild the upstream-bounded Copilot Desktop token source with one pre-aggregation OTEL-session authority selector across materialized, shipping streaming, count, cache, mtime, pruning, and report paths | Keep current schema 32 |
+| M23-H | M21 | Merged as PR #82 at `1a8ee0c6`: add only Hermes Windows `%LOCALAPPDATA%/hermes` and supplied-home `AppData/Local/hermes` candidates while preserving explicit `HERMES_HOME` isolation and all existing plural DB consumers | Kept schema 32 |
+| M23-D | M23-H merged | Current local checkpoint: upstream-bounded Copilot Desktop token source with DB agent attribution, token-only rows, one pre-aggregation OTEL-session authority selector, raw DB/WAL/event-aware caching, fail-open pruning, and materialized/streaming/count/report parity | Keep current schema 32 |
 | M23-V | Fidelity stop | DEFER `074619f7`; do not revive PR #74 until upstream fixes ObjectMutationLog replay or a reproducible format contract exists | No runtime change |
 | M18 | M16 | Merged as PR #70 at `0735fd2b`: add `fugu-ultra` regular/long rates, select one whole-request tier only for verified Sakana and LiteLLM GPT-5.4/GPT-5.5 when `input + cache_read > 272,000`, preserve bare `fugu` as unpriced, and enforce exact raw/custom first refusal, parenthesized validation, provider-scoped fail-closed behavior, bounded path/terminal fallbacks, case-insensitive forced-source isolation, provider ranking/cache backfill, and one Claude never-degrade guard | Kept schema 31 |
 | M25 | M18 | Merged in PR #75: reloadable grouping aliases (`set_model_aliases` / `clear_model_aliases`), alias-free `canonical_model_id`, and process-wide usage-data invalidation (`model_alias_generation` + hooks); Swift/FFI settings wiring deferred | Kept then-active schema 31; current main is 32 after PR #77 |
@@ -119,7 +119,7 @@ The shared-parser critical path through M17, the money-correctness M18 checkpoin
 | M26 | M23-D + M24 + M19-A | Activate 256 identity-aware cache shards across every materialized, streaming, count, and report lane, including `cd07bf78` generic related-file path/existence metadata while excluding Devin behavior | Active shard format 2; leave legacy schema-32 monolith untouched |
 | M19-B | M26 merged | Reconcile Windows-only residuals and perform one final Rust/header/registry re-sync with parity gates | Sync shard format 2 and legacy schema-32 provenance |
 
-Every runtime merge applies the deterministic ledger delta recorded in [`vendor/README.md`](../../../vendor/README.md), regenerates all six hash sets, and rechecks duplicates plus both symmetric-difference directions. This M23-H checkpoint is `76/5/0/16/13/1`; after M23-D, M24, and M26, the terminal ledger is `80/0/0/17/13/1`, total 111. The difference from the older forecast is M23-V: `074619f7` remains deferred. M26 moves `cd07bf78` from `TAKE` to `DEFER`. Fidelity rule: preserve necessary TokenBar streaming/FFI seams, but stop when core parser/authority needs continuous systematic repair, custom algorithm scope exceeds upstream, or review exposes new failure classes; defer until upstream converges rather than continuing by sunk cost.
+Every runtime merge applies the deterministic ledger delta recorded in [`vendor/README.md`](../../../vendor/README.md), regenerates all six hash sets, and rechecks duplicates plus both symmetric-difference directions. The current M23-D checkpoint is `78/3/0/16/13/1`; after M24 and M26, the terminal ledger is `80/0/0/17/13/1`, total 111. The difference from the older forecast is M23-V: `074619f7` remains deferred. M26 moves `cd07bf78` from `TAKE` to `DEFER`. Fidelity rule: preserve necessary TokenBar streaming/FFI seams, but stop when core parser/authority needs continuous systematic repair, custom algorithm scope exceeds upstream, or review exposes new failure classes; defer until upstream converges rather than continuing by sunk cost.
 
 ## Ownership and integration
 
@@ -172,7 +172,7 @@ A milestone is complete only after its implementation and mandatory docs share o
 | Surface | Responsibility |
 |---|---|
 | [`vendor/README.md`](../../../vendor/README.md) | Exact 111-row classification, selected/mixed commit accounting, transition matrix, cache provenance, and local patch ledger |
-| [Issue #45](https://github.com/Nanako0129/TokenBar/issues/45) | Designated public ledger; M25 is merged as PR #75, M22 PR #72 is closed unmerged and deferred, and M23-H must be recorded only after its replacement PR actually merges |
+| [Issue #45](https://github.com/Nanako0129/TokenBar/issues/45) | Designated public ledger; M23-H is merged as PR #82 but its issue bookkeeping still needs explicit remote authorization; M23-D must not be recorded as landed before its own replacement PR merges |
 | Private Project #1 | Executable milestone cards only; no duplicate commit-by-commit ledger and no parser-preparation branches |
 | This plan | Product decisions, dependency graph, ownership, cache schedule, and milestone completion contract |
 | [`current-state.md`](../current-state.md) | Concise current queue and maintenance handoff |
