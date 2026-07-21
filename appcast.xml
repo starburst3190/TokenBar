@@ -3,6 +3,41 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>1.6.0</title>
+            <pubDate>Tue, 21 Jul 2026 06:32:08 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.6.0</link>
+            <sparkle:version>379</sparkle:version>
+            <sparkle:shortVersionString>1.6.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>New:</b>
+<ul>
+<li>Count more local usage: expanded sources on existing clients (OpenCode v2 databases, Kiro IDE globalStorage and structured sessions, Kimi Code beside legacy Kimi) plus new first-class clients Junie and OpenCodeReview.</li>
+<li>Grok Agent Limits shows weekly SuperGrok credits and, best-effort, monthly included allowance only when the API returns used/limit; a monthly miss does not sink weekly.</li>
+<li>Historical quota pace can learn on eligible recurring windows for Codex, Claude, Grok, Antigravity, and Copilot (not every % card; not only Codex Weekly).</li>
+</ul>
+<b>Improved:</b>
+<ul>
+<li>Grok Build multi-turn usage now follows real turn_completed API usage and unified logs when present, so totals match the product more closely than context counters did. Totals may rise versus 1.5.0 — accuracy correction, not new spend.</li>
+<li>Long-context and routed pricing paths resolve cost more carefully for verified Sakana and LiteLLM-style requests.</li>
+<li>Usage cache schema advances 29→32 (via 30/31); first launch after this update rebuilds the local usage cache once so new parsers and Grok fixes are not mixed with stale rows; later refreshes stay fast.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Grok weekly quota no longer fails the whole card right after a weekly reset when percent fields are omitted.</li>
+<li>Quota card selections keep internal "|" characters so model-scoped windows are not mis-parsed.</li>
+<li>Existing Codex, Claude, Copilot, and related parsers tighten duration anchoring and dedup so shared sessions are less likely to double-count.</li>
+</ul>
+<b>Not in this release:</b>
+<ul>
+<li>Copilot Desktop / VS Code chatSessions / Hermes Windows (still in progress)</li>
+<li>Zcode</li>
+<li>Model-alias settings UI</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.6.0/TokenBar.app.tar.gz" length="7842236" type="application/octet-stream" sparkle:edSignature="fHiR6/RyKJpZDYuA2GWour0Ood72DXJQwFjRaW+41zUDvmf5AkW6cuL6ua9+g6mcYNqeVu5XYPNrNjJbngp2Aw=="/>
+        </item>
+        <item>
             <title>1.5.0</title>
             <pubDate>Thu, 16 Jul 2026 19:21:13 +0000</pubDate>
             <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.5.0</link>
@@ -95,36 +130,6 @@
 <p>Thanks: @starburst3190</p>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.2.1/TokenBar.app.tar.gz" length="7390153" type="application/octet-stream" sparkle:edSignature="eDN5+9T9AABCFgkPgP09ifDUBUDgniW5xntTtMJJcm7omqQ/4fEVRxxFYWDDivO/9mCJaqXWnexEKXi9gLkDAQ=="/>
-        </item>
-        <item>
-            <title>1.2.0</title>
-            <pubDate>Sat, 04 Jul 2026 11:59:48 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.2.0</link>
-            <sparkle:version>192</sparkle:version>
-            <sparkle:shortVersionString>1.2.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>New:</b>
-<ul>
-<li>Claude limits now work with setup-token / CLAUDE_CODE_OAUTH_TOKEN. When the usage endpoint is scope-blocked (403 user:profile), TokenBar reads your Session (5h) and Weekly (7d) windows from Anthropic's rate-limit response headers, and picks the token up from your environment or Keychain. Thanks @sayre4ux (#26).</li>
-</ul>
-<b>Accuracy — parsing engine caught up to tokscale v4.0.7:</b>
-<ul>
-<li>MiMo Code usage now parses at all (it was reading empty).</li>
-<li>Codex: fixed a ~50% token under-count on same-millisecond forks.</li>
-<li>GitHub Copilot: sub-agents are now attributed separately instead of collapsing into one bucket.</li>
-<li>Recovered dropped spend for gjc and Pi (messages with no provider field were skipped).</li>
-<li>Fixed provider bucketing and pricing across OpenCode, Kilo, Mux, Antigravity and Jcode.</li>
-<li>fable-5 is now priced correctly instead of resolving to "unknown".</li>
-<li>More accurate "active days" and average-per-day.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>Refreshed every agent brand icon: fixed 4 wrong and 2 broken ones, and added marks for 8 that showed a plain letter disc.</li>
-<li>Homebrew: silenced the depends_on macos: deprecation warning. Thanks @yiskang (#23).</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.2.0/TokenBar.app.tar.gz" length="7390235" type="application/octet-stream" sparkle:edSignature="9RRaaKVKIGuYWsvZbMdZOKRHAn4mC3odcHoBPTpov2naMTQbshU6qV72FTGGpFN/amEE1UhBgpf8Uzp0jTb7CQ=="/>
         </item>
         <item>
             <title>1.1.1</title>
