@@ -169,7 +169,7 @@ struct UsageChartCard: View {
                 if hidden > 0 {
                     Text("+\(hidden)")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
             }
         }
@@ -275,7 +275,7 @@ struct UsageChartCard: View {
     private func axisLabel(_ date: String?) -> some View {
         Text(date.map(Format.monthDay) ?? "")
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
     }
 
     private func barTotal(_ bar: DayBar) -> Double {

@@ -65,7 +65,7 @@ struct ModelBreakdownCard: View {
                         .foregroundStyle(.secondary)
                     if let updatedAt = report?.pricingUpdatedAt {
                         Text("Prices updated \(Format.relativeTime(updatedAt))")
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                             .help("LiteLLM pricing data; refreshes automatically about once an hour")
                     }
                 }
@@ -267,7 +267,7 @@ struct ModelUsageTooltip: View {
             }
             Text([context, provider].compactMap { $0 }.joined(separator: " · "))
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             HStack {
                 Text("\(Format.compactTokens(total)) tokens")
                 Spacer()

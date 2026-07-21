@@ -441,7 +441,7 @@ struct PopoverView: View {
         HStack {
             Text(effectiveView.label)
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             Spacer()
             if let version = UpdaterService.shared.availableVersion {
                 Button {
