@@ -1,9 +1,19 @@
 New:
-- Browse spending by month, drill into each month's per-model usage, and choose which optional dashboard views appear.
+- Count more local usage: expanded sources on existing clients (OpenCode v2 databases, Kiro IDE globalStorage and structured sessions, Kimi Code beside legacy Kimi) plus new first-class clients Junie and OpenCodeReview.
+- Grok Agent Limits shows weekly SuperGrok credits and, best-effort, monthly included allowance only when the API returns used/limit; a monthly miss does not sink weekly.
+- Historical quota pace can learn on eligible recurring windows for Codex, Claude, Grok, Antigravity, and Copilot (not every % card; not only Codex Weekly).
 
 Improved:
-- Codex Weekly historical pace now learns from a clean, account-scoped history so expected usage, run-out timing, and risk stay consistent. Learning starts fresh after this update; Linear pace is used until enough complete weeks are available.
-- Quota cards keep pace, ETA, and risk readable by moving projection details to a second line when space is tight.
+- Grok Build multi-turn usage now follows real turn_completed API usage and unified logs when present, so totals match the product more closely than context counters did. Totals may rise versus 1.5.0 — accuracy correction, not new spend.
+- Long-context and routed pricing paths resolve cost more carefully for verified Sakana and LiteLLM-style requests.
+- Usage cache schema advances 29→32 (via 30/31); first launch after this update rebuilds the local usage cache once so new parsers and Grok fixes are not mixed with stale rows; later refreshes stay fast.
 
 Fixes:
-- Monthly keeps message-only activity visible even when its token and cost totals are zero.
+- Grok weekly quota no longer fails the whole card right after a weekly reset when percent fields are omitted.
+- Quota card selections keep internal "|" characters so model-scoped windows are not mis-parsed.
+- Existing Codex, Claude, Copilot, and related parsers tighten duration anchoring and dedup so shared sessions are less likely to double-count.
+
+Not in this release:
+- Copilot Desktop / VS Code chatSessions / Hermes Windows (still in progress)
+- Zcode
+- Model-alias settings UI
