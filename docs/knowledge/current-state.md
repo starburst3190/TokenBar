@@ -36,7 +36,7 @@ TokenBar native 已完成從 Tauri 到 SwiftUI 的出貨重寫，現在是維護
 | Area | Current evidence |
 |---|---|
 | Product | Native SwiftUI menu-bar app is the shipping line; the predecessor Tauri repository is archived and remains a legacy migration source |
-| Vendor | Current main baseline `471a7f239f0270b4ebfaed04894335c506d588d3` includes merged M21; upstream target is `366ce643` across 111 core commits classified as 74 already / 8 take / 0 adapt / 15 defer / 13 skip / 1 superseded; local cache schema is 31 |
+| Vendor | Current main baseline `471a7f239f0270b4ebfaed04894335c506d588d3` includes merged M21; upstream target is `366ce643` across 111 core commits classified as 74 already / 8 take / 0 adapt / 15 defer / 13 skip / 1 superseded; local cache schema is 32 (PR #77 Grok `turn_completed.usage`; schema 31 is the pre-PR-77 historical baseline) |
 | Correctness | Cost provenance, Jcode correction turns, Pi metadata, Claude workflow transcripts, Copilot hierarchy, hidden-client filtering, and bounded folds have landed in staged releases or main history |
 | Release | Stable Sparkle feed, Homebrew cask, legacy update metadata, and landing Pages workflows are maintained as separate delivery surfaces |
 | Current repository baseline | Before each task, fetch and resolve the current `origin/main`; this document is not a commit pin |
