@@ -166,7 +166,7 @@ edit dirty main WIP (`agent_grok` quota, unrelated rustfmt). Prefer branch
 | Item | Value |
 |---|---|
 | Branch | `fix/grok-turn-completed-usage` |
-| Worktree | `/Users/nanako/side-project/TokenBar-Native-wt-grok-usage` |
+| Worktree | isolated worktree on that branch (machine-local path not recorded) |
 | Base | `f1b35a89` (local main at plan time; behind `origin/main` — rebase before PR) |
 | Authorization | Plan + implement authorized by user; push/merge not authorized |
 | Upstream follow-up | Report that tokscale still uses context deltas; offer usage-primary port |
@@ -178,10 +178,12 @@ edit dirty main WIP (`agent_grok` quota, unrelated rustfmt). Prefer branch
 - [x] Live open turn does not double-count completed usage
 - [x] Cache schema 32 forces rebuild
 - [x] Ledger + plan registry updated
-- [x] Targeted tests green (`cargo test -p tokscale-core --lib sessions::grok::` — 15 passed)
+- [x] Targeted tests green (`cargo test -p tokscale-core --lib sessions::grok::`)
+- [x] Codex review follow-up: skip context on usage lines; preserve pre-usage legacy turns; zero split `message_count`; inherit parent cost/duration
 
 ## Implementation note (2026-07-21)
 
-Landed on branch `fix/grok-turn-completed-usage` (worktree
-`TokenBar-Native-wt-grok-usage`). Not pushed. Host session should rebase onto
-current `origin/main` before PR (base was local main `f1b35a89`, behind remote).
+Landed on branch `fix/grok-turn-completed-usage`. Host session should rebase onto
+current `origin/main` before PR when needed (base was local main `f1b35a89`,
+behind remote). Review follow-up fixed double-count on usage+context lines and
+mixed pre-upgrade sessions.
