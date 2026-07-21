@@ -10,7 +10,7 @@ sources:
   - "vendor/README.md"
   - "docs/knowledge/vendor-tokscale.md"
   - "docs/knowledge/verification.md"
-  - "local ~/.grok session probe 2026-07-21"
+  - "sanitized local Grok Build session probe (2026-07-21)"
 ---
 
 # Grok Build: prefer `turn_completed.usage` over context counters
@@ -75,8 +75,10 @@ fields:
 
 1. Emit one message per `modelUsage` entry when present; otherwise one message
    from the top-level usage object.
-2. Map tokens:
-   - `input` ← `inputTokens`
+2. Map tokens (Grok's `inputTokens` **includes** cache reads; TokenBar totals
+   sum every bucket, so net uncached input and put cache in its own field —
+   do **not** map raw `inputTokens` into `input` or totals double-count):
+   - `input` ← `inputTokens.saturating_sub(cachedReadTokens)` (floored at 0)
    - `output` ← `outputTokens`
    - `reasoning` ← `reasoningTokens`
    - `cache_read` ← `cachedReadTokens`

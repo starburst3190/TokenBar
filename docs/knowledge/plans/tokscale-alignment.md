@@ -36,7 +36,7 @@ TokenBar follows upstream `tokscale` as a rolling source and selects bounded mil
 | tokscale target | [`366ce643`](https://github.com/junhoyeo/tokscale/commit/366ce64395594abf111e0409581d91016561b25a), 111 commits |
 | M21/M22 checkpoint | M21 merged; M22 PR #72 is closed unmerged (`c41b864b2b867bd84b69e82ff391b0197177775e`), 17 commits / 12 files / `+4392/-52`; its code is not main |
 | 111-row classification | `ALREADY_VENDORED 74`, `TAKE 8`, `ADAPT_FOR_STREAMING 0`, `DEFER 15`, `SKIP 13`, `SUPERSEDED 1` |
-| Cache | TokenBar main uses monolithic schema 31; closed-unmerged M22 made no runtime change |
+| Cache | Active monolithic schema is **32** after Grok `turn_completed.usage` (was 31 through M21/M25; closed-unmerged M22 made no runtime change) |
 
 The audited range and all referenced trees are readable from a clean upstream clone. The six categories are duplicate-free and have no symmetric difference from the 111-hash range. M20 moved `366ce643`; M15-B moved `405ded4a` and `315549b4`; M16 moved `6899ea03`, `b59979c5`, `9155018c`, and `18cd13cc` to `ALREADY_VENDORED`, moved mixed `34cfbb50` to `DEFER`, and left mixed `b64d861e` as one `TAKE` row after its Jcode hunk. M19-A moved `a87f0ab6`; M17 used non-main `ed798642` and left the audited counts unchanged; M18 moved `959cce84` and `6c804711`. M21 moved `839ce378`, `052f43de`, `633ea946`, `77948d9d`, and `302d39c3` to `ALREADY_VENDORED`; M22 did not merge, and its five selected rows move to `DEFER`, producing `74/8/0/15/13/1`. M25 moved `9a5aeb65` to `ALREADY_VENDORED`, producing the post-M25-only `75/7/0/15/13/1` classification. Three non-main commits and one pre-anchor Warp commit are semantic sources only and do not enter the 111-row ledger.
 
