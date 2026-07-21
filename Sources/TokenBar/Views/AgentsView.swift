@@ -56,7 +56,7 @@ struct AgentsView: View {
                 Spacer()
                 Text(String(format: "%.1f%%", share))
                     .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
@@ -70,7 +70,7 @@ struct AgentsView: View {
             .frame(height: 6)
             HStack {
                 Text(sources)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                     .lineLimit(1)
                     .help(sources)
                 Spacer()

@@ -34,7 +34,7 @@ struct ModelsView: View {
                         .foregroundStyle(.secondary)
                     if let updatedAt = report?.pricingUpdatedAt {
                         Text("Prices updated \(Format.relativeTime(updatedAt))")
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                             .help("LiteLLM pricing data; refreshes automatically about once an hour")
                     }
                 }
@@ -70,11 +70,11 @@ struct ModelsView: View {
                         .help("\(entry.model) · \(ClientRegistry.style(entry.client).displayName)")
                     Text(String(format: "%.1f%%", share))
                         .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
                 HStack(spacing: 8) {
                     ForEach(Self.kinds, id: \.label) { kind in
-                        (Text(kind.label + " ").foregroundStyle(.tertiary)
+                        (Text(kind.label + " ").foregroundStyle(.tertiaryAdaptive)
                             + Text(Format.compactTokens(kind.pick(entry))))
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.secondary)

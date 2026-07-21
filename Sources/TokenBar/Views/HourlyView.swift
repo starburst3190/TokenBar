@@ -83,7 +83,7 @@ struct HourlyView: View {
             if filtered && hasData {
                 Text("Filtered hours include each slot's full total across agents.")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
             if report == nil {
                 Text("Loading…")

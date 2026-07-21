@@ -24,12 +24,12 @@ struct UsageTraceCard: View {
         DashCard(title, trailing: {
             Text("last \(windowMin)m · \(Format.compactTokens(Int64(totalRate.rounded())))/m total")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
         }) {
             if top.isEmpty {
                 Text("No activity in this window")
                     .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 8)
             } else {
@@ -53,7 +53,7 @@ struct UsageTraceCard: View {
                     .foregroundStyle(.secondary)
                 Text(bucket.model)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                     .lineLimit(1)
                 Spacer()
                 Text("\(Format.compactTokens(Int64(bucket.tokensPerMin.rounded())))/m")

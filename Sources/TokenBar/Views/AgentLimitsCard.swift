@@ -129,7 +129,7 @@ struct AgentLimitsCard: View {
                         : "No supported agents yet"
                 )
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
             } else {
@@ -147,7 +147,7 @@ struct AgentLimitsCard: View {
     private var noteLabel: some View {
         Text(note)
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
     }
 
     private func integrationLine(_ text: String) -> some View {
@@ -218,7 +218,7 @@ struct AgentLimitsCard: View {
                 if reorderable {
                     Text("⠿")
                         .font(.caption)
-                        .foregroundStyle(dragId == id ? .primary : .tertiary)
+                        .foregroundStyle(dragId == id ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiaryAdaptive))
                         .help("Drag to reorder")
                         .gesture(dragGesture(for: id, visible: visible))
                 }
@@ -370,7 +370,7 @@ struct AgentLimitsCard: View {
                     Spacer()
                     Text(window.resetText ?? leftLabel)
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
                 bar(fillPercent: fill, color: gauge, paceLeft: nil, paceIsDeficit: false)
                 if window.resetText != nil {
@@ -388,7 +388,7 @@ struct AgentLimitsCard: View {
                     if let reset = window.resetText {
                         Text(reset)
                             .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                     }
                 }
                 bar(
@@ -411,13 +411,13 @@ struct AgentLimitsCard: View {
                                 .compactMap(\.self).joined(separator: " · ")
                         )
                         .font(.caption2)
-                        // Reserve hint sits one notch under .secondary so it
-                        // stays brighter than .tertiary yet reads distinct from
-                        // the '% left' label (.secondary) beside it.
+                        // Pace/ETA is tertiary text like every other former
+                        // .tertiary label; a deficit pace flips it to orange
+                        // as a warning.
                         .foregroundStyle(
                             pace.stage.isDeficit
                                 ? AnyShapeStyle(.orange)
-                                : AnyShapeStyle(Color.primary.opacity(0.45)))
+                                : AnyShapeStyle(.tertiaryAdaptive))
                         .lineLimit(1)
                     }
                 }
@@ -434,14 +434,14 @@ struct AgentLimitsCard: View {
                 if classic {
                     Text("No data")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
             }
             bar(fillPercent: 0, color: Color(hex: brand), paceLeft: nil, paceIsDeficit: false)
             if !classic {
                 Text("No data")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
         }
     }

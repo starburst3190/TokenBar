@@ -119,7 +119,7 @@ struct TokenUsageRow: View {
                 .foregroundStyle(.secondary)
             Text(sub)
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

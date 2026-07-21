@@ -197,7 +197,7 @@ struct SettingsPanel: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label.uppercased())
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             content()
         }
     }
@@ -254,7 +254,7 @@ struct SettingsPanel: View {
     private func hint(_ text: String) -> some View {
         Text(text)
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
             .fixedSize(horizontal: false, vertical: true)
     }
 }
