@@ -19,5 +19,6 @@ sources: ["docs/knowledge/current-state.md", "docs/knowledge/vendor-tokscale.md"
 | [`provider-quota-pace.md`](provider-quota-pace.md) | active | Mac implementation is complete through the Rust-locked cross-port fixture；Stage 7 integration and Windows parity remain pending |
 | [`codex-historical-pace-v2.md`](codex-historical-pace-v2.md) | superseded | Implemented Codex Weekly v2 foundation retained as migration and evaluator evidence |
 | [`tokscale-alignment.md`](tokscale-alignment.md) | active | Rolling selective alignment and correctness order |
+| [`grok-turn-completed-usage.md`](grok-turn-completed-usage.md) | active | Grok Build: prefer `turn_completed.usage` over context-window counters |
 
 Historical or superseded private plans remain classified in [`../migration-ledger.md`](../migration-ledger.md); they are not copied wholesale into the public tree.
