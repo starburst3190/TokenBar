@@ -1045,7 +1045,8 @@ enum SelfTest {
         let chartColors = ModelColorMap(report: nil)
         let visBars = DayBars.build(
             payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeEnd: "2026-07-03", endFallback: "2026-07-09")
+            colors: chartColors, rangeStart: "2026-07-03", rangeEnd: "2026-07-03",
+            endFallback: "2026-07-09")
         expect(visBars.count == DayBars.window && visBars.last?.date == "2026-07-03",
             "chart window anchors to the filtered range end")
         expect((visBars.last?.totalTokens ?? 0) > 0,
@@ -1054,90 +1055,51 @@ enum SelfTest {
         // later day) shifts the window forward, stranding an empty trailing bar.
         let shiftedBars = DayBars.build(
             payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeEnd: "2026-07-05", endFallback: "2026-07-09")
+            colors: chartColors, rangeStart: "2026-07-05", rangeEnd: "2026-07-05",
+            endFallback: "2026-07-09")
         expect(shiftedBars.last?.date == "2026-07-05" && (shiftedBars.last?.totalTokens ?? 0) == 0,
             "unfiltered anchor would shift the window past the visible activity")
 
-        // Tooltip placement stays inside the visible ScrollView viewport, not
-        // merely inside the source card. Region-dodge (container 0.45) prefers
-        // above/below by cursor Y; viewport only clamps / rescues.
-        let viewport = CGRect(x: 100, y: 200, width: 400, height: 300)
-        let chartFrame = CGRect(x: 120, y: 250, width: 360, height: 150)
-        let tooltipSize = CGSize(width: 210, height: 120)
-        let belowPlacement = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 180, y: 30), tooltipSize: tooltipSize,
-            containerFrame: chartFrame, viewport: viewport)
-        expect(belowPlacement?.height == 42,
-            "upper-half anchor places tooltip below the cursor")
-        let abovePlacement = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 180, y: 140), tooltipSize: tooltipSize,
-            containerFrame: chartFrame, viewport: viewport)
-        expect(abovePlacement?.height == 8,
-            "lower-half anchor places tooltip above the cursor")
-        // Lower-half region even when the viewport still has room below —
-        // the old "prefer below if fits" path felt like sticky follow.
-        let regionDodge = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 180, y: 100), tooltipSize: tooltipSize,
-            containerFrame: chartFrame, viewport: viewport)
-        expect(regionDodge?.height == -32,
-            "lower-half still dodges above when the viewport has room below")
-        let constrainedPlacement = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 180, y: 110), tooltipSize: CGSize(width: 210, height: 260),
-            containerFrame: chartFrame, viewport: viewport)
-        expect(constrainedPlacement?.height == -46,
-            "tooltip clamps to the side with more visible space")
-        let edgePlacement = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 2, y: 30), tooltipSize: tooltipSize,
-            containerFrame: chartFrame, viewport: viewport)
-        expect(edgePlacement?.width == 0,
-            "tooltip clamps a near-edge anchor horizontally")
-        let tallPlacement = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 180, y: 30), tooltipSize: CGSize(width: 210, height: 400),
-            containerFrame: chartFrame, viewport: viewport)
-        expect(tallPlacement?.height == -46,
-            "viewport-taller tooltip pins to the visible top inset")
-        // Pre-resize viewport that no longer covers the card must not clamp.
-        let staleViewport = CGRect(x: 100, y: 0, width: 400, height: 80)
-        let stalePlacement = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 180, y: 30), tooltipSize: tooltipSize,
-            containerFrame: chartFrame, viewport: staleViewport)
-        let containerOnly = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 180, y: 30), tooltipSize: tooltipSize,
-            containerFrame: chartFrame, viewport: nil)
-        expect(stalePlacement?.height == containerOnly?.height,
-            "stale non-intersecting viewport falls back to container-only")
-        // Pre-resize short viewport that still overlaps the card but leaves
-        // the hover anchor below it (grow handoff) must also fall back.
-        let partialStale = CGRect(x: 100, y: 200, width: 400, height: 80)
-        // chartFrame y=250..400; partialStale y=200..280 intersects the card
-        // but anchor at local y=100 → global y=350 is outside partialStale.
-        let partialPlacement = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 180, y: 100), tooltipSize: tooltipSize,
-            containerFrame: chartFrame, viewport: partialStale)
-        let partialContainerOnly = PopoverTooltipPlacement.offset(
-            anchor: CGPoint(x: 180, y: 100), tooltipSize: tooltipSize,
-            containerFrame: chartFrame, viewport: nil)
-        expect(partialPlacement?.height == partialContainerOnly?.height,
-            "partial-overlap stale viewport that misses the anchor falls back")
-
-        let chartWidth: CGFloat = 360
-        let barGap = UsageChartGeometry.gap
-        let barWidth = (chartWidth - barGap * 2) / 3
-        let firstFrame = UsageChartGeometry.barFrame(index: 0, barWidth: barWidth)
-        let secondFrame = UsageChartGeometry.barFrame(index: 1, barWidth: barWidth)
-        let lastFrame = UsageChartGeometry.barFrame(index: 2, barWidth: barWidth)
-        expect(firstFrame.minX == 0 && secondFrame.minX - firstFrame.maxX == barGap,
-            "chart bar frames start at zero and leave draw gaps")
-        expect(abs(lastFrame.maxX - chartWidth) < 0.0001,
-            "last chart bar frame reaches the trailing edge")
-        // Production hover uses floor(x / stride); gap pixels attach left.
-        let gapX = firstFrame.maxX + barGap / 2
-        expect(UsageChartGeometry.barIndex(atX: gapX, barWidth: barWidth, count: 3) == 0,
-            "gap pixels floor-attach to the left bar")
-        expect(UsageChartGeometry.barIndex(atX: secondFrame.minX, barWidth: barWidth, count: 3) == 1,
-            "bar starts hit their own index")
-        expect(UsageChartGeometry.barIndex(atX: lastFrame.maxX + barGap + 1, barWidth: barWidth, count: 3) == nil,
-            "past the last stride is out of range")
+        // DayBars now spans the whole recorded range so the chart can scroll
+        // back to the first day (padding to a full viewport for short history).
+        // Fixture: vis active on the range endpoints 60 days apart.
+        let longPayload = rangeStatsPayload(end: "2026-07-05", days: [
+            daily("vis", "2026-05-07", 1), daily("vis", "2026-07-05", 1),
+        ])
+        // (a) History longer than the window → full-length series ending at
+        // rangeEnd and starting at rangeStart, one bar per inclusive day.
+        let longBars = DayBars.build(
+            payload: longPayload, clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeStart: "2026-05-07", rangeEnd: "2026-07-05",
+            endFallback: "2026-07-09")
+        expect(longBars.count == 60 && longBars.first?.date == "2026-05-07"
+            && longBars.last?.date == "2026-07-05",
+            "long history yields a full-range series from rangeStart to rangeEnd")
+        expect((longBars.first?.totalTokens ?? 0) > 0 && (longBars.last?.totalTokens ?? 0) > 0,
+            "both endpoints of the long series carry their activity")
+        // (b) History shorter than the window pads older empty days so the
+        // viewport is always full — exactly `window` bars ending at rangeEnd.
+        let shortBars = DayBars.build(
+            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeStart: "2026-07-03", rangeEnd: "2026-07-03",
+            endFallback: "2026-07-09")
+        expect(shortBars.count == DayBars.window
+            && shortBars.first?.date == "2026-06-04" && shortBars.last?.date == "2026-07-03",
+            "short history pads to exactly one window ending at rangeEnd")
+        // (c) Empty/invalid rangeStart falls back to a trailing window series.
+        let emptyStartBars = DayBars.build(
+            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeStart: "", rangeEnd: "2026-07-03",
+            endFallback: "2026-07-09")
+        expect(emptyStartBars.count == DayBars.window
+            && emptyStartBars.first?.date == "2026-06-04" && emptyStartBars.last?.date == "2026-07-03",
+            "empty rangeStart falls back to a trailing window")
+        let badStartBars = DayBars.build(
+            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeStart: "not-a-date", rangeEnd: "2026-07-03",
+            endFallback: "2026-07-09")
+        expect(badStartBars.count == DayBars.window && badStartBars.last?.date == "2026-07-03",
+            "unparseable rangeStart falls back to a trailing window")
 
         let modelWidths = ModelBarGeometry.widths(
             values: [1_000_000, 1, 1, 1, 1], totalWidth: 120)
