@@ -156,6 +156,59 @@ extension View {
     }
 }
 
+/// Floating hover-tooltip chrome. On macOS 26 it's real Liquid Glass so the
+/// panel picks up the same specular rim and refraction as the cards it floats
+/// over — but a tooltip overlaps dense chart/row content, so unlike the cards
+/// (which use see-through `.clear` glass) we hold a heavy tinted scrim between
+/// the text and the glass. Legibility wins here: clear glass would let the bars
+/// and axis labels underneath bleed straight through the numbers. Older systems
+/// fall back to an opaque-backed `.regularMaterial` (a bare material over the
+/// `.hudWindow` backdrop reads near-transparent). A drop shadow lifts it off the
+/// content in both cases so it reads as a floating panel, not a smudge.
+struct TooltipSurface: ViewModifier {
+    var cornerRadius: CGFloat = 8
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content
+                .background(
+                    colorScheme == .dark
+                        ? Color(white: 0.12).opacity(0.78)
+                        : Color(white: 0.99).opacity(0.82),
+                    in: RoundedRectangle(cornerRadius: cornerRadius))
+                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+                .shadow(color: .black.opacity(0.28), radius: 9, y: 3)
+        } else {
+            content
+                .background(
+                    RoundedRectangle(cornerRadius: cornerRadius)
+                        .fill(colorScheme == .dark ? Color(white: 0.15) : Color(white: 0.99))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: cornerRadius)
+                                .fill(.regularMaterial))
+                )
+                .overlay(RoundedRectangle(cornerRadius: cornerRadius).strokeBorder(.quaternary))
+                .shadow(color: .black.opacity(0.28), radius: 9, y: 3)
+        }
+    }
+}
+
+extension View {
+    func tooltipSurface(cornerRadius: CGFloat = 8) -> some View {
+        modifier(TooltipSurface(cornerRadius: cornerRadius))
+    }
+}
+
+/// Coordinate space pinned to the popover's scroll viewport. Cards report the
+/// hovered cursor position in this space so the root `HoverTooltipLayer` can
+/// place the tooltip relative to the visible viewport (whose bottom is the real
+/// floor — content past it is clipped), not relative to the card.
+enum PopoverViewport {
+    static let space = "popoverViewport"
+}
+
 /// Shared dashboard-card chrome: rounded glass panel, matching the Tauri
 /// dashboard's card stack.
 struct DashCard<Content: View>: View {

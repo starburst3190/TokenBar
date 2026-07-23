@@ -17,9 +17,7 @@ struct MonthlyView: View {
     let colors: ModelColorMap
 
     @State private var openMonth: String?
-    @State private var hover: HoverState?
-    @State private var tooltipSize: CGSize = .zero
-    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
+    @Environment(TooltipHost.self) private var tooltipHost
 
     struct MonthRow {
         let month: String  // "YYYY-MM"
@@ -42,13 +40,6 @@ struct MonthlyView: View {
         var tokens: Int64
         var cost: Double
     }
-
-    private struct HoverState {
-        let slice: ModelSlice
-        let point: CGPoint
-    }
-
-    private static let rowsSpace = "monthly-model-rows"
 
     /// Pure bucketing, internal (not private) so SelfTest can pin it.
     static func monthRows(payload: UsagePayload, clientIds: [String]) -> [MonthRow] {
@@ -133,14 +124,12 @@ struct MonthlyView: View {
                 }
             }
         }
-        .zIndex(hover == nil ? 0 : 1)
     }
 
     @ViewBuilder private func monthItem(_ row: MonthRow) -> some View {
         let isOpen = openMonth == row.month
         VStack(spacing: 4) {
             Button {
-                hover = nil
                 withAnimation(.easeOut(duration: 0.15)) {
                     openMonth = isOpen ? nil : row.month
                 }
@@ -172,7 +161,7 @@ struct MonthlyView: View {
                 VStack(spacing: 4) {
                     ForEach(Self.modelSlices(for: row, clientIds: clientIds, colors: colors),
                             id: \.key) { slice in
-                        let isHovered = hover?.slice.key == slice.key
+                        let isHovered = tooltipHost.isActive(owner: slice.key)
                         HStack(spacing: 8) {
                             Circle()
                                 .fill(Color(hex: slice.color))
@@ -197,42 +186,31 @@ struct MonthlyView: View {
                                 .font(.caption2.monospacedDigit())
                                 .frame(minWidth: 50, alignment: .trailing)
                         }
+                        // Report the cursor in the viewport space so the root
+                        // HoverTooltipLayer places the panel over the whole
+                        // popover instead of clipping it to this drill-down.
                         .contentShape(Rectangle())
-                        .onContinuousHover(coordinateSpace: .named(Self.rowsSpace)) { phase in
+                        .onContinuousHover(coordinateSpace: .named(PopoverViewport.space)) { phase in
                             switch phase {
                             case let .active(point):
-                                hover = HoverState(slice: slice, point: point)
-                            case .ended:
-                                if hover?.slice.key == slice.key {
-                                    hover = nil
+                                if tooltipHost.isActive(owner: slice.key) {
+                                    tooltipHost.move(owner: slice.key, to: point)
+                                } else {
+                                    tooltipHost.show(owner: slice.key, at: point) { tooltip(slice) }
                                 }
+                            case .ended:
+                                tooltipHost.hide(owner: slice.key)
                             }
                         }
-                    }
-                }
-                .coordinateSpace(name: Self.rowsSpace)
-                .overlay(alignment: .topLeading) {
-                    if let hover {
-                        GeometryReader { geo in
-                            let measuredSize = tooltipSize == .zero
-                                ? CGSize(width: ModelUsageTooltip.width, height: 120)
-                                : tooltipSize
-                            let offset = PopoverTooltipPlacement.offset(
-                                anchor: hover.point,
-                                tooltipSize: measuredSize,
-                                containerFrame: geo.frame(in: .global),
-                                viewport: popoverScrollViewport)
-                            tooltip(hover.slice)
-                                .offset(offset ?? .zero)
-                        }
-                        .allowsHitTesting(false)
+                        // Collapsing the month or refreshing data drops the row
+                        // without an `.ended` — take its panel down with it.
+                        .onDisappear { tooltipHost.hide(owner: slice.key) }
                     }
                 }
                 .padding(.leading, 18)
                 .padding(.bottom, 6)
             }
         }
-        .zIndex(isOpen ? 1 : 0)
     }
 
     private func tooltip(_ slice: ModelSlice) -> some View {
@@ -247,7 +225,6 @@ struct MonthlyView: View {
             cacheWrite: slice.cacheWrite,
             reasoning: slice.reasoning,
             total: slice.tokens,
-            cost: slice.cost,
-            measuredSize: $tooltipSize)
+            cost: slice.cost)
     }
 }
