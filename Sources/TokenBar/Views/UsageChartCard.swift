@@ -325,6 +325,19 @@ private struct ScrollingBarChart: View {
                              cornerRadius: min(2, h / 2)),
                         with: .color(Color(hex: segment.color).opacity(0.86)))
                 }
+                // Outline the hovered bar so it reads as one selection with the
+                // panel above it — same affordance the model rows use.
+                if bar.date == hoverDate {
+                    let rect = CGRect(
+                        x: x, y: bottom - totalHeight, width: barWidth, height: totalHeight)
+                    context.drawLayer { layer in
+                        layer.addFilter(.shadow(color: .primary.opacity(0.65), radius: 3))
+                        layer.stroke(
+                            Path(roundedRect: rect, cornerRadius: min(2, totalHeight / 2)),
+                            with: .color(.primary.opacity(0.85)),
+                            lineWidth: 1)
+                    }
+                }
             }
         }
     }

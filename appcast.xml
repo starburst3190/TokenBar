@@ -3,6 +3,30 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>1.7.0</title>
+            <pubDate>Wed, 22 Jul 2026 20:25:01 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.7.0</link>
+            <sparkle:version>398</sparkle:version>
+            <sparkle:shortVersionString>1.7.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>New:</b>
+<ul>
+<li>Copilot Desktop token-bearing local sessions are now counted with model, workspace, and agent details. Copilot OTEL remains authoritative when both sources contain the same session, so overlapping usage is not counted twice. Totals may increase because previously invisible Desktop usage is now included, not because the update created new spend.</li>
+</ul>
+<b>Improved:</b>
+<ul>
+<li>Hovered Token Usage and Models bars now gain adaptive outlines and glow in light and dark appearances. Model markers glow with their rows, and Daily/Monthly drill-downs show detailed Input, Output, Cache read, Cache write, and Reasoning tooltips above neighboring rows.</li>
+</ul>
+<b>Under the hood:</b>
+<ul>
+<li>Usage caching now uses bounded identity-aware shards instead of one message-cache file. The first scan after updating starts cold because the legacy cache is intentionally left untouched; later refreshes use the new cache without changing report semantics.</li>
+<li>Hermes discovery supports native Windows layouts for the downstream Windows build without changing the macOS app.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.7.0/TokenBar.app.tar.gz" length="7931247" type="application/octet-stream" sparkle:edSignature="5klKHNy8+0H5PlrDqZsMQ+prDZYiWABSsG+j6SFSsX+BeIZm/hPiax4B1dBc3zzmmhNpIecr92DPlTp58Kc5Ag=="/>
+        </item>
+        <item>
             <title>1.6.2</title>
             <pubDate>Tue, 21 Jul 2026 14:07:22 +0000</pubDate>
             <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.6.2</link>
@@ -97,35 +121,6 @@
 <p>Thanks: @yiskang</p>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.5.0/TokenBar.app.tar.gz" length="7513984" type="application/octet-stream" sparkle:edSignature="KbHPCM6RFWGztVKe5K8IA/g/LBImAgN1BRfl7ZpkvtN7oJCNENEnHgsK5SX9xsUkhSoiT/7UHIgbIg2w7a/lBw=="/>
-        </item>
-        <item>
-            <title>1.4.0</title>
-            <pubDate>Wed, 15 Jul 2026 04:12:46 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.4.0</link>
-            <sparkle:version>264</sparkle:version>
-            <sparkle:shortVersionString>1.4.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>New:</b>
-<ul>
-<li>Added Grok Build as a first-class client, including local session usage throughout TokenBar and weekly quota when Grok OAuth credentials are available.</li>
-<li>Added discovery for named Hermes profiles, including profile-only homes.</li>
-<li>Added deep Claude workflow transcripts to local usage reports.</li>
-</ul>
-<b>Improved:</b>
-<ul>
-<li>Preserved provider-reported costs from GJC and OpenCode instead of replacing them with estimates.</li>
-<li>Made usage refreshes reliable when Roo Code, Kilo Code, Cline, Droid, Kimi, or Kiro change metadata stored outside the primary session file.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>Corrected Jcode turn counts, Pi session and subagent attribution, and nested Copilot agent attribution.</li>
-<li>Prevented token totals from overflowing on corrupt or extreme input.</li>
-<li>Corrected Codex model-performance timing so repeated snapshots no longer count overlapping durations.</li>
-</ul>
-<p>Thanks: @savourylie</p>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.4.0/TokenBar.app.tar.gz" length="7647140" type="application/octet-stream" sparkle:edSignature="DKo4duLm4VDTGcUFGp3Gn3LXd6OtDuz+sR+pNDQiyb9cieeYl2UqylZhiKXmD+Bic68HvGARS5zq/uXaZYYzDA=="/>
         </item>
         <item>
             <title>1.1.1</title>

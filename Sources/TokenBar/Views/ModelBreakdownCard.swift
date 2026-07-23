@@ -1,6 +1,21 @@
 import SwiftUI
 import TokenBarCore
 
+enum ModelBarGeometry {
+    static let gap: CGFloat = 1
+
+    static func widths(values: [Int64], totalWidth: CGFloat) -> [CGFloat] {
+        guard !values.isEmpty, totalWidth > 0 else { return [] }
+        let available = max(0, totalWidth - gap * CGFloat(values.count - 1))
+        let minimum = min(1, available / CGFloat(values.count))
+        let remainder = available - minimum * CGFloat(values.count)
+        let weights = values.map { Double(max(0, $0)).squareRoot() }
+        let totalWeight = weights.reduce(0, +)
+        guard totalWeight > 0 else { return Array(repeating: 0, count: values.count) }
+        return weights.map { minimum + remainder * CGFloat($0 / totalWeight) }
+    }
+}
+
 /// "Models" card: one row per model sorted by cost, with the token-category
 /// split as a stacked bar. Port of ModelBreakdownCard.tsx — bar widths use a
 /// square-root scale (cache reads dwarf everything linearly; log flattens
@@ -16,7 +31,6 @@ struct ModelBreakdownCard: View {
     @Environment(TooltipHost.self) private var tooltipHost
 
     private static let maxRows = 8
-    private static let tooltipWidth: CGFloat = 210
 
     /// Token-category palette (matches the Tauri .model-seg-* CSS classes).
     private static let tokenKinds: [(label: String, color: String, pick: (ModelReportEntry) -> Int64)] = [
@@ -92,16 +106,25 @@ struct ModelBreakdownCard: View {
     }
 
     private func row(_ entry: ModelReportEntry) -> some View {
-        HStack(spacing: 8) {
+        let isHovered = tooltipHost.isActive(owner: entry.rowID)
+        return HStack(spacing: 8) {
             Circle()
                 .fill(Color(hex: colors.color(entry.provider, entry.model)))
                 .frame(width: 8, height: 8)
+                .overlay {
+                    Circle().stroke(
+                        Color.primary.opacity(isHovered ? 0.85 : 0),
+                        lineWidth: 1)
+                }
+                .shadow(
+                    color: Color.primary.opacity(isHovered ? 0.65 : 0),
+                    radius: isHovered ? 3 : 0)
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.model)
                     .font(.caption)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                segmentBar(entry)
+                segmentBar(entry, isHovered: isHovered)
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 2) {
@@ -136,25 +159,32 @@ struct ModelBreakdownCard: View {
         .onDisappear { tooltipHost.hide(owner: entry.rowID) }
     }
 
-    /// sqrt-scaled stacked category bar.
-    private func segmentBar(_ entry: ModelReportEntry) -> some View {
+    /// sqrt-scaled stacked category bar. Widths carry a guaranteed minimum so a
+    /// tiny category still shows a sliver; the hovered row gets a matching
+    /// outline so bar and legend dot read as one selection.
+    private func segmentBar(_ entry: ModelReportEntry, isHovered: Bool) -> some View {
         let segments = Self.tokenKinds
             .map { (color: $0.color, value: $0.pick(entry)) }
             .filter { $0.value > 0 }
-        let scaleTotal = segments.reduce(0.0) { $0 + Double($1.value).squareRoot() }
         return GeometryReader { geo in
-            HStack(spacing: 1) {
+            let widths = ModelBarGeometry.widths(
+                values: segments.map(\.value), totalWidth: geo.size.width)
+            HStack(spacing: ModelBarGeometry.gap) {
                 ForEach(segments.indices, id: \.self) { i in
                     RoundedRectangle(cornerRadius: 1.5)
                         .fill(Color(hex: segments[i].color))
-                        .frame(
-                            width: scaleTotal > 0
-                                ? max(1, geo.size.width * Double(segments[i].value).squareRoot() / scaleTotal)
-                                : 0)
+                        .frame(width: widths[i])
                 }
             }
         }
         .frame(height: 6)
+        .overlay {
+            RoundedRectangle(cornerRadius: 1.5)
+                .stroke(Color.primary.opacity(isHovered ? 0.85 : 0), lineWidth: 1)
+        }
+        .shadow(
+            color: Color.primary.opacity(isHovered ? 0.65 : 0),
+            radius: isHovered ? 3 : 0)
     }
 
     // MARK: - Hover tooltip
@@ -163,26 +193,68 @@ struct ModelBreakdownCard: View {
     /// sqrt-scaled, so this is where the real numbers live. Placement and
     /// clamping are handled by the root HoverTooltipLayer.
     private func tooltip(_ entry: ModelReportEntry) -> some View {
-        let kinds = Self.tokenKinds
-            .map { (label: $0.label, color: $0.color, value: $0.pick(entry)) }
-            .filter { $0.value > 0 }
-        return VStack(alignment: .leading, spacing: 4) {
+        ModelUsageTooltip(
+            model: entry.model,
+            provider: entry.provider,
+            context: ClientRegistry.style(entry.client).displayName,
+            color: colors.color(entry.provider, entry.model),
+            input: entry.input,
+            output: entry.output,
+            cacheRead: entry.cacheRead,
+            cacheWrite: entry.cacheWrite,
+            reasoning: entry.reasoning,
+            total: entry.total,
+            cost: entry.cost)
+    }
+}
+
+/// Rich per-model token breakdown panel, shared by the Models card and the
+/// Daily/Monthly drill-downs. Pure content: the root `HoverTooltipLayer`
+/// measures it and manages placement and hit-testing.
+struct ModelUsageTooltip: View {
+    static let width: CGFloat = 210
+
+    let model: String
+    let provider: String
+    let context: String?
+    let color: String
+    let input: Int64
+    let output: Int64
+    let cacheRead: Int64
+    let cacheWrite: Int64
+    let reasoning: Int64
+    let total: Int64
+    let cost: Double
+
+    private var kinds: [(label: String, color: String, value: Int64)] {
+        [
+            ("Input", "#3b82f6", input),
+            ("Output", "#22c55e", output),
+            ("Cache read", "#f59e0b", cacheRead),
+            ("Cache write", "#a855f7", cacheWrite),
+            ("Reasoning", "#ec4899", reasoning),
+        ]
+        .filter { $0.value > 0 }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 5) {
                 Circle()
-                    .fill(Color(hex: colors.color(entry.provider, entry.model)))
+                    .fill(Color(hex: color))
                     .frame(width: 6, height: 6)
-                Text(entry.model)
+                Text(model)
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            Text("\(ClientRegistry.style(entry.client).displayName) · \(entry.provider)")
+            Text([context, provider].compactMap { $0 }.joined(separator: " · "))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             HStack {
-                Text("\(Format.compactTokens(entry.total)) tokens")
+                Text("\(Format.compactTokens(total)) tokens")
                 Spacer()
-                Text(Format.usd(entry.cost))
+                Text(Format.usd(cost))
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -193,14 +265,14 @@ struct ModelBreakdownCard: View {
                         .frame(width: 6, height: 6)
                     Text(kind.label)
                     Spacer()
-                    Text("\(Format.compactTokens(kind.value)) · \(Int((Double(kind.value) / Double(max(1, entry.total)) * 100).rounded()))%")
+                    Text("\(Format.compactTokens(kind.value)) · \(Int((Double(kind.value) / Double(max(1, total)) * 100).rounded()))%")
                         .foregroundStyle(.secondary)
                 }
                 .font(.caption2)
             }
         }
         .padding(8)
-        .frame(width: Self.tooltipWidth, alignment: .leading)
+        .frame(width: Self.width, alignment: .leading)
         .tooltipSurface()
     }
 }

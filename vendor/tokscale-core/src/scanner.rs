@@ -79,6 +79,7 @@ pub struct ScanResult {
     /// `opencode-nightly.db`, etc. See upstream logic in opencode's
     /// `packages/opencode/src/storage/db.ts` (`getChannelPath`).
     pub opencode_dbs: Vec<PathBuf>,
+    pub copilot_desktop_db: Option<PathBuf>,
     pub synthetic_db: Option<PathBuf>,
     pub kilo_db: Option<PathBuf>,
     pub hermes_db: Option<PathBuf>,
@@ -95,6 +96,7 @@ impl Default for ScanResult {
         Self {
             files: std::array::from_fn(|_| Vec::new()),
             opencode_dbs: Vec::new(),
+            copilot_desktop_db: None,
             synthetic_db: None,
             kilo_db: None,
             hermes_db: None,
@@ -285,7 +287,13 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
         .filter_map(|e| e.ok())
         .filter(|e| {
             let path = e.path();
-            if !path.is_file() {
+            // WalkDir already knows the entry type from the directory read, so
+            // trust it for the common regular-file case and avoid a redundant
+            // stat() per file. Symlinks still follow metadata to preserve the
+            // existing file-symlink behavior.
+            let file_type = e.file_type();
+            let is_file = file_type.is_file() || (file_type.is_symlink() && path.is_file());
+            if !is_file {
                 return false;
             }
 
@@ -487,6 +495,38 @@ pub(crate) fn discover_hermes_profile_state_dbs(hermes_home: &Path) -> Vec<PathB
     dbs.sort_unstable();
     dbs.dedup();
     dbs
+}
+
+/// Candidate Hermes homes for the default database and named profiles.
+///
+/// An explicit `HERMES_HOME` is authoritative, including when it scopes the
+/// scan to one profile. Otherwise Windows also uses `%LOCALAPPDATA%/hermes`;
+/// the supplied-home fallback is always included so isolated scans can resolve
+/// the equivalent `AppData/Local/hermes` layout without process environment.
+fn hermes_home_candidates(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let mut homes = vec![PathBuf::from(
+        ClientId::Hermes
+            .data()
+            .root
+            .resolve_with_env_strategy(home_dir, use_env_roots),
+    )];
+
+    let hermes_home_set = use_env_roots
+        && std::env::var("HERMES_HOME")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    if !hermes_home_set {
+        if cfg!(target_os = "windows") && use_env_roots {
+            if let Some(local_app_data) =
+                std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty())
+            {
+                homes.push(PathBuf::from(local_app_data).join("hermes"));
+            }
+        }
+        homes.push(PathBuf::from(home_dir).join("AppData/Local/hermes"));
+    }
+
+    homes
 }
 
 /// Claude desktop "Cowork" (local-agent-mode) writes standard Claude Code
@@ -1183,20 +1223,21 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     if enabled.contains(&ClientId::Hermes) {
-        let hermes_db_path = PathBuf::from(
-            ClientId::Hermes
-                .data()
-                .resolve_path_with_env_strategy(home_dir, use_env_roots),
-        );
-        let hermes_home = hermes_db_path.parent().map(Path::to_path_buf);
-        if hermes_db_path.is_file() {
-            result.hermes_db = Some(hermes_db_path);
+        let mut extra_dbs = Vec::new();
+        for hermes_home in hermes_home_candidates(home_dir, use_env_roots) {
+            let default_db = hermes_home.join("state.db");
+            if default_db.is_file() {
+                if result.hermes_db.is_none() {
+                    result.hermes_db = Some(default_db);
+                } else if result.hermes_db.as_ref() != Some(&default_db) {
+                    extra_dbs.push(default_db);
+                }
+            }
+            extra_dbs.extend(discover_hermes_profile_state_dbs(&hermes_home));
         }
-        if let Some(hermes_home) = hermes_home {
-            result
-                .get_mut(ClientId::Hermes)
-                .extend(discover_hermes_profile_state_dbs(&hermes_home));
-        }
+        extra_dbs.sort_unstable();
+        extra_dbs.dedup();
+        result.get_mut(ClientId::Hermes).extend(extra_dbs);
     }
 
     if enabled.contains(&ClientId::Goose) {
@@ -1374,6 +1415,11 @@ fn scan_all_clients_with_env_strategy_inner(
     result.get_mut(ClientId::Grok).sort_unstable();
 
     if enabled.contains(&ClientId::Copilot) {
+        let desktop_db = PathBuf::from(home_dir).join(".copilot/data.db");
+        if desktop_db.is_file() {
+            result.copilot_desktop_db = Some(desktop_db);
+        }
+
         if let Some(path) = copilot_exporter_path_with_env_strategy(use_env_roots) {
             let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             if path.is_file() && seen.insert(key) {
@@ -1566,6 +1612,19 @@ mod tests {
         let json_files = scan_directory(path.to_str().unwrap(), "*.json");
         assert_eq!(json_files.len(), 2);
         assert!(json_files.iter().all(|p| p.extension().unwrap() == "json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_directory_keeps_file_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.json");
+        let alias = dir.path().join("alias.json");
+        File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let files = scan_directory(dir.path().to_str().unwrap(), "*.json");
+        assert_eq!(files, vec![alias, target]);
     }
 
     #[test]
@@ -2454,6 +2513,89 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_discovers_hermes_windows_local_appdata_home() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let windows_home = home.join("AppData/Local/hermes");
+        fs::create_dir_all(&windows_home).unwrap();
+        let default_db = windows_home.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let profile_dir = windows_home.join("profiles/research");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
+        assert_eq!(result.hermes_db_paths(), vec![default_db, profile_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_explicit_hermes_home_does_not_widen_to_windows_fallback() {
+        let mut _hermes = EnvGuard::capture(&["HERMES_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        _hermes.remove("TOKSCALE_EXTRA_DIRS");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let explicit_home = home.join("custom-hermes-home");
+        fs::create_dir_all(&explicit_home).unwrap();
+        let explicit_db = explicit_home.join("state.db");
+        File::create(&explicit_db).unwrap();
+
+        let windows_home = home.join("AppData/Local/hermes");
+        fs::create_dir_all(&windows_home).unwrap();
+        File::create(windows_home.join("state.db")).unwrap();
+
+        _hermes.set("HERMES_HOME", &explicit_home);
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&explicit_db));
+        assert_eq!(result.hermes_db_paths(), vec![explicit_db]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hermes_windows_fallback_dedups_physical_database_overlaps() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let windows_home = home.join("AppData/Local/hermes");
+        fs::create_dir_all(windows_home.join("profiles/research")).unwrap();
+        File::create(windows_home.join("state.db")).unwrap();
+        File::create(windows_home.join("profiles/research/state.db")).unwrap();
+        std::os::unix::fs::symlink(&windows_home, home.join(".hermes")).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        let paths = result.hermes_db_paths();
+        assert_eq!(paths.len(), 2, "physical dbs must be parsed exactly once");
+        let canonical: HashSet<PathBuf> = paths
+            .iter()
+            .map(|path| std::fs::canonicalize(path).unwrap())
+            .collect();
+        assert_eq!(canonical.len(), 2);
+    }
+
+    #[test]
     fn test_scan_all_clients_with_scanner_settings_discovers_zed_windows_local_appdata_home() {
         let dir = TempDir::new().unwrap();
         let home = dir.path();
@@ -2990,6 +3132,24 @@ mod tests {
 
         assert_eq!(result.get(ClientId::Copilot).len(), 1);
         assert!(result.get(ClientId::Copilot)[0].ends_with("copilot.jsonl"));
+    }
+
+    #[test]
+    fn test_scan_all_clients_copilot_discovers_desktop_database() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        fs::create_dir_all(home.join(".copilot")).unwrap();
+        let desktop_db = home.join(".copilot/data.db");
+        File::create(&desktop_db).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["copilot".to_string()],
+            false,
+        );
+
+        assert_eq!(result.copilot_desktop_db.as_ref(), Some(&desktop_db));
+        assert!(result.get(ClientId::Copilot).is_empty());
     }
 
     #[test]

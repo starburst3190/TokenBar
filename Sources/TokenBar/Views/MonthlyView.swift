@@ -17,6 +17,7 @@ struct MonthlyView: View {
     let colors: ModelColorMap
 
     @State private var openMonth: String?
+    @Environment(TooltipHost.self) private var tooltipHost
 
     struct MonthRow {
         let month: String  // "YYYY-MM"
@@ -31,6 +32,11 @@ struct MonthlyView: View {
         let model: String
         let provider: String
         let color: String
+        var input: Int64
+        var output: Int64
+        var cacheRead: Int64
+        var cacheWrite: Int64
+        var reasoning: Int64
         var tokens: Int64
         var cost: Double
     }
@@ -78,7 +84,14 @@ struct MonthlyView: View {
                 let key = "\(model)|\(cc.providerId)"
                 var slot = grouped[key] ?? ModelSlice(
                     key: key, model: model, provider: cc.providerId,
-                    color: colors.color(cc.providerId, model), tokens: 0, cost: 0)
+                    color: colors.color(cc.providerId, model),
+                    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0,
+                    tokens: 0, cost: 0)
+                slot.input = slot.input.saturatingAdding(cc.tokens.input)
+                slot.output = slot.output.saturatingAdding(cc.tokens.output)
+                slot.cacheRead = slot.cacheRead.saturatingAdding(cc.tokens.cacheRead)
+                slot.cacheWrite = slot.cacheWrite.saturatingAdding(cc.tokens.cacheWrite)
+                slot.reasoning = slot.reasoning.saturatingAdding(cc.tokens.reasoning)
                 slot.tokens = slot.tokens.saturatingAdding(tokens)
                 slot.cost += cc.cost
                 grouped[key] = slot
@@ -148,15 +161,23 @@ struct MonthlyView: View {
                 VStack(spacing: 4) {
                     ForEach(Self.modelSlices(for: row, clientIds: clientIds, colors: colors),
                             id: \.key) { slice in
+                        let isHovered = tooltipHost.isActive(owner: slice.key)
                         HStack(spacing: 8) {
                             Circle()
                                 .fill(Color(hex: slice.color))
                                 .frame(width: 6, height: 6)
+                                .overlay {
+                                    Circle().stroke(
+                                        Color.primary.opacity(isHovered ? 0.85 : 0),
+                                        lineWidth: 1)
+                                }
+                                .shadow(
+                                    color: Color.primary.opacity(isHovered ? 0.65 : 0),
+                                    radius: isHovered ? 3 : 0)
                             Text(slice.model)
                                 .font(.caption2)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                                .help("\(slice.model) · \(slice.provider)")
                             Spacer()
                             Text(Format.compactTokens(slice.tokens))
                                 .font(.caption2.monospacedDigit())
@@ -165,11 +186,45 @@ struct MonthlyView: View {
                                 .font(.caption2.monospacedDigit())
                                 .frame(minWidth: 50, alignment: .trailing)
                         }
+                        // Report the cursor in the viewport space so the root
+                        // HoverTooltipLayer places the panel over the whole
+                        // popover instead of clipping it to this drill-down.
+                        .contentShape(Rectangle())
+                        .onContinuousHover(coordinateSpace: .named(PopoverViewport.space)) { phase in
+                            switch phase {
+                            case let .active(point):
+                                if tooltipHost.isActive(owner: slice.key) {
+                                    tooltipHost.move(owner: slice.key, to: point)
+                                } else {
+                                    tooltipHost.show(owner: slice.key, at: point) { tooltip(slice) }
+                                }
+                            case .ended:
+                                tooltipHost.hide(owner: slice.key)
+                            }
+                        }
+                        // Collapsing the month or refreshing data drops the row
+                        // without an `.ended` — take its panel down with it.
+                        .onDisappear { tooltipHost.hide(owner: slice.key) }
                     }
                 }
                 .padding(.leading, 18)
                 .padding(.bottom, 6)
             }
         }
+    }
+
+    private func tooltip(_ slice: ModelSlice) -> some View {
+        ModelUsageTooltip(
+            model: slice.model,
+            provider: slice.provider,
+            context: nil,
+            color: slice.color,
+            input: slice.input,
+            output: slice.output,
+            cacheRead: slice.cacheRead,
+            cacheWrite: slice.cacheWrite,
+            reasoning: slice.reasoning,
+            total: slice.tokens,
+            cost: slice.cost)
     }
 }
