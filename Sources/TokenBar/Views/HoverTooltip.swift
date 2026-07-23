@@ -37,7 +37,13 @@ final class TooltipHost {
     /// between the `move` fast path and a full `show` (e.g. after `clear()`
     /// dropped the panel out from under a still-hovering cursor).
     func isActive(owner: AnyHashable) -> Bool {
-        self.owner == owner && content != nil
+        // Read the observed `content` first: `owner` is @ObservationIgnored, so
+        // if the owner check came first it would short-circuit for every
+        // non-owner and register no dependency — a card body gating a hover
+        // glow on this would then never re-evaluate when the active tooltip
+        // changes (only HoverTooltipLayer, which reads `content` directly,
+        // would update). Reading `content` up front makes the glow reactive.
+        content != nil && self.owner == owner
     }
 
     func hide(owner: AnyHashable) {
