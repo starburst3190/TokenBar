@@ -1,6 +1,29 @@
 import AppKit
 import TokenBarCore
 
+#if DEBUG
+struct TrayAnimationCPUTestConfiguration {
+    let style: String
+    let animated: Bool
+    let tokensPerMinute = 1_000_000.0
+
+    static let current: TrayAnimationCPUTestConfiguration? = {
+        let prefix = "--tray-animation-cpu-test="
+        guard let argument = CommandLine.arguments.first(where: { $0.hasPrefix(prefix) })
+        else { return nil }
+        let value = String(argument.dropFirst(prefix.count))
+        switch value {
+        case "cat", "parrot":
+            return TrayAnimationCPUTestConfiguration(style: value, animated: true)
+        case "static":
+            return TrayAnimationCPUTestConfiguration(style: "cat", animated: false)
+        default:
+            return nil
+        }
+    }()
+}
+#endif
+
 /// RunCat-style menu-bar animation, port of src-tauri's animation.rs: the
 /// cat (or parrot) spins faster as the live token rate climbs. Frame sets
 /// come in dark/light pairs and follow the menu bar's effective appearance —
@@ -15,16 +38,26 @@ final class TrayAnimator {
 
     private weak var controller: StatusItemController?
     private let source: any UsageDataSource
+#if DEBUG
+    private let cpuTest = TrayAnimationCPUTestConfiguration.current
+#endif
     /// Frame sets keyed by "<style>|<dark|light>".
     private let frames: [String: [NSImage]]
-    private var animationTask: Task<Void, Never>?
     private var loadTask: Task<Void, Never>?
     private var quotaTask: Task<Void, Never>?
+    private var presentedAnimationKey: String?
+    private var isStopped = true
     /// RunCat load signal in [0, 100]: tokens/min ÷ 10K, so 1M tok/min = 100.
     private var load: Double = 0
-    /// Latest OAuth quota snapshot — feeds the gauge icon styles and the
-    /// quota title mode (AppDelegate reads it through `quotaRemaining`).
-    private(set) var quota: AgentUsagePayload?
+    /// Latest snapshot returned by this poller. A newer payload accepted by a
+    /// dashboard or Settings poll wins through the shared publication state.
+    private var polledQuota: AgentUsagePayload?
+    var quota: AgentUsagePayload? { Self.publishedQuota(polledQuota) }
+
+    static func publishedQuota(_ polledQuota: AgentUsagePayload?) -> AgentUsagePayload? {
+        if let polledQuota, polledQuota.publicationGeneration == nil { return polledQuota }
+        return AgentUsagePublicationCoordinator.latestPayload ?? polledQuota
+    }
     /// Fired after every successful quota fetch (title refresh hook).
     var onQuotaUpdated: (() -> Void)?
 
@@ -61,7 +94,6 @@ final class TrayAnimator {
     }
 
     private var defaultsObserver: NSObjectProtocol?
-    private var appearanceObserver: NSKeyValueObservation?
     /// Snapshot of the icon-affecting defaults the observer reacts to. The
     /// global didChangeNotification carries no key and fires for every write
     /// (popover height, active tab, year, quota cache…), so we compare this
@@ -70,12 +102,12 @@ final class TrayAnimator {
     /// tear down + restart the animation loop on every keystroke.
     private var iconSettingsSignature = ""
 
-    private static func currentIconSignature() -> String {
-        let d = UserDefaults.standard
+    static func currentIconSignature(defaults d: UserDefaults = .standard) -> String {
         return [
             d.string(forKey: styleKey) ?? "",
             d.object(forKey: animateKey).map { "\($0)" } ?? "",
             d.string(forKey: quotaSourceKey) ?? "",
+            d.object(forKey: lastRemainingKey).map { "\($0)" } ?? "",
             d.string(forKey: IconColoring.storageKey) ?? "",
             // The Auto gauge value now depends on the exclusion set, so a hide
             // toggle must re-render (and re-resolve) the gauge — renderGaugeIcon
@@ -89,15 +121,20 @@ final class TrayAnimator {
     }
 
     func start() {
-        startAnimationLoop()
-        startLoadPolling()
-        startQuotaPolling()
+        isStopped = false
+#if DEBUG
+        if let cpuTest {
+            load = Self.animationLoad(tokensPerMinute: cpuTest.tokensPerMinute)
+            tokensPerMinRate = cpuTest.tokensPerMinute
+            refreshIcon()
+            reportCPUTestReady(cpuTest)
+            return
+        }
+#endif
         iconSettingsSignature = Self.currentIconSignature()
-        // Re-render the gauge and restart the animation loop the moment an
-        // icon setting changes (style, animate, quota source, coloring) — the
-        // 30s gauge loop alone is too slow, and a gauge→cat/parrot switch
-        // would otherwise stall until the sleep finishes. Gated on a signature
-        // compare so unrelated defaults writes don't churn the loop.
+        controller?.setAppearanceChangeHandler { [weak self] in
+            self?.refreshIcon()
+        }
         defaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -106,164 +143,228 @@ final class TrayAnimator {
                 let next = Self.currentIconSignature()
                 guard next != self.iconSettingsSignature else { return }
                 self.iconSettingsSignature = next
-                self.renderGaugeIcon()
-                self.animationTask?.cancel()
-                self.startAnimationLoop()
+                if let payload = self.quota {
+                    self.reconcileQuotaRemaining(with: payload)
+                }
+                self.refreshIcon()
             }
         }
-        // Re-render on dark/light mode flip so gauge icons don't show the
-        // wrong color scheme for up to 30s (the gauge loop's sleep interval).
-        appearanceObserver = NSApp.observe(
-            \.effectiveAppearance, options: [.new]
-        ) { [weak self] _, _ in
-            MainActor.assumeIsolated { self?.renderGaugeIcon() }
-        }
+        refreshIcon()
+        startLoadPolling()
+        startQuotaPolling()
     }
 
     func stop() {
-        animationTask?.cancel()
+        isStopped = true
         loadTask?.cancel()
         quotaTask?.cancel()
+        loadTask = nil
+        quotaTask = nil
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
-        appearanceObserver?.invalidate()
+        defaultsObserver = nil
+        controller?.setAppearanceChangeHandler(nil)
+        controller?.stopTrayAnimation()
+        presentedAnimationKey = nil
     }
 
-    /// Draws the current gauge style immediately (no-op for cat/parrot,
-    /// whose frames the animation loop owns).
+    private var currentStyle: String {
+#if DEBUG
+        if let cpuTest { return cpuTest.style }
+#endif
+        return UserDefaults.standard.string(forKey: Self.styleKey) ?? "cat"
+    }
+
+    /// Draws the current gauge style immediately (no-op for cat/parrot).
     private func renderGaugeIcon() {
-        let style = UserDefaults.standard.string(forKey: Self.styleKey) ?? "cat"
+        let style = currentStyle
         guard let gaugeStyle = QuotaIconStyle(rawValue: style) else { return }
         let coloring = IconColoring(
             rawValue: UserDefaults.standard.string(forKey: IconColoring.storageKey) ?? ""
         ) ?? .warningOnly
-        controller?.setFrame(
+        presentedAnimationKey = nil
+        controller?.setStaticIcon(
             TrayIcons.image(
                 style: gaugeStyle, remaining: quotaRemaining,
                 dark: controller?.isDarkAppearance ?? true,
-                coloring: coloring))
+                coloring: coloring),
+            isTemplate: false)
     }
 
-    /// Internal so the settings window's preview can fall back to the same
-    /// last-good reading before its own quota fetch lands.
-    static let lastRemainingKey = "tokenbar.quota.lastRemaining"
+    /// Internal so the settings window's preview can use the same last-good
+    /// reading before its own quota fetch lands.
+    nonisolated static let lastRemainingKey = "tokenbar.quota.lastRemaining"
 
-    /// Last successfully resolved remaining percent — a transient fetch
-    /// failure (or a provider erroring) must never zero/blank the display.
-    /// Live mode seeds this from UserDefaults; demo mode starts nil and keeps
+    /// Remaining percent reconciled from the most recent successful outer
+    /// payload. Live mode seeds this from UserDefaults so an outer FFI failure
+    /// before any new payload preserves the last-good reading; demo mode keeps
     /// only the process-local synthetic value.
     private var cachedQuotaRemaining: Double?
 
-    /// The selected quota window's remaining percent, holding the last good
-    /// value across failed refreshes (nil only before any data ever arrived).
-    /// Pure read: it updates the in-memory cache but does NOT write
-    /// UserDefaults — persisting here (a side effect inside a getter that
-    /// renderGaugeIcon / applyTitle call on every observer pass) re-posted
-    /// didChangeNotification and re-entered the observers. `persistQuotaState()`
-    /// is called explicitly when fresh quota data arrives instead.
+    /// The selected quota window's remaining percent. A missing outer payload
+    /// may use the last-good scalar; a successful payload must resolve a fresh,
+    /// finite value from its own windows.
     var quotaRemaining: Double? {
         let persistedSelection = UserDefaults.standard.string(forKey: Self.quotaSourceKey)
             ?? QuotaResolver.auto
-        let excluded = ClientRegistry.quotaExcludedClients()
-        let selection = QuotaSelectionPolicy.effectiveSelection(
+        return QuotaSelectionPolicy.resolveRemainingPercent(
             payload: quota,
             persistedSelection: persistedSelection,
-            excluding: excluded)
-        if let value = QuotaResolver.resolve(
-            payload: quota, selection: selection, excluding: excluded)?
-            .window.remainingPercent
-        {
-            cachedQuotaRemaining = value
-            return value
-        }
-        // resolve() returned nil. If that is ONLY because every auto candidate
-        // is hidden, suppress the cached reading — it was captured before the
-        // hide and belongs to a now-hidden client, so keep the tray in its
-        // no-quota state instead. A genuine nil (no payload / fetch failure /
-        // no healthy window) still falls back to the cache, unchanged. The
-        // persisted last-good value is left intact so unhide restores instantly.
-        if QuotaResolver.excludedAllCandidates(
-            payload: quota, selection: selection, excluding: excluded)
-        {
-            return nil
-        }
-        return cachedQuotaRemaining
+            excluding: ClientRegistry.quotaExcludedClients(),
+            cachedRemaining: cachedQuotaRemaining)
     }
 
-    /// Persist a proven legacy-label migration and the last good remaining
-    /// percent when fresh live quota data arrives. Demo mode remains entirely
-    /// process-local. Reads `quotaRemaining` (not `cachedQuotaRemaining`) so it
-    /// resolves the fresh value even for cat/parrot styles, where
-    /// `renderGaugeIcon()` returns early without touching the cache.
-    private func persistQuotaState() {
+    /// Reconcile a successful payload with the scalar cache. A missing outer
+    /// payload returns the cache without touching defaults; nil defaults keep
+    /// demo mode process-local.
+    nonisolated static func applyQuotaRemaining(
+        payload: AgentUsagePayload?,
+        persistedSelection: String,
+        excluding: Set<String>,
+        cachedRemaining: Double?,
+        defaults: UserDefaults?
+    ) -> Double? {
+        guard payload != nil else { return cachedRemaining }
+        let remaining = QuotaSelectionPolicy.resolveRemainingPercent(
+            payload: payload,
+            persistedSelection: persistedSelection,
+            excluding: excluding,
+            cachedRemaining: cachedRemaining)
+        if let remaining {
+            defaults?.set(remaining, forKey: Self.lastRemainingKey)
+        } else {
+            defaults?.removeObject(forKey: Self.lastRemainingKey)
+        }
+        return remaining
+    }
+
+    private func reconcileQuotaRemaining(with payload: AgentUsagePayload) {
+        let defaults = UserDefaults.standard
+        cachedQuotaRemaining = Self.applyQuotaRemaining(
+            payload: payload,
+            persistedSelection: defaults.string(forKey: Self.quotaSourceKey)
+                ?? QuotaResolver.auto,
+            excluding: ClientRegistry.quotaExcludedClients(),
+            cachedRemaining: cachedQuotaRemaining,
+            defaults: source.allowsQuotaCachePersistence ? defaults : nil)
+    }
+
+    /// Persist a proven legacy-label migration after the payload's scalar state
+    /// has been reconciled. Demo mode remains entirely process-local.
+    private func persistQuotaSelectionMigration(for payload: AgentUsagePayload) {
         guard source.allowsQuotaCachePersistence else { return }
         let defaults = UserDefaults.standard
         let persistedSelection = defaults.string(forKey: Self.quotaSourceKey)
             ?? QuotaResolver.auto
         if let migrated = QuotaSelectionPolicy.migrationToPersist(
-            payload: quota, persistedSelection: persistedSelection)
+            payload: payload, persistedSelection: persistedSelection)
         {
             defaults.set(migrated, forKey: Self.quotaSourceKey)
         }
-        if let value = quotaRemaining {
-            defaults.set(value, forKey: Self.lastRemainingKey)
-        }
+    }
+
+    static func applyQuotaPayload(
+        _ candidate: AgentUsagePayload,
+        store: (AgentUsagePayload) -> Void,
+        reconcile: (AgentUsagePayload) -> Void,
+        persistSelection: (AgentUsagePayload) -> Void,
+        render: () -> Void,
+        notify: () -> Void
+    ) {
+        let payload = AgentUsagePublicationCoordinator.resolve(candidate)
+        store(payload)
+        reconcile(payload)
+        persistSelection(payload)
+        render()
+        notify()
     }
 
     private func currentFrames() -> [NSImage] {
-        let style = UserDefaults.standard.string(forKey: Self.styleKey) ?? "cat"
         let dark = controller?.isDarkAppearance ?? true
-        return frames["\(style)|\(dark ? "dark" : "light")"]
+        return frames["\(currentStyle)|\(dark ? "dark" : "light")"]
             ?? frames["cat|dark"] ?? []
     }
 
     private var animateEnabled: Bool {
-        UserDefaults.standard.object(forKey: Self.animateKey) == nil
+#if DEBUG
+        if let cpuTest { return cpuTest.animated }
+#endif
+        return UserDefaults.standard.object(forKey: Self.animateKey) == nil
             || UserDefaults.standard.bool(forKey: Self.animateKey)
     }
 
-    /// animation.rs: `speed = max(1, load/5)`, `interval = 500ms / speed` —
-    /// idle 2 fps, full load 40 fps.
-    private var frameInterval: Duration {
-        .milliseconds(Int(500.0 / max(1.0, load / 5.0)))
+    nonisolated static func animationLoad(tokensPerMinute: Double) -> Double {
+        min(max(0, tokensPerMinute) / 10_000.0, 100.0)
     }
 
-    private func startAnimationLoop() {
-        animationTask = Task { [weak self] in
-            var index = 0
-            var lastKey = ""
-            while !Task.isCancelled {
-                guard let self else { break }
-                let style = UserDefaults.standard.string(forKey: Self.styleKey) ?? "cat"
-                // Gauge styles: event-driven renders happen on quota
-                // changes (onQuotaUpdated) and settings changes (defaults
-                // observer). This loop only catches appearance flips (light/
-                // dark mode), so a long sleep is fine.
-                if QuotaIconStyle(rawValue: style) != nil {
-                    self.renderGaugeIcon()
-                    try? await Task.sleep(for: .seconds(30))
-                    continue
-                }
-                let set = self.currentFrames()
-                if style != lastKey {
-                    index = 0
-                    lastKey = style
-                }
-                guard !set.isEmpty else {
-                    try? await Task.sleep(for: .seconds(2))
-                    continue
-                }
-                if !self.animateEnabled {
-                    index = 0
-                    self.controller?.setFrame(set[0])
-                    try? await Task.sleep(for: .seconds(2))
-                    continue
-                }
-                self.controller?.setFrame(set[index % set.count])
-                index = (index + 1) % set.count
-                try? await Task.sleep(for: self.frameInterval)
-            }
+    nonisolated static func animationIntervalMilliseconds(load: Double) -> Int {
+        Int(500.0 / max(1.0, load / 5.0))
+    }
+
+    nonisolated static func animationLayerSpeed(load: Double) -> Double {
+        500.0 / Double(animationIntervalMilliseconds(load: load))
+    }
+
+    nonisolated static func effectiveAnimationFPS(load: Double) -> Double {
+        2.0 * animationLayerSpeed(load: load)
+    }
+
+    nonisolated static func baseAnimationDuration(frameCount: Int) -> Double {
+        Double(frameCount) / 2.0
+    }
+
+    private var animationSpeed: Float {
+        Float(Self.animationLayerSpeed(load: load))
+    }
+
+    private func refreshIcon() {
+        guard !isStopped else { return }
+        let style = currentStyle
+        if QuotaIconStyle(rawValue: style) != nil {
+            renderGaugeIcon()
+            return
+        }
+
+        let dark = controller?.isDarkAppearance ?? true
+        let frameKey = "\(style)|\(dark ? "dark" : "light")"
+        let set = frames[frameKey] ?? frames["cat|dark"] ?? []
+        guard let first = set.first else {
+            controller?.setAnimatedFrames([], speed: animationSpeed)
+            return
+        }
+
+        guard animateEnabled else {
+            presentedAnimationKey = nil
+            controller?.setStaticIcon(first, isTemplate: true)
+            return
+        }
+
+        if presentedAnimationKey != frameKey {
+            presentedAnimationKey = frameKey
+            controller?.setAnimatedFrames(set, speed: animationSpeed)
+        } else {
+            controller?.setAnimationSpeed(animationSpeed)
         }
     }
+
+    private func updateAnimationSpeedIfPresented() {
+        guard QuotaIconStyle(rawValue: currentStyle) == nil, animateEnabled,
+              presentedAnimationKey != nil
+        else { return }
+        controller?.setAnimationSpeed(animationSpeed)
+    }
+
+#if DEBUG
+    private func reportCPUTestReady(_ test: TrayAnimationCPUTestConfiguration) {
+        let frameCount = currentFrames().count
+        let duration = Self.baseAnimationDuration(frameCount: frameCount)
+        let speed = test.animated ? Self.animationLayerSpeed(load: load) : 0
+        let fps = test.animated ? Self.effectiveAnimationFPS(load: load) : 0
+        print(String(
+            format: "TRAY_CPU_TEST_READY style=%@ animated=%@ frames=%d base_duration=%.3f speed=%.3f fps=%.3f",
+            test.style, test.animated.description, frameCount, duration, speed, fps))
+        fflush(stdout)
+    }
+#endif
 
     /// OAuth quota fetch is network-bound (~30s worst case across four
     /// providers), so refresh on a 5-minute cadence — quota windows move
@@ -275,10 +376,13 @@ final class TrayAnimator {
                 let payload = try? await source.agentUsage()
                 guard let self, !Task.isCancelled else { break }
                 if let payload {
-                    self.quota = payload
-                    self.renderGaugeIcon() // refreshes cachedQuotaRemaining
-                    self.persistQuotaState()
-                    self.onQuotaUpdated?()
+                    Self.applyQuotaPayload(
+                        payload,
+                        store: { self.polledQuota = $0 },
+                        reconcile: { self.reconcileQuotaRemaining(with: $0) },
+                        persistSelection: { self.persistQuotaSelectionMigration(for: $0) },
+                        render: { self.renderGaugeIcon() },
+                        notify: { self.onQuotaUpdated?() })
                 }
                 try? await Task.sleep(for: .seconds(300))
             }
@@ -311,10 +415,11 @@ final class TrayAnimator {
     /// token reserved at that fetch's start; a stale (superseded) result is
     /// dropped.
     func applyRate(_ rate: Double, generation: Int) {
-        guard generation >= lastAppliedRateGen else { return }
+        guard !isStopped, generation >= lastAppliedRateGen else { return }
         lastAppliedRateGen = generation
-        load = min(rate / 10_000.0, 100.0)
+        load = Self.animationLoad(tokensPerMinute: rate)
         tokensPerMinRate = rate
+        updateAnimationSpeedIfPresented()
         onQuotaUpdated?()
     }
 
