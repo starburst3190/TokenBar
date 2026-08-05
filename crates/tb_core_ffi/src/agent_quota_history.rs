@@ -38,6 +38,18 @@ pub(crate) const RETENTION_MIN_CYCLES: usize = 8;
 pub(crate) const RETENTION_MAX_CYCLES: usize = 128;
 pub(crate) const RUNOUT_THRESHOLD_PERCENT: f64 = 100.0 - 1e-9;
 pub(crate) const EPSILON: f64 = 1e-9;
+/// How far a persisted `last_activity_at` may lead this transaction's clock
+/// before the series stops being trustworthy evidence.
+///
+/// A store written by an earlier transaction can legitimately carry a timestamp
+/// this one has not reached yet: the wall clock steps backwards on an NTP
+/// correction or a sleep/wake, and `observation_now` is captured before a
+/// provider run that may outlive the step. That is a clock event, not file
+/// corruption — every sample in the file is still exactly what the provider
+/// reported. Treating it as corruption discarded the whole store (all
+/// providers, weeks of samples) over a few seconds of skew, so ordinary skew is
+/// now absorbed here and only a lead this large costs a series its history.
+pub(crate) const CLOCK_SKEW_TOLERANCE_SECONDS: i64 = 900;
 
 static HISTORY_PROCESS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -404,6 +416,10 @@ struct LegacyV2Store {
 #[derive(Debug)]
 struct LoadedStore {
     store: Store,
+    /// Set when the loaded store is not what the file held: the file was
+    /// quarantined and this value must be written back even if the transaction
+    /// body changes nothing, or the surviving series would be lost with it.
+    repaired: bool,
 }
 
 /// Record a provider-neutral quota observation in the production v3 store.
@@ -1471,6 +1487,36 @@ fn validate_store_at(store: &Store, now: i64) -> bool {
             .series
             .iter()
             .all(|series| series.last_activity_at <= now)
+}
+
+/// The largest `last_activity_at` this transaction will still vouch for.
+fn activity_ceiling(now: i64) -> i64 {
+    now.saturating_add(CLOCK_SKEW_TOLERANCE_SECONDS)
+}
+
+/// Separate a structurally broken store from one that is merely ahead of this
+/// clock.
+///
+/// Structural failure — schema version, series ordering, sample validity,
+/// per-cycle caps, rollover coherence, activity behind its own samples — is
+/// corruption: the caller quarantines and starts empty. A series whose
+/// `last_activity_at` leads [`activity_ceiling`] is not corrupt, it is
+/// unverifiable by this clock, so only that series is dropped and every other
+/// provider keeps its history.
+///
+/// Returns the recovered store and how many series it lost, or `None` when the
+/// store is structurally invalid.
+fn recover_store_at(mut store: Store, now: i64) -> Option<(Store, usize)> {
+    if !validate_store(&store) {
+        return None;
+    }
+    let ceiling = activity_ceiling(now);
+    let before = store.series.len();
+    store
+        .series
+        .retain(|series| series.last_activity_at <= ceiling);
+    let dropped = before - store.series.len();
+    Some((store, dropped))
 }
 
 fn duration_for_resolution(resolution: DurationResolution) -> Option<i64> {
@@ -2732,12 +2778,16 @@ fn with_locked_transaction_with_save_and_mode<T>(
     let result = match loaded {
         Ok(mut loaded) => {
             let before = loaded.store.clone();
+            let repaired = loaded.repaired;
             let result = body(&mut loaded.store);
             match result {
                 Ok(value) => {
-                    if !validate_store_at(&loaded.store, upper_bound) {
+                    // The load already absorbed skew up to the tolerance, so the
+                    // post-body check has to accept the same range or a store it
+                    // just admitted would fail on the way out.
+                    if !validate_store_at(&loaded.store, activity_ceiling(upper_bound)) {
                         Err(HistoryError::Serialize)
-                    } else if loaded.store == before {
+                    } else if loaded.store == before && !repaired {
                         Ok(value)
                     } else if save(path, &loaded.store).is_err() {
                         Err(HistoryError::AtomicSave)
@@ -2794,20 +2844,38 @@ fn load_store_at_with_mode(
     let Some(bytes) = read_owner_only_with_mode(mode, path).map_err(|_| HistoryError::Read)? else {
         return Ok(LoadedStore {
             store: Store::default(),
+            repaired: false,
         });
     };
 
-    let parsed = serde_json::from_slice::<Store>(&bytes)
+    let recovered = serde_json::from_slice::<Store>(&bytes)
         .ok()
-        .filter(|store| validate_store_at(store, validation_now));
-    if let Some(store) = parsed {
-        return Ok(LoadedStore { store });
+        .and_then(|store| recover_store_at(store, validation_now));
+    if let Some((store, dropped)) = recovered {
+        if dropped == 0 {
+            return Ok(LoadedStore {
+                store,
+                repaired: false,
+            });
+        }
+        // Structurally sound, but at least one series is dated past what this
+        // clock can vouch for. Keep the whole file as forensic evidence — the
+        // quarantine copy is what a later investigation reads — then carry on
+        // with the series that are still verifiable instead of resetting every
+        // provider's history.
+        quarantine_corrupt_with_mode(mode, path, quarantine_now)
+            .map_err(|_| HistoryError::CorruptQuarantine)?;
+        return Ok(LoadedStore {
+            store,
+            repaired: true,
+        });
     }
 
     quarantine_corrupt_with_mode(mode, path, quarantine_now)
         .map_err(|_| HistoryError::CorruptQuarantine)?;
     Ok(LoadedStore {
         store: Store::default(),
+        repaired: false,
     })
 }
 
@@ -5806,9 +5874,12 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A backwards clock step (NTP correction, sleep/wake) leaves the store
+    /// dated slightly ahead of the transaction that reads it next. That is not
+    /// corruption, so nothing is quarantined and no history is lost.
     #[test]
-    fn future_last_activity_is_quarantined_before_observed_fallback() {
-        let (directory, path) = temp_path("future-activity");
+    fn small_clock_skew_preserves_history_without_quarantine() {
+        let (directory, path) = temp_path("small-skew");
         let now = 16_000_000;
         let lock_time = now + 1;
         let reset = now + DAY;
@@ -5831,29 +5902,110 @@ mod tests {
                 }],
             }],
         };
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+        record_at_lock_time(&path, "acct", Some(reset), 10.0, now, None, None, lock_time);
+
+        assert!(!directory
+            .join(format!("quota-pace-history-v3.corrupt-{now}.json"))
+            .exists());
+        let recovered = read_store(&path);
+        assert_eq!(recovered.series.len(), 1);
+        assert_eq!(recovered.series[0].active_reset_at, Some(reset));
+        assert_eq!(recovered.series[0].samples, store.series[0].samples);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Past the tolerance the series is no longer verifiable by this clock, so
+    /// it loses its history — but the file is kept as evidence and every other
+    /// series in it survives untouched.
+    #[test]
+    fn far_future_series_is_dropped_while_other_series_keep_history() {
+        let (directory, path) = temp_path("far-future-activity");
+        let now = 16_000_000;
+        let lock_time = now + 1;
+        let reset = now + DAY;
+        let sample = QuotaSample {
+            reset_at: reset,
+            duration_seconds: DAY,
+            duration_source: DurationSource::Provider,
+            used_percent: 10.0,
+            sampled_at: now,
+            origin: SampleOrigin::LiveV3,
+        };
+        let series = |account: &str, last_activity_at: i64| SeriesState {
+            provider_id: "copilot".into(),
+            account_scope: account.into(),
+            window_key: "premium_interactions.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at,
+            rollover: None,
+            samples: vec![sample.clone()],
+        };
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![
+                series("acct", activity_ceiling(lock_time) + 1),
+                series("other", now),
+            ],
+        };
         let bytes = serde_json::to_vec_pretty(&store).unwrap();
         fs::write(&path, &bytes).unwrap();
 
-        assert_eq!(
-            record_at_lock_time(&path, "acct", Some(reset), 10.0, now, None, None, lock_time,),
-            HistoryOutcome::LearningDuration
-        );
+        record_at_lock_time(&path, "acct", Some(reset), 10.0, now, None, None, lock_time);
+
         assert_eq!(
             fs::read(directory.join(format!("quota-pace-history-v3.corrupt-{now}.json"))).unwrap(),
             bytes
         );
         let recovered = read_store(&path);
-        assert_eq!(recovered.series[0].active_reset_at, None);
-        assert!(recovered.series[0].samples.is_empty());
-        assert!(matches!(
-            recovered.series[0].rollover,
-            Some(ObservedState::Watching {
-                reset_at,
-                consecutive_count: 1,
-                ..
-            }) if reset_at == reset
-        ));
+        let untouched = recovered
+            .series
+            .iter()
+            .find(|series| series.account_scope == "other")
+            .expect("an unrelated series must survive another series' clock anomaly");
+        assert_eq!(untouched.samples, vec![sample]);
+        assert_eq!(untouched.last_activity_at, now);
+        let rebuilt = recovered
+            .series
+            .iter()
+            .find(|series| series.account_scope == "acct")
+            .expect("the dropped series is rebuilt by the observation that follows");
+        assert_eq!(rebuilt.active_reset_at, None);
+        assert!(rebuilt.samples.is_empty());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_keeps_the_tolerance_boundary_and_drops_one_second_past_it() {
+        let now = 16_000_000;
+        let reset = now + DAY;
+        let series = |last_activity_at: i64| SeriesState {
+            provider_id: "copilot".into(),
+            account_scope: "acct".into(),
+            window_key: "premium_interactions.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at,
+            rollover: None,
+            samples: Vec::new(),
+        };
+        let store = |last_activity_at: i64| Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series(last_activity_at)],
+        };
+
+        let (kept, dropped) = recover_store_at(store(activity_ceiling(now)), now).unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.series.len(), 1);
+
+        let (emptied, dropped) = recover_store_at(store(activity_ceiling(now) + 1), now).unwrap();
+        assert_eq!(dropped, 1);
+        assert!(emptied.series.is_empty());
+
+        // Structural corruption is still corruption, not a clock anomaly.
+        let mut malformed = store(now);
+        malformed.schema_version = HISTORY_SCHEMA_VERSION + 1;
+        assert!(recover_store_at(malformed, now).is_none());
     }
 
     #[test]
