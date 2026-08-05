@@ -3,6 +3,99 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>1.12.0</title>
+            <pubDate>Tue, 04 Aug 2026 09:43:24 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.12.0</link>
+            <sparkle:version>499</sparkle:version>
+            <sparkle:shortVersionString>1.12.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>New:</b>
+<ul>
+<li>A flat contribution heatmap joins the bar and 3D views in the usage chart. Press Command-G to cycle through all three.</li>
+<li>Claude plans that report per-model weekly caps now show those limits alongside the session and weekly windows.</li>
+</ul>
+<b>Improved:</b>
+<ul>
+<li>Reopening the popover no longer recomputes the hourly views, so they appear right away.</li>
+<li>The turn count shows a loading state instead of looking empty while it is still being read.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Non-square menu-bar animation art, such as the parrot, is fitted to the bar instead of being stretched to a square.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.12.0/TokenBar.app.tar.gz" length="8421268" type="application/octet-stream" sparkle:edSignature="EavTOPbF+lu7JBSWFaGL0K2f9OljoqYmc5POwLU/eOg0MWi0+sXUmmMvNHj8NKsiRbkmq3ygimTA1YgUBZ1RAg=="/>
+        </item>
+        <item>
+            <title>1.11.0</title>
+            <pubDate>Mon, 03 Aug 2026 18:10:16 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.11.0</link>
+            <sparkle:version>473</sparkle:version>
+            <sparkle:shortVersionString>1.11.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>New:</b>
+<ul>
+<li>Daily and Monthly usage now show Codex and Claude turn counts alongside message totals, making human interactions easier to distinguish from agent and tool-loop activity.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Message-only activity remains visible in Daily and Monthly history, drill-downs, active-day counts, streaks, and year visibility without distorting token or cost charts.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.11.0/TokenBar.app.tar.gz" length="8326011" type="application/octet-stream" sparkle:edSignature="FpmXhLgz1Pv7rKx9butUTLM2g97D7/djuJC2imvb4nyA1NxTk950CUuB7GMo6k/72IDFT81fobDn77a+LaZ5Cg=="/>
+        </item>
+        <item>
+            <title>1.10.0</title>
+            <pubDate>Sun, 02 Aug 2026 14:39:54 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.10.0</link>
+            <sparkle:version>461</sparkle:version>
+            <sparkle:shortVersionString>1.10.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>New:</b>
+<ul>
+<li>Add optional menu bar items for individual clients, showing a brand icon and remaining quota for Auto or a selected window; clicking one opens TokenBar on that client.</li>
+<li>Settings now uses native sidebar navigation for Menu Bar, Dashboard, General, and About, with the live preview kept visible.</li>
+<li>Drag client tabs to reorder them directly in the popover; Overview stays first and hidden clients keep their saved positions.</li>
+</ul>
+<b>Improved:</b>
+<ul>
+<li>Historical quota pace can start once current-cycle evidence passes quality checks; insufficient history remains in learning mode and unvalidated risk stays hidden.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Claude quota cards reflect live Pro and Max plan changes instead of a stale login-time label.</li>
+<li>Grok usage is attributed more safely across process restarts and subagents; ambiguous evidence stays unattributed.</li>
+<li>Popover height dragging remains responsive, and Settings and Quit continue responding normally after resizing.</li>
+</ul>
+<p>Thanks: @amikai</p>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.10.0/TokenBar.app.tar.gz" length="8299789" type="application/octet-stream" sparkle:edSignature="7xZZTZq4NbzYQAIHhdmKXbR1LJTgOPbKzcJ3gxG87Ll1HE3suCv8vTPqf3ru+v/ajwcoa+ey9gaQO9sX0nDPBw=="/>
+        </item>
+        <item>
+            <title>1.9.0</title>
+            <pubDate>Mon, 27 Jul 2026 17:54:23 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.9.0</link>
+            <sparkle:version>435</sparkle:version>
+            <sparkle:shortVersionString>1.9.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>New:</b>
+<ul>
+<li>TokenBar now includes Traditional Chinese. Choose System, English, or Traditional Chinese in Settings; when the selection changes, TokenBar offers to restart immediately so the new preference can take effect. Dashboards, settings, menus, charts, quota reset countdowns, usage pace and risk text, and graph controls are localized, with English fallback for missing entries.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Copilot quota windows survive optional reset dates with unexpected types, and duplicate OTEL spans keep the full observed activity duration without adding replayed token usage.</li>
+<li>Empty KIMI_CODE_HOME values fall back to the default Kimi Code directory; non-empty overrides keep their existing behavior.</li>
+<li>Provider connection errors retain typed DNS and TLS diagnostics without exposing raw transport text.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.9.0/TokenBar.app.tar.gz" length="8100448" type="application/octet-stream" sparkle:edSignature="GM1JnVY0Kudj7VWoX4VR97Zd2KiJz56/p4Fj7HeTl8V5H5pTUIjN/7IWJDwGv5RMQoWxID9GU7j/cR8jXRczAg=="/>
+        </item>
+        <item>
             <title>1.8.1</title>
             <pubDate>Fri, 24 Jul 2026 16:23:12 +0000</pubDate>
             <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.8.1</link>
@@ -24,101 +117,6 @@
 </ul>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.8.1/TokenBar.app.tar.gz" length="8054494" type="application/octet-stream" sparkle:edSignature="hOtwEBwCATG6bwc5X8NWUWp9BADbfkWaVB1gdc/bUKPDpGREBC350SkGtlm28QHqhFFe37px7u90lyrfiMLQBA=="/>
-        </item>
-        <item>
-            <title>1.7.0</title>
-            <pubDate>Wed, 22 Jul 2026 20:25:01 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.7.0</link>
-            <sparkle:version>398</sparkle:version>
-            <sparkle:shortVersionString>1.7.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>New:</b>
-<ul>
-<li>Copilot Desktop token-bearing local sessions are now counted with model, workspace, and agent details. Copilot OTEL remains authoritative when both sources contain the same session, so overlapping usage is not counted twice. Totals may increase because previously invisible Desktop usage is now included, not because the update created new spend.</li>
-</ul>
-<b>Improved:</b>
-<ul>
-<li>Hovered Token Usage and Models bars now gain adaptive outlines and glow in light and dark appearances. Model markers glow with their rows, and Daily/Monthly drill-downs show detailed Input, Output, Cache read, Cache write, and Reasoning tooltips above neighboring rows.</li>
-</ul>
-<b>Under the hood:</b>
-<ul>
-<li>Usage caching now uses bounded identity-aware shards instead of one message-cache file. The first scan after updating starts cold because the legacy cache is intentionally left untouched; later refreshes use the new cache without changing report semantics.</li>
-<li>Hermes discovery supports native Windows layouts for the downstream Windows build without changing the macOS app.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.7.0/TokenBar.app.tar.gz" length="7931247" type="application/octet-stream" sparkle:edSignature="5klKHNy8+0H5PlrDqZsMQ+prDZYiWABSsG+j6SFSsX+BeIZm/hPiax4B1dBc3zzmmhNpIecr92DPlTp58Kc5Ag=="/>
-        </item>
-        <item>
-            <title>1.6.2</title>
-            <pubDate>Tue, 21 Jul 2026 14:07:22 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.6.2</link>
-            <sparkle:version>386</sparkle:version>
-            <sparkle:shortVersionString>1.6.2</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Fixes:</b>
-<ul>
-<li>Opening the popover no longer causes TokenBar to quit on some installations after v1.6.1.</li>
-<li>Quota bars now keep a consistent thickness whether or not a pace marker is available.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.6.2/TokenBar.app.tar.gz" length="7854734" type="application/octet-stream" sparkle:edSignature="EIj9p7XLYTP9JIBoseiX/Dsb+rpF09FFlqNvAMGnCxEX3Se0L7XWuAdluxINTOrjre3gtJOEQ1NSQZLURGlrDQ=="/>
-        </item>
-        <item>
-            <title>1.6.1</title>
-            <pubDate>Tue, 21 Jul 2026 12:42:52 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.6.1</link>
-            <sparkle:version>382</sparkle:version>
-            <sparkle:shortVersionString>1.6.1</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Improved:</b>
-<ul>
-<li>Token Usage (2D) and Models popover tooltips clamp inside the visible scroll area, dodge the cursor again, and stay above liquid-glass cards so they no longer hide under the footer or neighboring cards.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>Resizing the popover height then hovering no longer leaves a fake tooltip dodge from a stale viewport.</li>
-<li>Models tooltip overlay no longer steals hover from the row underneath.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.6.1/TokenBar.app.tar.gz" length="7853465" type="application/octet-stream" sparkle:edSignature="+pN1rgOr5UEmXoz3PBMdFtkjmtBsS2Zt18zvdyljE+cndNSH471lZJ9fnInTIOMtjVT19XLvKSABUJOep3XgDA=="/>
-        </item>
-        <item>
-            <title>1.6.0</title>
-            <pubDate>Tue, 21 Jul 2026 06:32:08 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.6.0</link>
-            <sparkle:version>379</sparkle:version>
-            <sparkle:shortVersionString>1.6.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>New:</b>
-<ul>
-<li>Count more local usage: expanded sources on existing clients (OpenCode v2 databases, Kiro IDE globalStorage and structured sessions, Kimi Code beside legacy Kimi) plus new first-class clients Junie and OpenCodeReview.</li>
-<li>Grok Agent Limits shows weekly SuperGrok credits and, best-effort, monthly included allowance only when the API returns used/limit; a monthly miss does not sink weekly.</li>
-<li>Historical quota pace can learn on eligible recurring windows for Codex, Claude, Grok, Antigravity, and Copilot (not every % card; not only Codex Weekly).</li>
-</ul>
-<b>Improved:</b>
-<ul>
-<li>Grok Build multi-turn usage now follows real turn_completed API usage and unified logs when present, so totals match the product more closely than context counters did. Totals may rise versus 1.5.0 — accuracy correction, not new spend.</li>
-<li>Long-context and routed pricing paths resolve cost more carefully for verified Sakana and LiteLLM-style requests.</li>
-<li>Usage cache schema advances 29→32 (via 30/31); first launch after this update rebuilds the local usage cache once so new parsers and Grok fixes are not mixed with stale rows; later refreshes stay fast.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>Grok weekly quota no longer fails the whole card right after a weekly reset when percent fields are omitted.</li>
-<li>Quota card selections keep internal "|" characters so model-scoped windows are not mis-parsed.</li>
-<li>Existing Codex, Claude, Copilot, and related parsers tighten duration anchoring and dedup so shared sessions are less likely to double-count.</li>
-</ul>
-<b>Not in this release:</b>
-<ul>
-<li>Copilot Desktop / VS Code chatSessions / Hermes Windows (still in progress)</li>
-<li>Zcode</li>
-<li>Model-alias settings UI</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.6.0/TokenBar.app.tar.gz" length="7842236" type="application/octet-stream" sparkle:edSignature="fHiR6/RyKJpZDYuA2GWour0Ood72DXJQwFjRaW+41zUDvmf5AkW6cuL6ua9+g6mcYNqeVu5XYPNrNjJbngp2Aw=="/>
         </item>
         <item>
             <title>1.1.1</title>

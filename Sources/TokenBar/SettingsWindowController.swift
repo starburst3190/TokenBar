@@ -1,4 +1,5 @@
 import AppKit
+import TokenBarCore
 import SwiftUI
 
 /// Owns the standalone settings window (gear button, Cmd-comma, `--settings`).
@@ -75,8 +76,17 @@ final class SettingsWindowController {
         // 1x0 at show time, which broke the centering math) — force the
         // SwiftUI fitting size up front.
         window.setContentSize(host.view.fittingSize)
-        window.title = "TokenBar Settings"
-        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.title = "TokenBar Settings".localized
+        window.styleMask = [.titled, .closable, .miniaturizable, .fullSizeContentView]
+        // The glass backdrop runs under the title bar (the popover look);
+        // scroll views inset their content via the safe area.
+        window.titlebarAppearsTransparent = true
+        // macOS 26 draws the native title flush left next to the traffic lights
+        // and an opaque title bar only trades the seamless glass for a solid
+        // band without centering it, so show no title at all — the sidebar and
+        // the window's own content already say what this is. `window.title`
+        // stays set for Mission Control and the Window menu.
+        window.titleVisibility = .hidden
         window.isReleasedWhenClosed = false
         // Swap the live UI for a static, same-size placeholder when the window
         // closes so its preview timelines + polling .tasks are torn down (a

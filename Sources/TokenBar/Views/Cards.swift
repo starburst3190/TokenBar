@@ -154,6 +154,29 @@ extension View {
     func glassCard(cornerRadius: CGFloat = 10) -> some View {
         modifier(GlassCardBackground(cornerRadius: cornerRadius))
     }
+
+    /// Shows `cursor` while the pointer is over this view. `onHoverChange` is for
+    /// callers that also drive their own hover styling.
+    ///
+    /// Uses `set()`, not `push()`/`pop()`: that stack is app-wide and `pop()`
+    /// removes whatever is on top rather than the entry this view pushed, so a
+    /// view torn down mid-hover — closing the popover or the Settings window
+    /// replaces the whole hosting root, with no exit callback — either leaks its
+    /// push or pops another view's cursor, and no amount of local bookkeeping
+    /// fixes that. `set()` keeps no stack, so the worst case is a stale cursor
+    /// that the next region the pointer enters corrects.
+    ///
+    /// AppKit cursor rects would be tidier still, but `NSHostingView` manages the
+    /// cursor itself and `addCursorRect` does not take effect inside it (measured:
+    /// the pointing hand never appeared).
+    func hoverCursor(
+        _ cursor: NSCursor, onHoverChange: ((Bool) -> Void)? = nil
+    ) -> some View {
+        onHover { inside in
+            onHoverChange?(inside)
+            if inside { cursor.set() } else { NSCursor.arrow.set() }
+        }
+    }
 }
 
 /// Floating hover-tooltip chrome. On macOS 26 it's real Liquid Glass so the
@@ -242,10 +265,10 @@ struct DashCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
+                    Text(title.localized)
                         .font(.system(size: 13, weight: .semibold))
                     if let subtitle {
-                        Text(subtitle)
+                        Text(subtitle.localized)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -272,7 +295,7 @@ struct TokenUsageRow: View {
                 "\(Format.mmdd(stats.dateRange.start)) → \(Format.mmdd(stats.dateRange.end))")
             cell(
                 Format.compactTokens(stats.totalTokens), "Tokens",
-                "\(stats.activeDays) active days")
+                "%lld active days".localized(stats.activeDays))
             cell(
                 stats.bestDay.map { Format.usd($0.cost) } ?? "$0.00", "Best day",
                 stats.bestDay.map { Format.monthDay($0.date) } ?? "—")
@@ -283,7 +306,7 @@ struct TokenUsageRow: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(num)
                 .font(.system(size: 15, weight: .semibold).monospacedDigit())
-            Text(label)
+            Text(label.localized)
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Text(sub)
@@ -312,7 +335,7 @@ struct StreaksCard: View {
         VStack(alignment: .leading, spacing: 2) {
             (Text("\(days)").font(.system(size: 17, weight: .semibold).monospacedDigit())
                 + Text(" days").font(.caption).foregroundStyle(.secondary))
-            Text(label)
+            Text(label.localized)
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

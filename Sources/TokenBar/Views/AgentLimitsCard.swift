@@ -48,10 +48,10 @@ struct AgentLimitsCard: View {
 
     /// Pure state presentation shared by every AgentLimitsCard consumer.
     enum PacePresentation {
-        static let learningHistoryText = "Learning history · Linear estimate"
-        static let learningDurationText = "Learning reset duration"
-        static let linearText = "Linear"
-        static let legacyText = "Pace unavailable · legacy data"
+        static var learningHistoryText: String { "Learning history · Linear estimate".localized }
+        static var learningDurationText: String { "Learning reset duration".localized }
+        static var linearText: String { "Linear".localized }
+        static var legacyText: String { "Pace unavailable · legacy data".localized }
 
         static func statusText(
             state: UsagePaceState,
@@ -74,22 +74,22 @@ struct AgentLimitsCard: View {
         }
 
         static func unavailableText(_ reason: UsagePaceUnavailableReason?) -> String {
-            guard let reason else { return "Pace unavailable · unavailable reason" }
+            guard let reason else { return "Pace unavailable · unavailable reason".localized }
             switch reason {
             case .windowIdentity:
-                return "Pace unavailable · unknown quota window"
+                return "Pace unavailable · unknown quota window".localized
             case .missingReset:
-                return "Pace unavailable · missing reset"
+                return "Pace unavailable · missing reset".localized
             case .invalidEvidence:
-                return "Pace unavailable · invalid quota data"
+                return "Pace unavailable · invalid quota data".localized
             case .accountScope:
-                return "Pace unavailable · account identity unavailable"
+                return "Pace unavailable · account identity unavailable".localized
             case .storeCapacity:
-                return "Pace unavailable · history storage full"
+                return "Pace unavailable · history storage full".localized
             case .history:
-                return "Pace unavailable · history unavailable"
+                return "Pace unavailable · history unavailable".localized
             case .nonRecurring:
-                return "Pace unavailable · non-recurring quota"
+                return "Pace unavailable · non-recurring quota".localized
             }
         }
 
@@ -194,14 +194,17 @@ struct AgentLimitsCard: View {
             if opencodeView {
                 integrationLine("↔ Routes through opencode")
             } else if !restrict && !opencodeSubs.isEmpty {
-                integrationLine("opencode also taps: \(opencodeSubs.joined(separator: " · "))")
+                integrationLine(
+                    "opencode also taps: %@".localized(
+                        opencodeSubs.joined(separator: " · ")))
             }
             let visible = visibleClients
             if visible.isEmpty {
                 Text(
                     opencodeView && !opencodeSubs.isEmpty
-                        ? "Subscriptions: \(opencodeSubs.joined(separator: " · "))"
-                        : "No supported agents yet"
+                        ? "Subscriptions: %@".localized(
+                            opencodeSubs.joined(separator: " · "))
+                        : "No supported agents yet".localized
                 )
                 .font(.caption)
                 .foregroundStyle(.tertiaryAdaptive)
@@ -220,13 +223,13 @@ struct AgentLimitsCard: View {
     }
 
     private var noteLabel: some View {
-        Text(note)
+        Text(note.localized)
             .font(.caption2)
             .foregroundStyle(.tertiaryAdaptive)
     }
 
     private func integrationLine(_ text: String) -> some View {
-        Text(text)
+        Text(text.localized)
             .font(.caption2)
             .foregroundStyle(.secondary)
     }
@@ -389,17 +392,18 @@ struct AgentLimitsCard: View {
         var color: Color = .secondary
         if snapshot?.source == "unconfigured" {
             // Not set up yet -- neutral prompt, not an alarming red error.
-            text = "Set up"
+            text = "Set up".localized
         } else if snapshot?.error != nil {
-            text = "Error"
+            text = "Error".localized
             color = .red
         } else if let snapshot, !snapshot.uniqueCardWindows.isEmpty {
+            // Backend-reported source ("oauth", "api", …) — data, not copy.
             text = snapshot.source.uppercased()
         } else if isLive {
-            text = "Live"
+            text = "Live".localized
             color = .green
         } else {
-            text = "No quota"
+            text = "No quota".localized
         }
         return Text(text)
             .font(.caption2.weight(.medium))
@@ -435,22 +439,30 @@ struct AgentLimitsCard: View {
         // up with the fill either way.
         let fill = asUsed ? used : remaining
         let leftLabel = asUsed
-            ? "\(Int(used.rounded()))% used"
-            : "\(Int(remaining.rounded()))% left"
+            ? "%lld%% used".localized(Int(used.rounded()))
+            : "%lld%% left".localized(Int(remaining.rounded()))
+        // `resetText` is a compatibility field produced in English by Rust.
+        // Derive the visible countdown from the structured timestamp so the
+        // quota card follows the selected UI language; non-countdown metadata
+        // (for example a monthly cap) keeps its provider text.
+        let resetText = window.resetsAt.flatMap { UsagePace.resetText(for: $0) }
+            ?? window.resetText
         let gauge = gaugeColor(remaining: remaining, brand: brand)
 
         if classic {
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text(window.label)
+                    // Display only — the payload's `label` stays untranslated
+                    // so QuotaResolver's legacy-selection matching still works.
+                    Text(window.label.localized)
                         .font(.caption2.weight(.medium))
                     Spacer()
-                    Text(window.resetText ?? leftLabel)
+                    Text(resetText ?? leftLabel)
                         .font(.caption2)
                         .foregroundStyle(.tertiaryAdaptive)
                 }
                 bar(fillPercent: fill, color: gauge, paceLeft: nil, paceIsDeficit: false)
-                if window.resetText != nil {
+                if resetText != nil {
                     Text(leftLabel)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -459,10 +471,12 @@ struct AgentLimitsCard: View {
         } else {
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text(window.label)
+                    // Display only — the payload's `label` stays untranslated
+                    // so QuotaResolver's legacy-selection matching still works.
+                    Text(window.label.localized)
                         .font(.caption2.weight(.medium))
                     Spacer()
-                    if let reset = window.resetText {
+                    if let reset = resetText {
                         Text(reset)
                             .font(.caption2)
                             .foregroundStyle(.tertiaryAdaptive)
@@ -552,7 +566,7 @@ struct AgentLimitsCard: View {
     private func placeholderRow(_ label: String, brand: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
-                Text(label)
+                Text(label.localized)
                     .font(.caption2.weight(.medium))
                 Spacer()
                 if classic {

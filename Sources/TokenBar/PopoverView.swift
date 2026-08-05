@@ -5,6 +5,17 @@ import TokenBarCore
 /// Popover root: view-switch row + lens router over a shared DashboardModel.
 /// Per-client tabs join in a later phase.
 struct PopoverView: View {
+    private let routeMemory: StatusItemRouteMemory
+
+    static func supportedTurnClients(_ ids: [String]) -> [String] {
+        let supported = Set(["codex", "claude"])
+        return ids.filter { supported.contains($0) }
+    }
+
+    init(routeMemory: StatusItemRouteMemory) {
+        self.routeMemory = routeMemory
+    }
+
     /// Owns the popover's size; the drag handle below writes its height.
     @EnvironmentObject private var chrome: PopoverChrome
     /// Height at the start of the active resize drag (global-space gesture).
@@ -28,18 +39,21 @@ struct PopoverView: View {
     private var popoverScale: CGFloat {
         (PopoverScale(rawValue: popoverScaleRaw) ?? .default).factor
     }
-    @AppStorage("tokenbar.chart.view") private var chartViewRaw = "2d"
-    @AppStorage("tokenbar.view") private var activeViewRaw = AppView.overview.rawValue
+    // Round 6 audit 2: matches the sibling `activeViewRaw` default below —
+    // `ChartView.bars.rawValue`, not the bare "2d" literal this used to
+    // duplicate.
+    @AppStorage("tokenbar.chart.view") private var chartViewRaw = ChartView.bars.rawValue
+    @AppStorage(ClientTray.activeViewKey) private var activeViewRaw = AppView.overview.rawValue
     @AppStorage("tokenbar.views.hidden") private var hiddenViewsRaw = ""
     @AppStorage("tokenbar.bridge.dismissed") private var bridgeDismissed = false
     /// "overview" or a client id. Persisted so the selection survives the
     /// popover's rootView teardown/rebuild cycle (StatusItemController swaps
     /// the live view for a placeholder on close).
     /// `--tab=<id>` preselects a client tab (debug/screenshot aid).
-    @AppStorage("tokenbar.activeTab") private var activeTab =
+    @AppStorage(ClientTray.activeTabKey) private var activeTab =
         CommandLine.arguments
             .first(where: { $0.hasPrefix("--tab=") })
-            .map { String($0.dropFirst("--tab=".count)) } ?? "overview"
+            .map { String($0.dropFirst("--tab=".count)) } ?? ClientTray.overviewTab
     // Observe the tab hidden/order keys so the popover reacts LIVE to a hide or
     // reorder made in the Settings window while it stays open — otherwise
     // `displayClients` (which reads UserDefaults) would only pick up the change
@@ -51,7 +65,22 @@ struct PopoverView: View {
     private var activeView: Binding<AppView> {
         Binding(
             get: { AppView(rawValue: activeViewRaw) ?? .overview },
-            set: { activeViewRaw = $0.rawValue })
+            set: {
+                activeViewRaw = $0.rawValue
+                routeMemory.record(clientId: activeTab, view: $0.rawValue)
+            })
+    }
+
+    private var clientTab: Binding<String> {
+        Binding(
+            get: { activeTab },
+            set: { nextClient in
+                guard nextClient != activeTab else { return }
+                let route = routeMemory.switchClient(
+                    from: activeTab, currentView: activeViewRaw, to: nextClient)
+                activeTab = route.clientId
+                activeViewRaw = route.view
+            })
     }
 
     /// Lenses shown in the tab row — a hidden lens drops out the instant the
@@ -95,7 +124,20 @@ struct PopoverView: View {
     /// a client tab. Threaded into `ensureData` so the Hourly/Agents FFI fetch
     /// is scoped to the selection (accurate totals for shared hours/agents).
     private var lensClientIds: [String] {
-        activeTab == "overview" ? displayClients : [activeTab]
+        activeTab == ClientTray.overviewTab ? displayClients : [activeTab]
+    }
+
+    /// Daily/Monthly request turns only for visible canonical clients, keeping
+    /// the incoming display order and never passing an empty all-client filter.
+    private var turnClientIds: [String] {
+        Self.supportedTurnClients(lensClientIds)
+    }
+
+    private var lazyClientIds: [String] {
+        switch activeView.wrappedValue {
+        case .daily, .monthly: return turnClientIds
+        default: return lensClientIds
+        }
     }
 
     var body: some View {
@@ -106,8 +148,9 @@ struct PopoverView: View {
             }
             if let stats = model.stats, !stats.presentClients.isEmpty {
                 DashboardTabs(
-                    clients: displayClients, active: $activeTab,
-                    kbdHints: cmdHeld)
+                    clients: displayClients,
+                    presentClients: model.stats?.presentClients ?? [],
+                    active: clientTab, kbdHints: cmdHeld)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 8)
             }
@@ -136,7 +179,13 @@ struct PopoverView: View {
             Divider()
             footer
         }
-        .frame(width: chrome.width, height: chrome.height)
+        // The scaled path needs a concrete base height to scale from, so it
+        // pins `chrome.height` and gives up the fill-the-host optimization
+        // below. At the default scale the modifier is a pass-through, so the
+        // unscaled path keeps AppKit's live drag size and does not republish a
+        // height — and rebuild this whole tree — on every pointer event.
+        .frame(width: chrome.width, height: popoverScale == 1 ? nil : chrome.height)
+        .frame(maxHeight: popoverScale == 1 ? .infinity : nil)
         .modifier(PopoverScaleModifier(baseWidth: chrome.width, baseHeight: chrome.height,
             scale: popoverScale))
         // Container-level tooltip invalidation: a tab switch swaps every card
@@ -164,8 +213,8 @@ struct PopoverView: View {
         // "overview" (same onChange pass), which changes this task's id and
         // cancels the in-flight fetch before it commits. Self-correcting;
         // switching to effectiveView here isn't needed for correctness.
-        .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(lensClientIds.joined(separator: ","))") {
-            await model.ensureData(for: activeView.wrappedValue, clients: lensClientIds)
+        .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(lazyClientIds.joined(separator: ","))") {
+            await model.ensureData(for: activeView.wrappedValue, clients: lazyClientIds)
         }
         // Auto-clear a year filter scoped to a year only hidden clients used —
         // re-checked on a live hide toggle (hiddenRaw) and on each payload load
@@ -189,8 +238,12 @@ struct PopoverView: View {
             if let tabArg = CommandLine.arguments
                 .first(where: { $0.hasPrefix("--tab=") })
                 .map({ String($0.dropFirst("--tab=".count)) }) {
-                activeTab = tabArg
+                let route = routeMemory.switchClient(
+                    from: activeTab, currentView: activeViewRaw, to: tabArg)
+                activeTab = route.clientId
+                activeViewRaw = route.view
             }
+            routeMemory.record(clientId: activeTab, view: activeViewRaw)
         }
         .onDisappear { removeKeyMonitors() }
         // Reset a stale persisted tab whenever the displayed client set changes,
@@ -229,8 +282,8 @@ struct PopoverView: View {
     /// presentClients — still falls back.
     private func resetTabIfHidden() {
         guard model.stats?.presentClients != nil else { return }
-        if activeTab != "overview", !displayClients.contains(activeTab) {
-            activeTab = "overview"
+        if activeTab != ClientTray.overviewTab, !displayClients.contains(activeTab) {
+            clientTab.wrappedValue = ClientTray.overviewTab
         }
     }
 
@@ -280,7 +333,7 @@ struct PopoverView: View {
                 .pickerStyle(.inline)
                 .labelsHidden()
             } label: {
-                Text(model.year ?? "All")
+                Text((model.year ?? "All").localized)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -415,7 +468,7 @@ struct PopoverView: View {
             // the single body pass before `resetTabIfHidden()` fixes the
             // persisted `activeTab`. Use the reactive `displayClients` (observes
             // the hidden/order raws) so a live hide re-derives the slice.
-            let singleClient = (activeTab != "overview" && displayClients.contains(activeTab))
+            let singleClient = (activeTab != ClientTray.overviewTab && displayClients.contains(activeTab))
                 ? activeTab : nil
             let clientIds = singleClient.map { [$0] } ?? displayClients
             // Every displayed number must exclude hidden clients — including the
@@ -424,6 +477,7 @@ struct PopoverView: View {
             // slice, so this hot path (re-evals every ~10s trace poll) doesn't
             // re-aggregate UsageStats on every body eval.
             let activeStats = model.stats(selecting: Set(clientIds)) ?? stats
+            let turnClientIds = Self.supportedTurnClients(clientIds)
             switch effectiveView {
             case .overview:
                 OverviewView(
@@ -436,11 +490,19 @@ struct PopoverView: View {
                 ModelsView(
                     report: model.modelReport, clientIds: clientIds, colors: model.colors)
             case .daily:
-                DailyView(payload: payload, clientIds: clientIds, colors: model.colors)
+                DailyView(
+                    payload: payload, clientIds: clientIds,
+                    hourlyReport: model.turnsReport(for: turnClientIds),
+                    turnClientIds: turnClientIds, turnsLoading: model.hourlyLoading,
+                    colors: model.colors)
             case .monthly:
-                MonthlyView(payload: payload, clientIds: clientIds, colors: model.colors)
+                MonthlyView(
+                    payload: payload, clientIds: clientIds,
+                    hourlyReport: model.turnsReport(for: turnClientIds),
+                    turnClientIds: turnClientIds, turnsLoading: model.hourlyLoading,
+                    colors: model.colors)
             case .hourly:
-                HourlyView(report: model.hourly, clientIds: clientIds)
+                HourlyView(report: model.hourlyReport(for: clientIds), clientIds: clientIds)
             case .stats:
                 StatsView(
                     payload: payload, clientIds: clientIds, stats: activeStats,
@@ -517,9 +579,7 @@ struct PopoverView: View {
                         dragBase = nil
                     }
             )
-            .onHover { inside in
-                if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
-            }
+            .hoverCursor(.resizeUpDown)
             .help("Drag to resize the popover height")
     }
 
@@ -527,7 +587,8 @@ struct PopoverView: View {
 
     /// The web app's Cmd shortcuts (App.tsx onKeyDown), as local NSEvent
     /// monitors scoped to the popover's key window: ⌘1-9 tabs, ⌘[/⌘] cycle,
-    /// ⌘, settings, ⌘R refresh, ⌘G 2D/3D, ⌘W/Esc close, ⌘Q quit. Holding Cmd
+    /// ⌘, settings, ⌘R refresh, ⌘G cycle chart view (Bars/Heatmap/3D), ⌘W/Esc
+    /// close, ⌘Q quit. Holding Cmd
     /// alone for 400ms reveals the tab pins (system chords like ⌘⇧4 don't).
     private func installKeyMonitors() {
         guard keyMonitor == nil else { return }
@@ -551,10 +612,17 @@ struct PopoverView: View {
 
     /// Settings live in their own window now; the transient popover closes
     /// itself on the way (programmatic window swaps don't count as the
-    /// outside click that would normally dismiss it).
+    /// outside click that would normally dismiss it). Present on the NEXT
+    /// runloop turn: showing the window in the same turn as the popover's
+    /// animated close puts both vibrant windows in one CoreAnimation
+    /// transaction and the native switch thumbs lose their first frame (blue
+    /// track, no knob) until a later window-level invalidation. Launching with
+    /// `--settings` has no popover and never showed the artifact.
     private func openSettingsWindow(from popoverWindow: NSWindow?) {
         popoverWindow?.performClose(nil)
-        SettingsWindowController.shared.show()
+        DispatchQueue.main.async {
+            SettingsWindowController.shared.show()
+        }
     }
 
     /// Returns true when the event was consumed.
@@ -567,16 +635,16 @@ struct PopoverView: View {
         guard mods == .command, let chars = event.charactersIgnoringModifiers?.lowercased()
         else { return false }
 
-        let tabs = ["overview"] + ClientRegistry.displayClients(present: model.stats?.presentClients ?? [])
+        let tabs = [ClientTray.overviewTab] + ClientRegistry.displayClients(present: model.stats?.presentClients ?? [])
         switch chars {
         case "1", "2", "3", "4", "5", "6", "7", "8", "9":
             let index = Int(chars)! - 1
             guard index < tabs.count else { return true }
-            activeTab = tabs[index]
+            clientTab.wrappedValue = tabs[index]
         case "[", "]":
             let current = tabs.firstIndex(of: activeTab) ?? 0
             let step = chars == "]" ? 1 : tabs.count - 1
-            activeTab = tabs[(current + step) % tabs.count]
+            clientTab.wrappedValue = tabs[(current + step) % tabs.count]
         case ",":
             openSettingsWindow(from: event.window)
         case "w":
@@ -586,7 +654,11 @@ struct PopoverView: View {
         case "r":
             Task { await model.refresh() }
         case "g":
-            chartViewRaw = chartViewRaw == "2d" ? "3d" : "2d"
+            // Round 6, FIX 1: cycle order lives on `ChartView` (bars →
+            // heatmap → 3D → bars) — not hardcoded here — so this handler
+            // never again silently drops a view out of the ⌘G cycle when a
+            // new one is added.
+            chartViewRaw = ChartView(raw: chartViewRaw).next.rawValue
         default:
             return false
         }

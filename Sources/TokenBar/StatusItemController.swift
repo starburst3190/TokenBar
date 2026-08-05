@@ -19,14 +19,24 @@ final class StatusItemController: NSObject {
     private var host: NSHostingController<AnyView>?
     private var animationSurface: StatusItemAnimationSurface?
     private var hasPresentedIcon = false
+    private var clientStatusItems: [String: NSStatusItem] = [:]
+    private var lastClientPresentations: [String: ClientTray.Presentation] = [:]
+    private let routeMemory: StatusItemRouteMemory
+    private var popoverAnchorIdentity: String?
 
     override init() {
+        let defaults = UserDefaults.standard
+        routeMemory = StatusItemRouteMemory(
+            mainClient: defaults.string(forKey: ClientTray.activeTabKey)
+                ?? ClientTray.overviewTab,
+            mainView: defaults.string(forKey: ClientTray.activeViewKey)
+                ?? AppView.overview.rawValue)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         popover = NSPopover()
         super.init()
 
         popover.behavior = .transient
-        let host = NSHostingController(rootView: AnyView(PopoverView().environmentObject(chrome)))
+        let host = NSHostingController(rootView: AnyView(PopoverView(routeMemory: routeMemory).environmentObject(chrome)))
         self.host = host
         // The SwiftUI root has a fixed frame; let the popover keep our size
         // instead of chasing intrinsic-size updates. The real size is set per
@@ -55,6 +65,7 @@ final class StatusItemController: NSObject {
                 // reopen that landed meanwhile isn't swapped to the placeholder.
                 DispatchQueue.main.async { [weak self] in
                     guard let self, !self.popover.isShown else { return }
+                    self.popoverAnchorIdentity = nil
                     self.host?.rootView = AnyView(
                         Color.clear.frame(width: self.chrome.width, height: self.chrome.minHeight))
                 }
@@ -191,10 +202,38 @@ final class StatusItemController: NSObject {
     }
 
     func showPopover() {
-        guard !popover.isShown, let button = statusItem.button else { return }
+        guard let button = statusItem.button else { return }
+        guard !popover.isShown else { return }
+        let current = persistedRoute()
+        applyRoute(routeMemory.activateMain(
+            currentClient: current.clientId, currentView: current.view))
+        presentPopover(from: button, identity: "main")
+    }
+
+    private func persistedRoute() -> StatusItemRouteMemory.Route {
+        let defaults = UserDefaults.standard
+        return StatusItemRouteMemory.Route(
+            clientId: defaults.string(forKey: ClientTray.activeTabKey)
+                ?? ClientTray.overviewTab,
+            view: defaults.string(forKey: ClientTray.activeViewKey)
+                ?? AppView.overview.rawValue)
+    }
+
+    private func applyRoute(_ route: StatusItemRouteMemory.Route) {
+        UserDefaults.standard.set(route.clientId, forKey: ClientTray.activeTabKey)
+        UserDefaults.standard.set(route.view, forKey: ClientTray.activeViewKey)
+    }
+
+    func closePopover() {
+        popoverAnchorIdentity = nil
+        popover.performClose(nil)
+    }
+
+    private func presentPopover(from button: NSStatusBarButton, identity: String) {
+        guard !popover.isShown else { return }
         // Reinstall the live PopoverView so its .task loops start fresh
         // (the previous close swapped it for a static placeholder).
-        host?.rootView = AnyView(PopoverView().environmentObject(chrome))
+        host?.rootView = AnyView(PopoverView(routeMemory: routeMemory).environmentObject(chrome))
         // Size against the screen the status item actually lives on (reliable,
         // unlike NSScreen.main at launch with no key window) every time we open.
         let visible = (button.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
@@ -203,10 +242,114 @@ final class StatusItemController: NSObject {
         // popover gets key status and closes on outside clicks.
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popoverAnchorIdentity = identity
     }
 
-    func closePopover() {
-        popover.performClose(nil)
+    private func reanchorPopover(to button: NSStatusBarButton, identity: String) {
+        guard popover.isShown else {
+            presentPopover(from: button, identity: identity)
+            return
+        }
+        // Re-clamp against the DESTINATION item's screen before moving: a height
+        // the user chose on a taller display would otherwise stay taller than a
+        // shorter display's visible frame and leave the popover clipped. Same
+        // resolve the normal presentation path does.
+        let visible = (button.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
+        chrome.resolve(visibleHeight: visible)
+        // NSPopover supports changing the relative anchor while shown. Keep the
+        // live host and Dashboard tasks intact; only the native anchor moves.
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popoverAnchorIdentity = identity
+    }
+
+    func reconcileClientItems(_ presentations: [ClientTray.Presentation]) {
+        let ordered = presentations.sorted { $0.clientId < $1.clientId }
+        let next = Dictionary(uniqueKeysWithValues: ordered.map { ($0.clientId, $0) })
+        guard next != lastClientPresentations else { return }
+
+        for id in Array(clientStatusItems.keys) where next[id] == nil {
+            removeClientItem(id)
+        }
+        // Only clients that actually own an item are recorded, so a client whose
+        // icon failed to render stays absent and the next pass retries it.
+        var reconciled: [String: ClientTray.Presentation] = [:]
+        for presentation in ordered {
+            if let item = clientStatusItems[presentation.clientId] {
+                if lastClientPresentations[presentation.clientId] != presentation {
+                    updateClientItem(item, presentation: presentation)
+                }
+            } else if !createClientItem(presentation) {
+                continue
+            }
+            reconciled[presentation.clientId] = presentation
+        }
+        lastClientPresentations = reconciled
+    }
+
+    private func createClientItem(_ presentation: ClientTray.Presentation) -> Bool {
+        guard let image = AgentIconView.statusItemImage(clientId: presentation.clientId) else {
+            return false
+        }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.autosaveName = presentation.autosaveName
+        clientStatusItems[presentation.clientId] = item
+        updateClientItem(item, presentation: presentation, image: image)
+        return true
+    }
+
+    private func updateClientItem(
+        _ item: NSStatusItem,
+        presentation: ClientTray.Presentation,
+        image: NSImage? = nil
+    ) {
+        guard let button = item.button else { return }
+        if let image { button.image = image }
+        button.imagePosition = .imageLeft
+        button.imageScaling = .scaleNone
+        button.title = " \(presentation.valueText)"
+        button.toolTip = presentation.toolTip
+        button.setAccessibilityLabel(presentation.accessibilityLabel)
+        button.setAccessibilityIdentifier(presentation.processIdentity)
+        button.identifier = NSUserInterfaceItemIdentifier(presentation.processIdentity)
+        button.target = self
+        button.action = #selector(clientItemAction(_:))
+        button.sendAction(on: [.leftMouseUp])
+    }
+
+    private func removeClientItem(_ clientId: String) {
+        guard let item = clientStatusItems.removeValue(forKey: clientId) else { return }
+        if popoverAnchorIdentity == ClientTray.processIdentity(for: clientId) {
+            closePopover()
+        }
+        if let button = item.button {
+            button.target = nil
+            button.action = nil
+            button.identifier = nil
+            button.setAccessibilityIdentifier(nil)
+            button.setAccessibilityLabel(nil)
+            button.toolTip = nil
+        }
+        NSStatusBar.system.removeStatusItem(item)
+    }
+
+    @objc private func clientItemAction(_ sender: Any?) {
+        guard let button = sender as? NSStatusBarButton,
+              let clientId = clientStatusItems.first(where: { $0.value.button === button })?.key
+        else { return }
+
+        let current = persistedRoute()
+        applyRoute(routeMemory.activateClient(
+            clientId, currentClient: current.clientId, currentView: current.view))
+        let identity = ClientTray.processIdentity(for: clientId)
+        if popover.isShown {
+            if popoverAnchorIdentity == identity {
+                closePopover()
+            } else {
+                reanchorPopover(to: button, identity: identity)
+            }
+        } else {
+            presentPopover(from: button, identity: identity)
+        }
     }
 
     /// Clean teardown on app termination: drop the defaults observer, close
@@ -219,7 +362,11 @@ final class StatusItemController: NSObject {
         defaultsObserver = nil
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
         closeObserver = nil
-        if popover.isShown { popover.performClose(nil) }
+        if popover.isShown { closePopover() }
+        for clientId in Array(clientStatusItems.keys) {
+            removeClientItem(clientId)
+        }
+        lastClientPresentations.removeAll()
         popover.contentViewController = nil
         animationSurface?.tearDown()
         animationSurface = nil
@@ -252,7 +399,8 @@ final class StatusItemController: NSObject {
         let current = QuotaResolver.canonicalSelection(
             payload: payload, selection: persistedSelection)
 
-        let header = NSMenuItem(title: "Menu bar tracks", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(
+            title: "Menu bar tracks".localized, action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
@@ -264,7 +412,7 @@ final class StatusItemController: NSObject {
             item.state = selection == current ? .on : .off
             menu.addItem(item)
         }
-        add("Auto (tightest window)", selection: QuotaResolver.auto)
+        add("Auto (tightest window)".localized, selection: QuotaResolver.auto)
 
         if let payload {
             for agent in payload.agents where agent.error == nil {
@@ -277,15 +425,19 @@ final class StatusItemController: NSObject {
                 name.isEnabled = false
                 menu.addItem(name)
                 for window in windows {
-                    let left = "\(Int(min(100, max(0, window.remainingPercent)).rounded()))% left"
+                    let left = "%lld%% left".localized(
+                        Int(min(100, max(0, window.remainingPercent)).rounded()))
+                    // `label` is display-only here; the persisted selection
+                    // below is keyed by `cardId`.
                     add(
-                        "\(window.label) — \(left)",
+                        "\(window.label.localized) — \(left)",
                         selection: QuotaResolver.selection(
                             clientId: agent.clientId, cardId: window.cardId))
                 }
             }
         } else {
-            let loading = NSMenuItem(title: "Loading quotas…", action: nil, keyEquivalent: "")
+            let loading = NSMenuItem(
+                title: "Loading quotas…".localized, action: nil, keyEquivalent: "")
             loading.isEnabled = false
             menu.addItem(loading)
         }

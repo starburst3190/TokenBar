@@ -32,6 +32,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Framewor
 cp .build/release/TokenBar "$APP/Contents/MacOS/TokenBar"
 # SwiftPM resource bundle (animation frames, agent icons).
 cp -R .build/release/TokenBar_TokenBar.bundle "$APP/Contents/Resources/"
+# Localizations land in the *main* bundle for packaged runs. Bare `swift run`
+# stages the same .lproj directories from the SwiftPM resource bundle before
+# SwiftUI creates any views.
+cp -R Sources/TokenBar/Resources/Localizations/*.lproj "$APP/Contents/Resources/"
 # Brand icon, shared with the Tauri app.
 if [ -f assets/icon.icns ]; then
   cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
@@ -63,6 +67,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>$BUILD_NUMBER</string>
     <key>CFBundleIconFile</key>
     <string>icon</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>en</string>
+        <string>zh-Hant</string>
+    </array>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSUIElement</key>

@@ -4,8 +4,8 @@ id: kb-plan-provider-quota-pace
 kind: plan
 scope: repository
 read_when: implementing or reviewing pace duration and historical pace for provider quota cards
-last_verified: 2026-07-17
-sources: ["crates/tb_core_ffi/src/agent_history.rs", "crates/tb_core_ffi/src/agent_usage.rs", "crates/tb_core_ffi/src/agent_antigravity.rs", "crates/tb_core_ffi/src/agent_copilot.rs", "crates/tb_core_ffi/src/agent_grok.rs", "Sources/TokenBarCore/AgentUsage.swift", "Sources/TokenBarCore/UsagePace.swift", "Sources/TokenBar/TrayAnimator.swift", "Sources/TokenBar/DashboardModel.swift", "docs/knowledge/plans/codex-historical-pace-v2.md", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "official GitHub Copilot billing documentation", "official Claude usage credits documentation"]
+last_verified: 2026-07-31
+sources: ["crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_usage.rs", "crates/tb_core_ffi/src/agent_antigravity.rs", "crates/tb_core_ffi/src/agent_copilot.rs", "crates/tb_core_ffi/src/agent_grok.rs", "Sources/TokenBarCore/AgentUsage.swift", "Sources/TokenBarCore/UsagePace.swift", "Sources/TokenBar/TrayAnimator.swift", "Sources/TokenBar/DashboardModel.swift", "docs/knowledge/plans/codex-historical-pace-v2.md", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public TokenBar-Windows PR #7", "public TokenBar PR #114", "public TokenBar-Windows PR #12", "official GitHub Copilot billing documentation", "official Claude usage credits documentation"]
 ---
 
 # Provider-wide quota pace plan
@@ -14,11 +14,11 @@ sources: ["crates/tb_core_ffi/src/agent_history.rs", "crates/tb_core_ffi/src/age
 
 這份計畫把 pace 的修正單位從「Codex Weekly 特例」改成「每一張 provider recurring quota card」。Codex、Claude、Grok、Antigravity 與 Copilot 的額度 window 都必須先取得可信的 account scope、stable window key、reset 與 duration，才能進入同一套 Linear／Historical 計算；缺少 duration 或歷史時必須顯示可理解的學習狀態，不得永久或無聲地退回 Linear。
 
-[`codex-historical-pace-v2.md`](codex-historical-pace-v2.md) 保留為已落地的 Codex Weekly evaluator 基礎與 migration 證據，但不再代表 provider-wide outcome。這份新計畫取代它作為後續實作與驗收的 active design。
+[`codex-historical-pace-v2.md`](codex-historical-pace-v2.md) 保留為已退役的 Codex Weekly historical evaluator 設計與 schema-2 migration 歷史記錄；現行 v3 runtime 與 read-only importer 的 source of truth 是 `agent_quota_history.rs`。這份新計畫取代它作為 provider-wide outcome 的 active design。
 
 > **核心結果：** pace duration 屬於 quota window，不屬於 provider 特例。任何已顯示、具有 recurring percentage quota 語意的 card，都必須走同一個 duration lifecycle；無法證明 duration 時，UI 必須明示原因，而不是顯示看似真實的 pace。
 >
-> **Implementation checkpoint（2026-07-17）：** Mac Stages 0–6 已在任務分支落地：secure account scope、duration lifecycle、generic v3 history、五個 provider adapters、typed Swift lifecycle／selection／presentation，以及 Rust serializer 鎖定的跨語言 fixture 均已通過各自的 hermetic gate。Stage 7 首次 live smoke 揭露 legacy file-Keychain ACL 在 ad-hoc rebuild 下仍會顯示授權 UI；使用者因此核准把尚未出貨的 installation key改為 hardened owner-only file。0600 storage security regressions、完整 Rust workspace tests／Clippy、Rust→Swift build、Swift selftest、docs gates與storage修正的fresh verifier均已通過；full workspace `cargo fmt --all -- --check`仍只命中既有out-of-scope `hourly_report.rs`、`model_report.rs`與vendor formatting。重新授權的monitored live smoke已exit 0，過程未出現`SecurityAgent`／`authorizationhost`，live storage metadata確認directory `0700`、file `0600`且exact 32 bytes；print-only hourly／agents drift probes顯示小幅mismatch；smoke contract不因此fail，且該diagnostic不涉及account-scope storage，但根因未在本scope內判定。人工 popover UX 已使用明示 `FIXTURE` 的 deterministic `--demo` payload 完成：Historical mode 同時呈現 `Learning reset duration`、灰色 `Learning history · Linear estimate`、只有 backend `available` historical deficit 帶橘色 marker／文案與 risk，以及 typed `unavailable(missingReset)`；Linear mode 移除 historical risk 與橘色 deficit 語意，Off mode 移除全部 pace marker／footer。Quota 長條本身的綠／黃／紅健康門檻維持獨立，不能誤當 historical deficit 色。各 capture process 皆在截圖後刻意終止，並且沒有 `SecurityAgent`／`authorizationhost`。最終 post-GUI fresh verifier 已回傳 `CONFIRMED`；Windows port／parity維持 pending，本 checkpoint 沒有寫入 Windows repository。
+> **Implementation checkpoint（2026-07-27）：** Mac Stages 0–7已完成secure account scope、duration lifecycle、generic v3 history、五個provider adapters、typed Swift lifecycle／selection／presentation、serializer-locked cross-language fixture、monitored live smoke與deterministic popover UX；最終post-GUI fresh verifier回傳 `CONFIRMED`。M19-B1又在Native PR #102與Windows PR #7完成exact shared-core handoff、Windows production DTO／state machine／selection／presentation、119-case Swift／C# cross-check、hosted x64 runtime以及separate real ARM64 runtime gate。Windows port／parity因此完成；C ABI、ledger、cache format與provider network surface均未擴張。
 
 ## 目錄
 
@@ -188,7 +188,7 @@ Crash before metadata save不會以 new credential寫 history；crash between me
 | Consistent full restore | Installation key、metadata、v3三者一致才恢復 |
 | Explicit full purge | 必須一起刪除installation-key file、metadata、v3與legacy v2；本Plan不新增purge UI，也不宣稱APFS secure erase |
 
-Retained v2 仍含 legacy raw Codex account key，因此分類為 legacy-sensitive rollback data；「沒有 raw identifier」只適用新 metadata與 v3。這份 Plan保留 v2 bytes／mtime／path，不隱瞞或假稱已清除；v2 retirement必須是 rollback window結束後的獨立明確決策。
+Retained v2 仍含 legacy raw Codex account key，因此分類為 legacy-sensitive migration data；「沒有 raw identifier」只適用新 metadata與 v3。這份 Plan保留 v2 bytes／mtime／path，不隱瞞或假稱已清除；v2 writer／evaluator 已退役，但 schema-2 檔案仍由 `agent_quota_history.rs` 的 importer 作 read-only migration input。
 
 Security fixtures必須覆蓋HMAC known vectors／domain separation、different-installation unlinkability、各credential source、refresh每一步crash injection、same-slot replacement、two-process create／transfer conflict、key exact-length／mode／symlink／non-regular／inode-replacement防護、key-loss orphan recovery、MAC／lock／atomic-write／quarantine failures、Antigravity stale active-email mismatch，以及metadata／v3 byte scan不含fixture raw values或其plain SHA-256。
 
@@ -298,65 +298,78 @@ u = clamp(1 - (resetAt - sampledAt) / durationSeconds, 0, 1)
 | Phase buckets | 每 cycle 48 格；`phaseBucket = min(floor(u * 48), 47)`；reset 改變、進入新 phase bucket，或 usage 改變至少 1 percentage point 才接受 |
 | Sample cap | 每 cycle 最多 48 筆；同 series／normalized reset／phase bucket dedupe |
 | Valid sample | Finite、`0 < usedPercent <= 100`、positive duration、sample 位於 cycle bounds；zero reading 可供當下 Linear 顯示但不持久化 |
-| Complete cycle | 至少 6 個 distinct phase buckets，起點／終點 coverage 成立，且最大 phase gap 不超過 `0.30` |
+| Retention-complete group | 至少 6 個 distinct phase buckets，起點／終點 coverage 成立，且最大 phase gap 不超過 `0.30` |
+| Fit-eligible completed cycle | 先符合 retention completeness，且所有 validated samples的 `durationSeconds` exact相同 |
 
-Coverage boundary 使用 `b = min(0.10, 24h / duration)`；complete cycle 必須滿足 `uMin <= b` 與 `uMax >= 1 - b`。最大 gap 在排序後的 `[0, distinct observed phases..., 1]` 上計算。這讓 5h、7d 與 monthly window 都用相同比例規則，又不要求 monthly app 在 reset 後數分鐘內一定在線。
+Coverage boundary 使用 `b = min(0.10, 24h / duration)`；retention-complete group 必須滿足 `uMin <= b` 與 `uMax >= 1 - b`。最大 gap 在排序後的 `[0, distinct observed phases..., 1]` 上計算。這讓 5h、7d 與 monthly window 都用相同比例規則，又不要求 monthly app 在 reset 後數分鐘內一定在線。Mixed-duration group仍受同一 retention bounds管理，但不進fit。
 
 ### Retention and confidence
 
-`nominalDuration` 是同 series 已完成 cycles 的 duration median，只用於 retention／recency，不覆蓋 current cycle 的 exact duration，也不進入 series key。奇數筆取中間值；偶數筆取兩個中間值的 arithmetic mean；尚無 complete cycle 時使用 current accepted exact duration（observed route 即 `ready.durationSeconds`）。
+`nominalDuration` 是同 series retention-complete groups 的 duration median，只用於 retention／recency，不覆蓋 current cycle 的 exact duration，也不進入 series key。奇數筆取中間值；偶數筆取兩個中間值的 arithmetic mean；尚無 retention-complete group 時使用 current accepted exact duration（observed route 即 `ready.durationSeconds`）。
+
+Retention completeness 與 fit eligibility 是兩個不同判斷。`retention_cycle_descriptor` 只檢查 sample validity、normalized reset、6 個以上 buckets、起終點 coverage與最大 phase gap；符合者占用既有 historical slot。`cycle_profile` 才額外要求該 group 的所有 validated samples具有 exact相同 `durationSeconds`。Mixed-duration group會在原位、bounded保留，但不計 `completeCycles`、不建 curve，也不進任何 fit fold。
 
 | Decision | Formula |
 |---|---|
-| Retained completed cycles | `R = clamp(max(8, ceil(28d / nominalDuration)), 8, 128)`；time horizon `H = clamp(max(56d, R * nominalDuration), 56d, 400d)` |
-| Per-series sample cap | 最多 `R` 個 completed cycles，加一個 current incomplete cycle；每 cycle 最多 48 samples |
+| Retained completed groups | `R = clamp(max(8, ceil(28d / nominalDuration)), 8, 128)`；time horizon `H = clamp(max(56d, R * nominalDuration), 56d, 400d)` |
+| Per-series sample cap | 最多 `R` 個 retention-complete groups，加一個 active incomplete group；每 group 最多 48 samples |
 | Recency basis | `ageSeconds = max(0, currentResetAt - historicalResetAt)`；`ageCycles = ageSeconds / nominalDuration`；`tauCycles = clamp(max(3, 7d / nominalDuration), 3, 64)`；`weight = exp(-ageCycles / tauCycles)` |
-| Effective samples | `nEff = sum(weight)^2 / sum(weight^2)` |
-| Observation span | `latest historical resetAt - earliest historical cycleStartedAt`；只計 complete historical cycles，不包含 current partial cycle |
-| Historical expected gate | 至少 3 complete cycles、`nEff >= 2.5`、observation span `>= max(2 * nominalDuration, 24h)` |
-| Historical risk gate | 至少 5 complete cycles、`nEff >= 4`、observation span `>= max(4 * nominalDuration, 7d)` |
+| Effective samples | `nEff = sum(weight)^2 / sum(weight^2)`；只保留作 actual `< 100` 的 completed risk confidence，不再作 expected availability hard gate |
+| Expected quality gate | Completed history的 out-of-sample `fitRmse <= 6 pp + EPSILON`；沒有合格 completed history時，可由 active current group的 walk-forward `fitRmse <= 6 pp + EPSILON`通過 |
+| Historical risk gate | 至少 5 個 fit-eligible completed cycles、`nEff >= 4`、observation span `>= max(4 * nominalDuration, 7d)`，且 final-quarter holdout quality通過 |
 
 Retention 在每次 locked v3 transaction 完成 duration transition／record 後、atomic save 前執行，並以該 transaction 的 `now` 決定所有 boundary。每個 series 先依 normalized reset分組，規則固定為：
 
 | Group or state | Deterministic retention |
 |---|---|
-| Completed cycle | 同時滿足「依 `resetAt` 最新的 `R` 個」以及 `resetAt >= now - H` 才保留；其餘整 cycle刪除 |
-| Current incomplete cycle | 只保留一組：其 reset必須等於 persisted `activeResetAt`；observed route 還必須等於 `ready.resetAt`。最多 48 samples |
-| Other incomplete groups | 立即整組刪除，包括 expired、superseded、future fragment與 repeated partial-reset churn |
+| Retention-complete group | 同時滿足「依 `resetAt` 最新的 `R` 個」以及 `resetAt >= now - H` 才保留；mixed-duration group也占同一 slot，超額時依相同順序整組刪除 |
+| Current incomplete group | 只保留一組：每筆 sample必須通過 validity，且以自己的 persisted duration正規化後符合 persisted `activeResetAt`。最多 48 samples |
+| Other incomplete groups | 立即整組刪除，包括 expired、superseded、future fragment與 repeated partial-reset churn；`activeResetAt`缺失時不猜最近或sample最多的group |
 | `watching`／`candidate`／`ready` | Tracked old reset超過 boundary 15 minutes仍未完成合法 adjacent transition即清除；candidate也必須在 `oldResetAt + 15m` 前由 next poll確認。下一個 reading從 fresh `watching` 開始 |
-| Rollover-only series | 沒有 samples／completed cycles且 `lastActivityAt < now - 56d` 時刪除；空 series立即刪除 |
+| Rollover-only series | 沒有 samples／retention-complete groups且 `lastActivityAt < now - 56d` 時刪除；空 series立即刪除 |
 
-Persisted `activeResetAt` 由最近一次 provider／contract route驗證成功的 normalized reset更新；observed route只有 ready後才可設定，因此 learning-duration readings不會留下 incomplete sample group。它在其他 provider transaction中仍能識別該 series的唯一 current group，但一旦早於 `now - 15m` 就先清除，舊 partial也不再受 current-cycle保護。Cleanup 不把 expired partial cycle升格為 completed cycle，也不從 reset delta猜漏掉幾個 cycles。
+Persisted `activeResetAt` 由最近一次 provider／contract route驗證成功的 normalized reset更新；observed route只有 ready後才可設定，因此 learning-duration readings不會留下 incomplete sample group。每次取得 accepted current duration後、寫入新 sample前，Rust會刪除同一 active incomplete group中 duration不相容的舊 evidence；completed groups不受影響。Evaluator只接受 normalized active reset、normalized current reset與每筆 exact current duration三者一致的 current samples，任何矛盾都 fail closed並重新學習。
 
-Store 另有兩個全域 hard bounds：最多 512 個 series、65,536 個 samples。Pruning 先套用 invalid／incomplete／stale state與 per-series規則；sample仍超額時，按 `(resetAt, providerId, accountScope, windowKey)` 升冪整批刪除全域最舊 completed cycles，直到回到上限。Current incomplete cycle不是這個全域 sample eviction的候選。
+Store 另有兩個全域 hard bounds：最多 512 個 series、65,536 個 samples。Pruning 先套用 invalid／incomplete／stale state與 per-series規則；sample仍超額時，按 `(resetAt, providerId, accountScope, windowKey)` 升冪整批刪除全域最舊 retention-complete groups，直到回到上限。Current incomplete group不是這個全域 sample eviction的候選。
 
 新增 series將超過 512 時，先移除 inactive series；排序固定為 `(lastActivityAt, providerId, accountScope, windowKey)` 升冪。Active 定義為本次 provider snapshot有 emit，或仍持有 future／15-minute grace內的唯一 current incomplete reset或 rollover reset；目前 active series不得被 eviction。若同一 transaction 的 active candidates仍超過剩餘容量，既有 active series優先，new candidates依完整 `SeriesKey`升冪依序 admission；其餘 cards回傳 `unavailable(storeCapacity)`，且不得 mutate v3。若只剩 current incomplete samples仍無法降到 65,536，也拒絕本次 offending sample並保留 transaction 前的最後有效 store；不得為了寫入而 eviction current active data。
 
-Retention fixtures 必須覆蓋 repeated partial-reset churn、sliding／backward reset、stale rollover-only state、abandoned account scopes、28–31-day horizon、short-cycle `R = 128`、global sample eviction tie ordering、active-series protection與 hard-cap overflow。
+Retention fixtures 必須覆蓋 repeated partial-reset churn、sliding／backward reset、stale rollover-only state、abandoned account scopes、mixed-duration bounded retention、28–31-day horizon、short-cycle `R = 128`、global sample eviction tie ordering、active-series protection與 hard-cap overflow。
 
-每個 complete cycle 先依自己的 duration 映射到 `u`，再重建為 169-point monotonic curve。Monthly cycle 長度改變不會造成 series fragmentation；evaluator 仍以 current exact duration 把 phase crossing 轉回 ETA seconds。3–4 個可信 cycles 可以產生 expected／ETA，risk 仍為 `nil`；達 risk gate 後才公開 probability。
+### Quality-based availability
 
-Expected 與 risk arithmetic 保留 Codex v2 行為，但把 week weights 換成上表的 cycle-aware weights。令 `u_i = i / 168`，`i = 0...168`，並固定：
+每個 fit-eligible completed cycle先依自己的唯一 duration映射到 `u`，再重建為169-point monotonic curve。Availability不再使用固定 complete-cycle數量、`nEff`或observation span作 expected hard gate，而是使用真正 holdout：
 
-```text
-lambda = clamp((nEff - 2) / 6, 0, 1)
-historical_i = recencyWeightedMedian(completedCycleCurve_i, weight)
-linear_i = 100 * u_i
-expected_i = clamp(lambda * historical_i + (1 - lambda) * linear_i, 0, 100)
-```
+- LOBO每次移除一個完整 phase bucket，只以其他 raw samples重建 curve，再對held-out bucket預測。每個cycle先算 bucket等權 MSE。
+- 只有一個cycle時，`fitRmse = loboRmse`。兩個以上cycles另做LOCO：排除一個cycle，以其他cycles的recency-weighted median curve預測該cycle；`fitRmse = max(loboRmse, locoRmse)`。
+- 跨cycle aggregate固定為 `sqrt(sum(weight * cycleMse) / sum(weight))`。空training、非finite、non-positive weight或 `fitRmse > 6 pp + EPSILON`一律fail closed。
+- Completed blend使用 `fitQuality = clamp(1 - fitRmse / 12, 0, 1)`、`evidenceShare = totalWeight / (totalWeight + 1)`與 `lambda = fitQuality * evidenceShare`。一個近期、完美cycle的historical contribution不超過50%。
 
-169 個 `expected_i` 算完後再由左到右做 cumulative maximum，不能把 Linear baseline 當成上限。若 `totalWeight` 非 finite 或 `<= 0`，不產生 historical result，card 保持 `learningHistory`。
+若沒有合格completed projection，exact active current group可獨立通過。它至少需要6個distinct phase buckets、phase span `>= 0.10`，並以phase排序做walk-forward validation：前三個buckets是initial prefix，每個後續bucket只能使用更早evidence fit through-origin slope `usedPercent ≈ beta * phase`。至少3個held-out predictions且RMSE通過相同6 pp gate後，才以全部current samples重算final `beta`。
 
-Risk／ETA 對每條 completed-cycle curve 依序套用以下 frozen order：若 curve 在最後一格前第一次到達 100%，從 cap point 起以 `slope = valueAtCap / uAtCap` 延伸未截斷 demand；在 current phase 算 `shift = actual - curve(uNow)`，且 shifted curve 在 crossing search 前不得 clamp。`shiftedEnd >= 100` 的 cycle 把自己的 weight 加到 `weightedRunOutMass`，並以線性 interpolation 找出第一個 `>= 100` 的 crossing candidate。接著固定：
+Partial blend固定為：
 
 ```text
-smoothed = clamp((weightedRunOutMass + 0.5) / (totalWeight + 1), 0, 1)
-willLastToReset = smoothed < 0.5
+fitQuality = clamp(1 - fitRmse / 12, 0, 1)
+lambda = 0.5 * fitQuality
+trendDemand(u) = max(0, beta * u)
+linearDemand(u) = 100 * u
+baseDemand(u) = lambda * trendDemand(u) + (1 - lambda) * linearDemand(u)
 ```
 
-只有通過上表 exact Historical risk gate 時，`runOutProbability = Some(smoothed)`；通過 expected gate但未通過 risk gate時為 `nil`。一旦已有 historical result且 current actual `>= 100`，一律覆蓋為 `runOutProbability = Some(1)`、`willLastToReset = false`、`etaSeconds = Some(0)`。其他情況若 `willLastToReset == false` 卻沒有 crossing candidate，必須改回 `true`，不能輸出 `false + nil`。ETA 是各 candidate 的 `(crossingU - uNow) * currentDurationSeconds`，clamp 到 non-negative 後用相同 weighted-median tie rule彙總。
+`expectedUsedPercent`取current phase的unshifted `baseDemand`；ETA與will-last則先算 `shift = actualUsedPercent - baseDemand(uNow)`，再從shifted demand找crossing。這讓wire可以合法回傳 `available + completeCycles: 0 + historicalPace`，其語意是validated current-window learned projection，不是跨cycle穩定性聲明。Partial actual `< 100`時不公開模型型risk。
 
-Weighted median 沿用 v2 的 deterministic tie rule：依 value 升冪排序，累積 weight 第一次 `>= totalWeight / 2` 就取該值，因此 exact half 選 lower value；total weight 為零時同樣排序並取 index `len / 2`。Expected grid 與 ETA candidates 都使用此規則。
+### Projection and risk
+
+Completed expected curve把通過quality gate的historical curve與 `linear_i = 100 * u_i`依上述 `lambda`混合，169點完成後再由左到右做cumulative maximum。若 `totalWeight`非finite或 `<= 0`，不產生completed result並嘗試current partial path。
+
+Risk／ETA 對每條completed curve沿用current-actual shift與uncapped demand extension。`weightedRunOutMass`仍以recency weight彙總，並以 `smoothed = clamp((weightedRunOutMass + 0.5) / (totalWeight + 1), 0, 1)`決定 `willLastToReset = smoothed < 0.5`。Actual `< 100`時，只有risk gate成立且每個cycle在 `phase >= 0.75 - EPSILON`的LOBO與LOCO各至少有3個held-out residuals、tail aggregate也通過6 pp gate，才公開 `runOutProbability = Some(smoothed)`；evidence不足只隱藏risk，不會撤銷已通過的expected／ETA。
+
+一旦quality gate已產生historical result且current actual `>= 100`，這是已發生的觀測事實：不論completed或partial path都固定 `runOutProbability = Some(1)`、`willLastToReset = false`、`etaSeconds = Some(0)`，不受5-cycle、`nEff`、span或tail-confidence限制。其他情況若 `willLastToReset == false`卻沒有合法crossing，整個candidate fail closed；不得輸出 `false + nil`。
+
+Weighted median沿用v2的deterministic tie rule：依value升冪排序，累積weight第一次 `>= totalWeight / 2`就取該值，因此exact half選lower value；total weight為零時同樣排序並取index `len / 2`。Expected grid、LOCO curve與ETA candidates都使用此規則。
+
+單一production calculation只定位exact `SeriesKey`一次，且只讀target series。最多讀取128個retention-complete historical groups加1個active partial group，共 `129 * 48 = 6,192` samples；partial最多45次walk-forward fits，completed最多6,144個LOBO folds與128個LOCO folds。不得對其他series建profile、curve或fold，也不得persist fit cache。
 
 ## Storage and migration
 
@@ -399,6 +412,8 @@ Migration fixtures 必須包含 empty／existing／corrupt v3、valid／corrupt 
 | Claude `seven_day_opus` | Opus | `opus.weekly.v1` | Contract 10,080 minutes |
 | Claude design aliases | Designs | `design.weekly.v1` | Contract 10,080 minutes |
 | Claude routines aliases | Daily Routines | `routines.weekly.v1` | Contract 10,080 minutes |
+| Claude `limits[]` model-scoped weekly（已知 flat 前身） | 沿用該 flat lane 的 card | 沿用該 flat lane 的 key | Contract 10,080 minutes |
+| Claude `limits[]` model-scoped weekly（其他） | `<model> only` | `weekly_scoped.<modelSlug>.v1` | Contract 10,080 minutes |
 | Claude `extra_usage` | Extra usage | `extra_usage.v1` | `unavailable(missingReset)` |
 
 Codex main mapping retains the current role normalization：18,000 seconds always maps Session and 604,800 seconds always maps Weekly，regardless of primary／secondary order。An unrecognized main duration may still render，但 its pace is `unavailable(windowIdentity)` until a semantic key fixture is added。
@@ -406,6 +421,20 @@ Codex main mapping retains the current role normalization：18,000 seconds alway
 For Codex additional limits，`sourceDigest` is lowercase hex SHA-256 of trimmed `metered_feature` when present，otherwise trimmed `limit_name`；`slot` is `primary` or `secondary` before selection。Both identity fields missing means typed `unavailable(windowIdentity)`，not the shared `Codex extra limit` label。Digesting avoids persisting provider display text；different raw identities safely fragment rather than collide。
 
 Claude design aliases are frozen in current first-match order：`seven_day_design`、`seven_day_claude_design`、`claude_design`、`design`、`seven_day_omelette`、`omelette`、`omelette_promotional`。Routines aliases are `seven_day_routines`、`seven_day_claude_routines`、`claude_routines`、`routines`、`routine`、`seven_day_cowork`、`cowork`。Every alias in each group maps to the one semantic key shown above；alias source and display label never enter history。
+
+#### Claude `limits[]` model-scoped weekly windows
+
+Anthropic 的 `oauth/usage` 除了上述 flat 欄位，另有一個 `limits[]` 陣列承載 model-scoped weekly 額度。促銷型模型（2026-08 起的 Fable 5）**只**出現在這裡，沒有對應 flat 欄位；長期而言 Opus／Sonnet 等既有 lane 也可能遷入此處。Flat 欄位是 `Option`，缺席不會報錯，因此不解析 `limits[]` 的話這類 window 會靜默消失。
+
+Eligibility：一筆 entry 必須同時滿足 `group == "weekly"`、`kind == "weekly_scoped"`、`percent` 為有限值且落在 `0..=100`（與 flat 欄位的 `utilization` 同尺度、同為 used percent）、`scope.model.display_name` 去空白後非空，且 scope 不是 account-wide。Account-wide 的排除同時比對 model id slug 與 display-name slug 的 `all-models`／`-all-models` 後綴。陣列以 element-wise 解析，單一 entry 格式錯誤只丟棄該 entry，不影響同陣列的其他 entry。
+
+`is_active` **不解析也不過濾**。2026-08-04 實際 payload 中，真正生效的 Fable window 回報 `is_active: false`；[steipete/codexbar](https://github.com/steipete/codexbar) 與 [stablyai/orca](https://github.com/stablyai/orca)（其 issue #8979）各自獨立踩過同一顆雷。以該欄位過濾會隱藏實際生效的額度。
+
+Identity 來源是 `scope.model.display_name` 的 slug，**不使用 `scope.model.id`**。這是本 lane 對「stable schema key 優先於 display 文字」通則的一項 documented exception，理由是 schema 目前沒有提供可用的 stable id：實際 payload 的 `scope.model.id` 為 `null`，而欄位本身存在。若採 id 優先，Anthropic 日後填入該欄位就會在 label 完全不變的情況下搬移 `cardId` 與 `windowKey`，使 Swift 的 `clientId|cardId` 精確比對失效、既有 history series 中斷。與 Codex additional limits 的 `sourceDigest` 不同的是，那裡 digest 的目的是避免持久化 `metered_feature`／`limit_name` 這類可能夾帶使用者或組織資訊的任意 provider 文字；Claude 這裡的來源是封閉集合中的模型名稱，不含使用者資料，因此保留明文 slug 以維持 history 與診斷的可讀性。Display name 改名仍會搬移 identity，但那一次搬移對使用者是可見的，因為 card label 同時改變。
+
+Flat lane 已擁有的模型不另立 identity。`sonnet`、`opus`、`designs`、`daily-routines` 四個 model slug 凍結對應到既有的 `sonnet.weekly.v1`、`opus.weekly.v1`、`design.weekly.v1`、`routines.weekly.v1` 與其原 label；當 Anthropic 移除 flat 欄位而同一額度改由 `limits[]` 提供時，card 與 history 原地延續。反向的重複則由 flat-window 去重擋下：scoped entry 的 display-name slug 若命中本次已產生的 window label，直接跳過，因此 flat 欄位仍存在時它保有優先權。該去重集合由實際產生的 window 推導，不是硬編碼模型清單，才不會隨 flat 欄位增減而漂移。
+
+Scoped window 一律使用 contract 10,080 minutes；`resets_at` 可能為 `null`（實際 Fable entry 即如此），此時 window 照常產生，只是沒有 reset 時間。
 
 ### Grok, Antigravity, and Copilot mappings
 
@@ -434,13 +463,13 @@ Stage 0 no longer discovers mappings。It turns every row and every reject rule 
 | 0. Freeze capability fixtures | Main session；provider modules與 dedicated fixtures | 把 frozen source-field matrix、aliases、unknown-key rejects與 current silent-fallback behavior變成 old-fail fixtures | Matrix每一列與 reject rule都有 case ID；本階段不再做 product discovery |
 | 1. Secure account scope | `security-executor`；new account-scope module與provider auth hooks | 實作owner-only installation-key file、HMAC、authenticated metadata、lineage transfer與fail-closed recovery | Approved security protocol逐項有fixture；storage path／permission attacks fail closed；Antigravity stale email不能scope／label remote quota |
 | 2. V3 shell and duration lifecycle | `executor`；new duration／v3 store modules、provider-neutral `UsageWindow` internals | 建立 locked atomic `SeriesState` store，實作 provider／contract／observed resolver與 durable rollover state | Restart／corruption／account-isolation加5h／7d／monthly／missed-boundary fixtures綠燈 |
-| 3. Generic history and migration | `executor`；v3 store／evaluator modules與 legacy `agent_history.rs` reader | 加 cycle-aware sampling／retention／confidence、current-account-only v2 import與 coherent evaluator | Exact migration collision matrix與5h／7d／monthly evaluator fixtures綠燈；v1／v2 unchanged proofs成立 |
+| 3. Generic history and migration | `executor`；v3 store／evaluator與 `agent_quota_history.rs` 內的 schema-2 read-only importer | 加 cycle-aware sampling／retention／confidence、current-account-only v2 import與 coherent evaluator | Exact migration collision matrix與5h／7d／monthly evaluator fixtures綠燈；v1／v2 unchanged proofs成立 |
 | 4. Provider adapters | `executor`；`agent_usage.rs`、Antigravity／Copilot／Grok modules | 為每個 card 注入 account scope、stable key、duration與 v3 enrichment | Provider matrix逐列有 serialized fixture；Codex 不再是特殊 enrichment entry point |
 | 5. Wire and Mac UX | `executor`；`ctb.h`、Swift models、`UsagePace`、settings／quota card views | 加 `paceStatus`、移除 silent fallback、更新 learning／available文案與顏色 | Rust JSON 可由 Swift decode；yellow ahead 僅由真實 evaluator fixture 驅動 |
-| 6. Cross-port handoff | Main session；CrossCheckHarness、canonical docs、fixture artifact | 跑完整 baseline、列出 intended wire delta、準備 Windows DTO／state-machine handoff | 非 pace cases 零回歸；Windows 尚未 port 時明確標為 pending，不改 Windows repo |
+| 6. Cross-port handoff | Main session；CrossCheckHarness、canonical docs、fixture artifact | 跑完整 baseline、列出 wire delta、完成 Windows DTO／state-machine handoff | 119-case Swift／C# cross-check 零 material difference；real ARM64 provider-v3 run 產生 exact 12 cases |
 | 7. Integrated verification | Main session，加 fresh `verifier` | 執行 full gates、人工 local UX與 adversarial edge cases | Verifier 回傳 `CONFIRMED`；任何 `REFUTED` 回到 owning stage |
 
-### Stage 6 checkpoint and Windows handoff
+### Stage 6 checkpoint and completed Windows handoff
 
 Mac-owned [`provider-quota-pace-v3.json`](../../../Fixtures/CrossCheck/provider-quota-pace-v3.json) 由 Rust production serializer test 鎖定，再由 Swift production `AgentUsagePayload`／`UsageWindow` decoder、`UsagePace` 與 `QuotaResolver` 執行。Fixture 包含 7 張 lifecycle windows 與 12 個 projection／selection／legacy／malformed cases；所有資料皆為 `.invalid` synthetic identifiers，不含 credential、account ID、email 或本機 path。
 
@@ -451,9 +480,9 @@ Mac-owned [`provider-quota-pace-v3.json`](../../../Fixtures/CrossCheck/provider-
 | Mode policy | Historical 只在 `available` 使用 backend result；`learningHistory` 才可明示 Linear estimate；`learningDuration`／`unavailable`／legacy 無 pace；Off 一律無 marker |
 | Selection | Persisted identity 改為 `clientId|cardId`；舊 label 只有唯一 match 才遷移；well-formed unmatched／ambiguous explicit selection 保留並 resolve `nil`，讓 transient partial payload 使用該來源 last-good，而非靜默切到 Auto；只有 malformed／empty selection 回 Auto；duplicate card ID 保留第一張並 fail closed |
 | Presentation | Deficit／yellow gate 必須同時是 Historical basis、`available` 與 deficit stage；Linear 或 learning estimate 不得偽裝成 learned Historical |
-| Cross-check | Windows harness 未來讀同一份 v3 fixture 並與 Mac actual output 對拍；在 DTO、state machine、selection 與 presentation 全部移植前不得宣稱 parity |
+| Cross-check | Windows harness讀同一份v3 fixture並與Mac actual output對拍；M19-B1完成DTO、state machine、selection與presentation後，119-case full cross-check為零material difference，real ARM64 provider-v3 run也產生exact 12 cases |
 
-`crosscheck-harness` 的 no-selector legacy run 目前可完整產生 42 pace＋74 format cases；74 個非 pace cases 與既有 C# reference 零差異。28 個 legacy pace cases 存在 intended mismatch，來源是 v3 strict decoder、typed lifecycle 與 no-silent-fallback contract；Windows status 明確為 **port/parity pending**。
+`crosscheck-harness` 的 no-selector legacy run 可完整產生42 pace＋74 format cases；原本28個legacy pace cases的intended mismatch來自v3 strict decoder、typed lifecycle與no-silent-fallback contract。M19-B1 Windows port以production decoder與同一份serializer-locked fixture收斂這些差異，status為 **port/parity complete**。GitHub ARM64 cross-package只證明交叉建置；另外執行的real ARM64 gate才是runtime evidence。
 
 ### Change budget
 
@@ -557,7 +586,7 @@ Local UX 驗收必須實際切換 Linear／Historical，覆蓋至少一張 `lear
 | Cross-language state drift | Swift再次 silent fallback | Required `paceStatus` invariants與 Rust／Swift shared fixtures |
 | V2 import破壞既有學習 | Codex使用者重新等待或 evidence遺失 | V2 read-only、idempotent merge、atomic v3與 byte／mtime assertions |
 | 新 identity endpoint | 新 privacy／latency／failure surface | 預設不新增；若必要，Stage 0停止並先更新 Plan與 security review |
-| Windows尚未同步 | Downstream DTO與呈現不一致 | Mac可完成但 parity標為 pending；另行授權跨 repo port後才能宣稱全平台完成 |
+| Consumer pin／ABI drift | Shared source或app-owned DTO／呈現再次分歧 | 兩邊維持同一 reviewed engine pin；app-owned delta 重新跑完整 Swift／C# cross-check，兩個 consumer gates 完成前不得宣稱全平台 parity |
 
 任何一張 eligible card 沒有 stable key、safe account scope 或可信 duration path 時，implementation 必須停在該 provider 的 Stage 0／1／2 gate，回來更新這份 Plan；不得以 label、token hash、30-day constant或 silent Linear 來「完成」matrix。
 

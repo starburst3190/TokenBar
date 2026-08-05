@@ -11,6 +11,9 @@ use crate::agent_quota_history::{
     SeriesKey,
 };
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
+use hyper_util::client::legacy::connect::dns::{
+    GaiResolver as HyperGaiResolver, Name as HyperDnsName,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -18,11 +21,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use tower_service::Service;
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+// The live subscription plan; the usage payload carries none.
+const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_REFRESH_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -102,6 +108,8 @@ impl SafeTransportDiagnostic {
             match facts.raw_os_code {
                 Some(61 | 111 | 10061) => TransportCategory::ConnectionRefused,
                 Some(54 | 104 | 10054) => TransportCategory::ConnectionReset,
+                _ if facts.is_dns => TransportCategory::Dns,
+                _ if facts.is_tls => TransportCategory::Tls,
                 _ if facts.is_connect => TransportCategory::Connect,
                 _ if facts.phase == TransportPhase::ResponseBody => TransportCategory::ResponseBody,
                 _ => TransportCategory::Request,
@@ -137,30 +145,106 @@ pub(crate) enum TransportPhase {
     ResponseBody,
 }
 
+#[derive(Debug)]
+struct DnsResolutionError {
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl DnsResolutionError {
+    fn new(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            source: Box::new(source),
+        }
+    }
+}
+
+impl std::fmt::Display for DnsResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DNS resolution failed")
+    }
+}
+
+impl std::error::Error for DnsResolutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TypedGaiResolver;
+
+impl reqwest::dns::Resolve for TypedGaiResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let parsed_name = name.as_str().parse::<HyperDnsName>();
+        Box::pin(async move {
+            let parsed_name = parsed_name.map_err(|source| {
+                Box::new(DnsResolutionError::new(source))
+                    as Box<dyn std::error::Error + Send + Sync>
+            })?;
+            let addresses = HyperGaiResolver::new()
+                .call(parsed_name)
+                .await
+                .map_err(|source| {
+                    Box::new(DnsResolutionError::new(source))
+                        as Box<dyn std::error::Error + Send + Sync>
+                })?;
+            Ok(Box::new(addresses) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+pub(crate) fn provider_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().dns_resolver(TypedGaiResolver)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransportErrorFacts {
     is_timeout: bool,
     is_connect: bool,
+    is_dns: bool,
+    is_tls: bool,
     phase: TransportPhase,
     raw_os_code: Option<i32>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TransportSourceFacts {
+    is_dns: bool,
+    is_tls: bool,
+    raw_os_code: Option<i32>,
+}
+
+fn transport_source_facts(error: &(dyn std::error::Error + 'static)) -> TransportSourceFacts {
+    let mut sources = vec![error];
+    let mut facts = TransportSourceFacts::default();
+    while let Some(current) = sources.pop() {
+        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
+            if facts.raw_os_code.is_none() {
+                facts.raw_os_code = io_error.raw_os_error();
+            }
+            if let Some(inner) = io_error.get_ref() {
+                sources.push(inner);
+            }
+        }
+        facts.is_dns |= current.downcast_ref::<DnsResolutionError>().is_some();
+        facts.is_tls |= current.downcast_ref::<rustls::Error>().is_some();
+        if let Some(source) = current.source() {
+            sources.push(source);
+        }
+    }
+    facts
+}
+
 impl TransportErrorFacts {
     pub(crate) fn from_reqwest(error: &reqwest::Error, phase: TransportPhase) -> Self {
-        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-        let mut raw_os_code = None;
-        while let Some(current) = source {
-            if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
-                raw_os_code = io_error.raw_os_error();
-                break;
-            }
-            source = current.source();
-        }
+        let source_facts = transport_source_facts(error);
         Self {
             is_timeout: error.is_timeout(),
             is_connect: error.is_connect(),
+            is_dns: source_facts.is_dns,
+            is_tls: source_facts.is_tls,
             phase,
-            raw_os_code,
+            raw_os_code: source_facts.raw_os_code,
         }
     }
 
@@ -174,6 +258,8 @@ impl TransportErrorFacts {
         Self {
             is_timeout,
             is_connect,
+            is_dns: false,
+            is_tls: false,
             phase,
             raw_os_code,
         }
@@ -993,6 +1079,8 @@ struct ClaudeUsageResponse {
     seven_day_cowork: Option<ClaudeWindow>,
     #[serde(default, deserialize_with = "deserialize_optional_raw")]
     cowork: Option<ClaudeWindow>,
+    #[serde(default, deserialize_with = "deserialize_optional_claude_limits")]
+    limits: Option<Vec<ClaudeLimitEntry>>,
     #[serde(default, deserialize_with = "deserialize_optional_raw")]
     extra_usage: Option<ClaudeExtraUsage>,
 }
@@ -1013,6 +1101,34 @@ impl ClaudeWindow {
 }
 
 #[derive(Debug, Deserialize)]
+struct ClaudeLimitEntry {
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty_string")]
+    kind: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty_string")]
+    group: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
+    percent: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty_string")]
+    resets_at: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    scope: Option<ClaudeLimitScope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeLimitScope {
+    #[serde(default, deserialize_with = "deserialize_optional_raw")]
+    model: Option<ClaudeLimitModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeLimitModel {
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty_string")]
+    id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty_string")]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ClaudeExtraUsage {
     #[serde(default)]
     is_enabled: bool,
@@ -1025,6 +1141,39 @@ struct ClaudeExtraUsage {
     #[serde(default)]
     currency: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+struct ClaudeProfileResponse {
+    #[serde(default)]
+    organization: Option<ClaudeProfileOrganization>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeProfileOrganization {
+    #[serde(default)]
+    organization_type: Option<String>,
+    #[serde(default)]
+    rate_limit_tier: Option<String>,
+}
+
+/// `(fetched_at, account_scope, plan)` — keyed on the verified account scope, not
+/// the access token: the scope survives a token refresh (which happens far more
+/// often than a plan change) while still refusing to serve another account's plan.
+//
+// ponytail: a rotation the Claude CLI performs itself fragments the scope by
+// design (an external marker replacement is indistinguishable from an account
+// switch), so the retained plan is dropped and a profile failure in that same
+// window shows the stale Keychain label for up to the TTL — the behavior that
+// predates this cache. Fixing it needs an account identity stable across
+// external rotations, and the only authoritative source for one is the endpoint
+// that just failed.
+type ClaudeProfileCacheEntry = (DateTime<Utc>, String, Option<String>);
+static CLAUDE_PROFILE_CACHE: Mutex<Option<ClaudeProfileCacheEntry>> = Mutex::new(None);
+/// A subscription changes far more slowly than the 60s/300s quota polls.
+const CLAUDE_PROFILE_TTL_SECS: i64 = 3600;
+/// Short next to the 30s usage timeout: a slow profile endpoint costs a stale
+/// plan label, never a delayed quota payload.
+const CLAUDE_PROFILE_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Deserialize)]
 struct ClaudeRefreshResponse {
@@ -1408,7 +1557,7 @@ async fn fetch_codex_inner() -> ProviderFetchOutcome {
     };
     let (credentials, cache_binding, response) =
         match request_after_verified_binding(verified, |(credentials, cache_binding)| async move {
-            let client = reqwest::Client::builder()
+            let client = provider_http_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .map_err(|_| {
@@ -1781,7 +1930,7 @@ async fn fetch_claude_oauth_usage_request(
     cache_binding: Option<ProviderCacheBinding>,
     gate_binding: ProviderCacheBinding,
 ) -> (&'static str, ProviderFetchOutcome) {
-    let client = match reqwest::Client::builder()
+    let client = match provider_http_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
     {
@@ -1917,11 +2066,15 @@ async fn fetch_claude_oauth_usage_request(
                 updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 identity: Some(AgentIdentity {
                     email: None,
-                    plan: first_non_empty([
-                        credentials.subscription_type.as_deref(),
-                        credentials.rate_limit_tier.as_deref(),
-                    ])
-                    .map(clean_plan),
+                    plan: claude_live_plan(&client, credentials, &account_scope)
+                        .await
+                        .or_else(|| {
+                            first_non_empty([
+                                credentials.subscription_type.as_deref(),
+                                credentials.rate_limit_tier.as_deref(),
+                            ])
+                            .map(clean_plan)
+                        }),
                 }),
                 account_scope: Ok(account_scope),
                 windows,
@@ -1932,6 +2085,130 @@ async fn fetch_claude_oauth_usage_request(
             cache_binding,
         },
     )
+}
+
+/// Live plan label from `/api/oauth/profile`.
+///
+/// The Keychain's `subscriptionType` is a snapshot written at login: upgrading a
+/// subscription never rewrites it, so it keeps claiming Pro on a Max account.
+/// The usage JSON carries no plan at all, and the profile endpoint is the only
+/// live source. It needs `user:profile`, which the caller already proved by
+/// getting a usable usage response. Failures fall back to the stored snapshot.
+///
+/// This is optional enrichment on a path every provider's snapshot waits for, so
+/// it is bounded well inside the usage request's own 30s timeout and its result
+/// is cached even when it fails — an unreachable endpoint must not re-cost a
+/// request on every 60s/300s poll, nor stretch the expired-token path (refresh +
+/// usage, ~60s) any further.
+async fn claude_live_plan(
+    client: &reqwest::Client,
+    credentials: &ClaudeCredentials,
+    account: &AccountScope,
+) -> Option<String> {
+    let now = Utc::now();
+    let last_known = match claude_cached_plan(now, account) {
+        Ok(fresh) => return fresh,
+        Err(stale) => stale,
+    };
+
+    let completed = tokio::time::timeout(
+        std::time::Duration::from_secs(CLAUDE_PROFILE_TIMEOUT_SECS),
+        claude_profile_request(client, &credentials.access_token),
+    )
+    .await
+    .ok()
+    .flatten();
+    let plan = claude_plan_or_last_known(completed, last_known);
+
+    *CLAUDE_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) =
+        Some((now, account.as_str().to_string(), plan.clone()));
+    plan
+}
+
+/// `completed` is `None` when the lookup timed out or failed, and `Some` when the
+/// endpoint answered — including an answer that names no plan. Only the former
+/// reuses `last_known`: resurrecting it for a live empty answer would re-stamp an
+/// obsolete label with a fresh timestamp on every poll instead of letting the
+/// caller fall back to the credential snapshot.
+fn claude_plan_or_last_known(
+    completed: Option<Option<String>>,
+    last_known: Option<String>,
+) -> Option<String> {
+    match completed {
+        Some(live) => live,
+        None => last_known,
+    }
+}
+
+/// `Ok` is a fresh hit to use as-is; `Err` carries the last known live plan for
+/// this account (if any), which a failed request falls back on before the caller
+/// drops to the stale Keychain snapshot.
+fn claude_cached_plan(
+    now: DateTime<Utc>,
+    account: &AccountScope,
+) -> Result<Option<String>, Option<String>> {
+    let guard = CLAUDE_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some((fetched_at, cached_account, plan)) if cached_account == account.as_str() => {
+            if (now - *fetched_at).num_seconds() < CLAUDE_PROFILE_TTL_SECS {
+                Ok(plan.clone())
+            } else {
+                Err(plan.clone())
+            }
+        }
+        _ => Err(None),
+    }
+}
+
+/// `None` is a failed lookup; `Some(None)` is a live answer that names no plan.
+/// The caller must not treat the second as the first.
+async fn claude_profile_request(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Option<Option<String>> {
+    let response = client
+        .get(CLAUDE_PROFILE_URL)
+        .bearer_auth(access_token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, claude_user_agent())
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let profile: ClaudeProfileResponse = response.json().await.ok()?;
+    Some(profile.organization.as_ref().and_then(claude_profile_plan))
+}
+
+/// `claude_max` + `default_claude_max_5x` -> `Max 5x`; `claude_pro` -> `Pro`.
+/// The multiplier only exists on the rate-limit tier, so it is appended when the
+/// tier ends in one.
+fn claude_profile_plan(org: &ClaudeProfileOrganization) -> Option<String> {
+    let kind = org
+        .organization_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let base = clean_plan(kind.strip_prefix("claude_").unwrap_or(kind));
+    let multiplier = org
+        .rate_limit_tier
+        .as_deref()
+        .and_then(|tier| tier.rsplit('_').next())
+        .filter(|part| {
+            part.len() > 1
+                && part.ends_with('x')
+                && part[..part.len() - 1].chars().all(|c| c.is_ascii_digit())
+        });
+    Some(match multiplier {
+        Some(multiplier) => format!("{base} {multiplier}"),
+        None => base,
+    })
 }
 
 /// Fallback for inference-only tokens (`claude setup-token`): the oauth/usage
@@ -1986,7 +2263,7 @@ async fn fetch_claude_via_headers(
         }
     }
 
-    let client = reqwest::Client::builder()
+    let client = provider_http_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| {
@@ -2612,7 +2889,7 @@ async fn request_codex_refresh(
     refresh_token: String,
     attempt_binding: ProviderCacheBinding,
 ) -> Result<Value, ProviderFetchFailure> {
-    let client = reqwest::Client::builder()
+    let client = provider_http_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| {
@@ -2792,7 +3069,7 @@ async fn request_claude_refresh(
     refresh_token: String,
     attempt_binding: ProviderCacheBinding,
 ) -> Result<ClaudeRefreshResponse, ProviderFetchFailure> {
-    let client = reqwest::Client::builder()
+    let client = provider_http_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| {
@@ -3030,7 +3307,7 @@ fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = parent.join(format!(".{}.tmp.{}.{}", file_name, std::process::id(), seq));
 
-    // Stage into the temp, fsync it, then rename over the target. Create with
+    // Stage into the temp, fsync it, then atomically replace the target. Create with
     // O_EXCL + 0600 up front: the mode-at-creation closes the umask-default
     // window a write-then-chmod leaves the secret readable in, and O_EXCL
     // refuses to follow a symlink pre-seeded at the temp path.
@@ -3060,7 +3337,7 @@ fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
-    if let Err(error) = fs::rename(&tmp, path) {
+    if let Err(error) = tokscale_core::fs_atomic::replace_file(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("replace {}: {}", path.display(), error));
     }
@@ -3658,6 +3935,7 @@ fn claude_windows(usage: &ClaudeUsageResponse, now: DateTime<Utc>) -> Vec<UsageW
         usage.routines_window(),
         now,
     );
+    append_claude_scoped_windows(&mut windows, usage.limits.as_deref(), now);
     if let Some(extra) = claude_extra_usage_window(usage.extra_usage.as_ref()) {
         windows.push(extra);
     }
@@ -3730,6 +4008,144 @@ fn map_claude_window(
             )
         },
     )
+}
+
+fn append_claude_scoped_windows(
+    windows: &mut Vec<UsageWindow>,
+    limits: Option<&[ClaudeLimitEntry]>,
+    now: DateTime<Utc>,
+) {
+    // Flat labels are the provider's human model names; compare them with the
+    // scoped display name rather than the id slug, which may include a
+    // namespace or version.
+    let flat_model_slugs = windows
+        .iter()
+        .map(|window| claude_slug(&window.label))
+        .collect::<HashSet<_>>();
+    let mut emitted_slugs = HashSet::new();
+    for entry in limits.unwrap_or(&[]) {
+        // Do not filter on `is_active`: live enforceable limits can report false.
+        if entry.group.as_deref() != Some("weekly")
+            || entry.kind.as_deref() != Some("weekly_scoped")
+        {
+            continue;
+        }
+        let Some(percent) = entry
+            .percent
+            .filter(|percent| percent.is_finite() && (0.0..=100.0).contains(percent))
+        else {
+            continue;
+        };
+        let Some(model) = entry.scope.as_ref().and_then(|scope| scope.model.as_ref()) else {
+            continue;
+        };
+        let Some(display_name) = model
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|display_name| !display_name.is_empty())
+        else {
+            continue;
+        };
+        let display_name_slug = claude_slug(display_name);
+        let model_id_slug = model
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(claude_slug);
+        if model_id_slug
+            .as_deref()
+            .is_some_and(claude_is_all_models_slug)
+            || claude_is_all_models_slug(&display_name_slug)
+        {
+            continue;
+        }
+        if flat_model_slugs.contains(&display_name_slug) {
+            continue;
+        }
+        // Identity comes from the display name, never the model id, even though
+        // the id looks like the more stable choice. The live payload reports
+        // `scope.model.id: null` while the field exists, so Anthropic populating
+        // it later would silently move this window's `card_id` and window key —
+        // dropping the user's persisted gauge selection (Swift matches
+        // `clientId|cardId` exactly) and restarting its quota-history series —
+        // with no visible change to the label. A display-name rename is the only
+        // way identity moves now, and that one is at least visible to the user.
+        if display_name_slug.is_empty() {
+            continue;
+        }
+        let slug = display_name_slug;
+        if !emitted_slugs.insert(slug.clone()) {
+            continue;
+        }
+        // A scoped entry that succeeds a legacy flat field inherits that
+        // field's semantic key and label. Anthropic moving a quota out of
+        // `seven_day_*` and into `limits[]` is the migration this mapper exists
+        // to support, and minting a new identity for it would cost the user the
+        // same persisted selection and history the flat lane already owns —
+        // for an otherwise unchanged quota. The flat-window guard above means
+        // this branch only runs once the flat field is actually gone.
+        let (window_key, label) = CLAUDE_SCOPED_FLAT_SUCCESSORS
+            .iter()
+            .find(|(model_slug, _, _)| *model_slug == slug)
+            .map_or_else(
+                || {
+                    (
+                        format!("weekly_scoped.{slug}.v1"),
+                        format!("{display_name} only"),
+                    )
+                },
+                |(_, key, label)| ((*key).to_string(), (*label).to_string()),
+            );
+        let resets_at = entry.resets_at.as_deref().and_then(parse_datetime);
+        if let Some(window) = UsageWindow::try_from_provider_used_percent(
+            label, percent, resets_at, now,
+        )
+        .map(|window| {
+            window.with_identity(
+                window_key.clone(),
+                Some(window_key),
+                None,
+                Some(DurationEvidence::contract(7 * 24 * 60 * 60)),
+            )
+        }) {
+            windows.push(window);
+        }
+    }
+}
+
+/// Model-name slugs that already have a flat-field lane, paired with the
+/// semantic key and label that lane owns. Keeping these frozen is what lets a
+/// quota move from `seven_day_*` into `limits[]` without the user losing a
+/// pinned gauge or its learned pace. Entries here must match the identities
+/// emitted by `claude_windows()` for the corresponding flat fields.
+const CLAUDE_SCOPED_FLAT_SUCCESSORS: &[(&str, &str, &str)] = &[
+    ("sonnet", "sonnet.weekly.v1", "Sonnet"),
+    ("opus", "opus.weekly.v1", "Opus"),
+    ("designs", "design.weekly.v1", "Designs"),
+    ("daily-routines", "routines.weekly.v1", "Daily Routines"),
+];
+
+fn claude_is_all_models_slug(slug: &str) -> bool {
+    slug == "all-models" || slug.ends_with("-all-models")
+}
+
+fn claude_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_separator = false;
+    for character in value.chars() {
+        if character.is_alphanumeric() {
+            if pending_separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.extend(character.to_lowercase());
+            pending_separator = false;
+        } else if !slug.is_empty() {
+            pending_separator = true;
+        }
+    }
+    slug
 }
 
 /// Parse the `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}` response
@@ -4185,6 +4601,23 @@ where
         Some(Value::String(s)) => s.parse::<f64>().ok(),
         _ => None,
     })
+}
+
+fn deserialize_optional_claude_limits<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ClaudeLimitEntry>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| {
+        value.as_array().map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+                .collect()
+        })
+    }))
 }
 
 #[cfg(test)]
@@ -4797,6 +5230,76 @@ mod tests {
     }
 
     #[test]
+    fn copilot_malformed_optional_reset_remains_success_and_keeps_last_good() {
+        let scope = TestRefreshScope::new("copilot", "lossy-optional-reset");
+        let account_scope = scope
+            .resolve_current("fixture", "account-a", b"marker-a")
+            .unwrap();
+        let binding = ProviderCacheBinding::primary(account_scope.clone());
+        let cache = Mutex::new(ProviderLastGoodCache::default());
+        let fresh_at = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+
+        apply_provider_outcome_with(
+            &cache,
+            "copilot",
+            "oauth",
+            fresh_at,
+            ProviderFetchOutcome::Success {
+                snapshot: cache_test_snapshot("copilot", Ok(account_scope.clone()), fresh_at),
+                cache_binding: Some(binding.clone()),
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        let response_at = fresh_at + chrono::Duration::minutes(1);
+        let decoded = agent_copilot::decode_usage_response(
+            r#"{
+                "quota_reset_date": {"credential":"token-secret"},
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 100,
+                        "remaining": 60,
+                        "percent_remaining": 60
+                    }
+                }
+            }"#,
+            response_at,
+        );
+        let outcome = match decoded {
+            Ok((plan, windows)) => ProviderFetchOutcome::Success {
+                snapshot: AgentUsageSnapshot {
+                    client_id: "copilot".to_string(),
+                    source: "oauth".to_string(),
+                    updated_at: response_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                    identity: Some(AgentIdentity { email: None, plan }),
+                    account_scope: Ok(account_scope),
+                    windows,
+                    credits: None,
+                    error: None,
+                    transport_diagnostic: None,
+                },
+                cache_binding: Some(binding),
+            },
+            Err(failure) => ProviderFetchOutcome::Failure(failure),
+        };
+        let snapshot =
+            apply_provider_outcome_with(&cache, "copilot", "oauth", response_at, outcome, |_| {})
+                .unwrap();
+
+        assert!(snapshot.error.is_none());
+        assert_eq!(snapshot.windows.len(), 1);
+        assert!((snapshot.windows[0].remaining_percent - 60.0).abs() < 0.01);
+        assert!(snapshot.windows[0].resets_at.is_none());
+        let cached = lock_last_good(&cache).entries["copilot"].snapshot.clone();
+        assert_eq!(cached.updated_at, snapshot.updated_at);
+        assert_eq!(cached.windows.len(), 1);
+        assert!(cached.error.is_none());
+        assert!(cached.transport_diagnostic.is_none());
+        scope.cleanup();
+    }
+
+    #[test]
     fn last_good_same_binding_fallback_preserves_clean_snapshot_without_enrichment() {
         let scope = TestRefreshScope::new("codex", "last-good-same-binding");
         let account_scope = scope
@@ -4903,7 +5406,7 @@ mod tests {
             failure_at + chrono::Duration::minutes(1),
             ProviderFetchOutcome::Failure(ProviderFetchFailure::transient(
                 "Codex usage request failed. Retrying automatically.",
-                Some(binding),
+                Some(binding.clone()),
                 SafeTransportDiagnostic::server_error(503),
             )),
             |_| enrich_calls.set(enrich_calls.get() + 1),
@@ -4912,6 +5415,36 @@ mod tests {
         assert_eq!(enrich_calls.get(), 1);
         assert_eq!(fallback_again.updated_at, fresh.updated_at);
         assert_eq!(fallback_again.windows[0].pace_status.complete_cycles, 6);
+
+        let dns_fallback = apply_provider_outcome_with(
+            &cache,
+            "codex",
+            "oauth",
+            failure_at + chrono::Duration::minutes(2),
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::transient(
+                "Codex usage request failed. Retrying automatically.",
+                Some(binding),
+                SafeTransportDiagnostic::from_facts(TransportErrorFacts {
+                    is_timeout: false,
+                    is_connect: true,
+                    is_dns: true,
+                    is_tls: false,
+                    phase: TransportPhase::Request,
+                    raw_os_code: None,
+                }),
+            )),
+            |_| enrich_calls.set(enrich_calls.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(enrich_calls.get(), 1);
+        assert_eq!(dns_fallback.updated_at, fresh.updated_at);
+        assert_eq!(dns_fallback.windows[0].pace_status.complete_cycles, 6);
+        assert_eq!(
+            dns_fallback
+                .transport_diagnostic
+                .map(|diagnostic| diagnostic.category),
+            Some(TransportCategory::Dns)
+        );
         scope.cleanup();
     }
 
@@ -5176,6 +5709,262 @@ mod tests {
             assert_eq!(result, Err("scope unavailable"), "{provider}");
             assert_eq!(sends.get(), 0, "{provider}");
         }
+    }
+
+    #[derive(Debug)]
+    struct SensitiveTestError(&'static str);
+
+    impl std::fmt::Display for SensitiveTestError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for SensitiveTestError {}
+
+    #[derive(Debug)]
+    struct NestedTestError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    }
+
+    impl NestedTestError {
+        fn new(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+            Self {
+                source: Box::new(source),
+            }
+        }
+    }
+
+    impl std::fmt::Display for NestedTestError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("nested transport failure")
+        }
+    }
+
+    impl std::error::Error for NestedTestError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.source.as_ref())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct InjectedDnsFailureResolver;
+
+    impl reqwest::dns::Resolve for InjectedDnsFailureResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(async {
+                Err(Box::new(DnsResolutionError::new(SensitiveTestError(
+                    "token-secret user@example.invalid /private/credential/path",
+                )))
+                    as Box<dyn std::error::Error + Send + Sync>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_gai_adapter_preserves_loopback_addresses_without_network_io() {
+        let name: reqwest::dns::Name = "127.0.0.1".parse().unwrap();
+        let addresses = reqwest::dns::Resolve::resolve(&TypedGaiResolver, name)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert!(!addresses.is_empty());
+        assert!(addresses.iter().all(|address| address.ip().is_loopback()));
+        assert!(provider_http_client_builder().build().is_ok());
+    }
+
+    #[tokio::test]
+    async fn injected_typed_dns_failure_is_classified_without_source_disclosure() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(InjectedDnsFailureResolver)
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let error = client
+            .get("http://account-123.example.invalid/private/path?token=token-secret")
+            .send()
+            .await
+            .unwrap_err();
+        let diagnostic = SafeTransportDiagnostic::from_facts(TransportErrorFacts::from_reqwest(
+            &error,
+            TransportPhase::Request,
+        ));
+        assert_eq!(diagnostic.category, TransportCategory::Dns);
+        let wire = serde_json::to_string(&diagnostic).unwrap();
+        assert_eq!(wire, r#"{"category":"dns"}"#);
+        for secret in [
+            "token-secret",
+            "user@example.invalid",
+            "account-123",
+            "example.invalid",
+            "/private/path",
+            "/private/credential/path",
+        ] {
+            assert!(!wire.contains(secret));
+        }
+    }
+
+    #[test]
+    fn nested_typed_sources_are_found_without_text_classification() {
+        let dns_error = NestedTestError::new(std::io::Error::other(DnsResolutionError::new(
+            SensitiveTestError("token-secret"),
+        )));
+        let dns_facts = transport_source_facts(&dns_error);
+        assert!(dns_facts.is_dns);
+        assert!(!dns_facts.is_tls);
+        assert_eq!(dns_facts.raw_os_code, None);
+
+        let tls_error = NestedTestError::new(std::io::Error::other(rustls::Error::General(
+            "token-secret".to_string(),
+        )));
+        let tls_facts = transport_source_facts(&tls_error);
+        assert!(!tls_facts.is_dns);
+        assert!(tls_facts.is_tls);
+        assert_eq!(tls_facts.raw_os_code, None);
+
+        let os_error =
+            NestedTestError::new(std::io::Error::other(std::io::Error::from_raw_os_error(61)));
+        assert_eq!(transport_source_facts(&os_error).raw_os_code, Some(61));
+    }
+
+    #[tokio::test]
+    async fn loopback_plaintext_on_tls_endpoint_is_classified_as_tls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut client_hello = [0_u8; 1024];
+            let _ = stream.read(&mut client_hello).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let client = provider_http_client_builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get(format!("https://{address}/")).send(),
+        )
+        .await
+        .expect("loopback TLS request timed out")
+        .unwrap_err();
+        let facts = TransportErrorFacts::from_reqwest(&error, TransportPhase::Request);
+        assert!(facts.is_tls);
+        assert_eq!(
+            SafeTransportDiagnostic::from_facts(facts).category,
+            TransportCategory::Tls
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn transport_diagnostic_precedence_and_generic_categories_are_stable() {
+        let facts =
+            |is_timeout, is_connect, is_dns, is_tls, phase, raw_os_code| TransportErrorFacts {
+                is_timeout,
+                is_connect,
+                is_dns,
+                is_tls,
+                phase,
+                raw_os_code,
+            };
+        let category = |facts| SafeTransportDiagnostic::from_facts(facts).category;
+
+        assert_eq!(
+            category(facts(
+                true,
+                true,
+                true,
+                true,
+                TransportPhase::Request,
+                Some(61),
+            )),
+            TransportCategory::Timeout
+        );
+        assert_eq!(
+            category(facts(
+                false,
+                true,
+                true,
+                true,
+                TransportPhase::Request,
+                Some(61),
+            )),
+            TransportCategory::ConnectionRefused
+        );
+        assert_eq!(
+            category(facts(
+                false,
+                true,
+                true,
+                true,
+                TransportPhase::Request,
+                Some(54),
+            )),
+            TransportCategory::ConnectionReset
+        );
+        assert_eq!(
+            category(facts(
+                false,
+                true,
+                true,
+                true,
+                TransportPhase::Request,
+                None,
+            )),
+            TransportCategory::Dns
+        );
+        assert_eq!(
+            category(facts(
+                false,
+                true,
+                false,
+                true,
+                TransportPhase::Request,
+                None,
+            )),
+            TransportCategory::Tls
+        );
+        assert_eq!(
+            category(facts(
+                false,
+                true,
+                false,
+                false,
+                TransportPhase::Request,
+                None,
+            )),
+            TransportCategory::Connect
+        );
+        assert_eq!(
+            category(facts(
+                false,
+                false,
+                false,
+                false,
+                TransportPhase::Request,
+                None,
+            )),
+            TransportCategory::Request
+        );
+        assert_eq!(
+            category(facts(
+                false,
+                false,
+                false,
+                false,
+                TransportPhase::ResponseBody,
+                None,
+            )),
+            TransportCategory::ResponseBody
+        );
     }
 
     #[test]
@@ -5624,6 +6413,199 @@ mod tests {
         scope.cleanup();
     }
 
+    /// Both cache tests write the same process-wide static, and Cargo runs tests
+    /// in parallel by default.
+    static CLAUDE_PROFILE_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn claude_plan_keeps_the_last_known_only_when_the_lookup_did_not_answer() {
+        let known = || Some("Max 5x".to_string());
+
+        // Timed out or failed -> keep the last known live plan.
+        assert_eq!(claude_plan_or_last_known(None, known()), known());
+        // Answered with a plan -> use it, even when it differs from the cache.
+        assert_eq!(
+            claude_plan_or_last_known(Some(Some("Max 20x".into())), known()),
+            Some("Max 20x".into())
+        );
+        // Answered with no plan -> a live empty answer is not a failure; the
+        // caller falls back to the credential snapshot rather than re-stamping
+        // an obsolete label.
+        assert_eq!(claude_plan_or_last_known(Some(None), known()), None);
+        assert_eq!(claude_plan_or_last_known(None, None), None);
+    }
+
+    #[test]
+    fn claude_profile_plan_reports_the_live_subscription() {
+        let profile = |body: &str| {
+            let parsed: ClaudeProfileResponse = serde_json::from_str(body).unwrap();
+            parsed.organization.as_ref().and_then(claude_profile_plan)
+        };
+
+        // The account this endpoint was added for: Keychain still says "pro".
+        assert_eq!(
+            profile(
+                r#"{"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}}"#
+            )
+            .as_deref(),
+            Some("Max 5x")
+        );
+        assert_eq!(
+            profile(
+                r#"{"organization":{"organization_type":"claude_pro","rate_limit_tier":"default_claude_ai"}}"#
+            )
+            .as_deref(),
+            Some("Pro")
+        );
+        // No organization type -> nothing to report, so the caller keeps its fallback.
+        assert_eq!(
+            profile(r#"{"organization":{"rate_limit_tier":"default_claude_max_20x"}}"#),
+            None
+        );
+        assert_eq!(profile(r#"{}"#), None);
+    }
+
+    #[test]
+    fn claude_cached_plan_separates_fresh_hits_from_fallback_values() {
+        let _cache_guard = CLAUDE_PROFILE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = Utc::now();
+        let set = |entry| {
+            *CLAUDE_PROFILE_CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = entry;
+        };
+
+        // Fresh: serve it without spending a request on the 60s/300s poll.
+        set(Some((
+            now,
+            "scope-a".to_string(),
+            Some("Max 5x".to_string()),
+        )));
+        assert_eq!(
+            claude_cached_plan(now, &AccountScope::for_test("scope-a")),
+            Ok(Some("Max 5x".into()))
+        );
+
+        // Expired: not a hit, but still the value a failed request falls back on
+        // instead of dropping to the stale Keychain snapshot. The key is the
+        // account scope, so this survives the token refresh that happens far more
+        // often than a plan change.
+        let old = now - chrono::Duration::seconds(CLAUDE_PROFILE_TTL_SECS + 1);
+        set(Some((
+            old,
+            "scope-a".to_string(),
+            Some("Max 5x".to_string()),
+        )));
+        assert_eq!(
+            claude_cached_plan(now, &AccountScope::for_test("scope-a")),
+            Err(Some("Max 5x".into()))
+        );
+
+        // Another account's entry is never served or fallen back on.
+        set(Some((
+            now,
+            "scope-b".to_string(),
+            Some("Max 5x".to_string()),
+        )));
+        assert_eq!(
+            claude_cached_plan(now, &AccountScope::for_test("scope-a")),
+            Err(None)
+        );
+
+        // A cached failure is a real hit: it is what stops the retry every poll.
+        set(Some((now, "scope-a".to_string(), None)));
+        assert_eq!(
+            claude_cached_plan(now, &AccountScope::for_test("scope-a")),
+            Ok(None)
+        );
+
+        set(None);
+        assert_eq!(
+            claude_cached_plan(now, &AccountScope::for_test("scope-a")),
+            Err(None)
+        );
+    }
+
+    /// A profile endpoint that accepts the connection and then says nothing —
+    /// the shape that would otherwise sit on the usage request's full 30s
+    /// timeout, once per poll.
+    #[tokio::test]
+    async fn claude_live_plan_is_bounded_and_caches_its_failure() {
+        let _cache_guard = CLAUDE_PROFILE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+
+        // Entry written before a token refresh: same account scope, and the
+        // credentials now carry the rotated token.
+        let credentials = claude_test_login_credentials();
+        let expired = Utc::now() - chrono::Duration::seconds(CLAUDE_PROFILE_TTL_SECS + 1);
+        *CLAUDE_PROFILE_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((expired, "scope-a".to_string(), Some("Max 5x".to_string())));
+
+        let client = provider_http_client_builder()
+            .no_proxy()
+            .resolve("api.anthropic.com", address)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let plan =
+            claude_live_plan(&client, &credentials, &AccountScope::for_test("scope-a")).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(CLAUDE_PROFILE_TIMEOUT_SECS + 5),
+            "profile lookup rode the usage timeout instead of its own: {elapsed:?}"
+        );
+        // The last known live plan survives both the failed request and the token
+        // rotation; only a cold cache drops to the Keychain snapshot.
+        assert_eq!(plan.as_deref(), Some("Max 5x"));
+        // Cached despite failing, so the next poll does not pay for it again.
+        assert_eq!(
+            claude_cached_plan(Utc::now(), &AccountScope::for_test("scope-a")),
+            Ok(Some("Max 5x".into()))
+        );
+
+        // A different account with the cache still warm: it must neither serve nor
+        // fall back on scope-a's plan, and its own failure has to be cached too —
+        // otherwise every poll re-pays for the same refusal.
+        let refused = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let client = provider_http_client_builder()
+            .no_proxy()
+            .resolve("api.anthropic.com", refused)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            claude_live_plan(&client, &credentials, &AccountScope::for_test("scope-b")).await,
+            None
+        );
+        assert_eq!(
+            claude_cached_plan(Utc::now(), &AccountScope::for_test("scope-b")),
+            Ok(None)
+        );
+
+        *CLAUDE_PROFILE_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     #[test]
     fn parses_claude_credentials_file() {
         let raw = r#"{
@@ -5735,6 +6717,116 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(target_os = "windows")]
+    fn open_without_delete_sharing(path: &Path) -> fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        options.open(path).unwrap()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn atomic_temp_path(dir: &Path) -> Option<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .map(|entry| entry.path())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn lock_staged_atomic_temp(dir: &Path) -> Option<fs::File> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let mut options = fs::OpenOptions::new();
+        options.read(true).share_mode(0);
+        options.open(atomic_temp_path(dir)?).ok()
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn atomic_write_retries_transient_windows_destination_lock() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!(
+            "tb_atomic_windows_transient_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(&path, "old").unwrap();
+        let destination_lock = open_without_delete_sharing(&path);
+
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || atomic_write(&writer_path, "new"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let staged_temp_lock = loop {
+            if let Some(file) = lock_staged_atomic_temp(&dir) {
+                break Some(file);
+            }
+            if writer.is_finished() || Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let staged_temp_locked = staged_temp_lock.is_some();
+        if staged_temp_locked {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let waited_for_retry = !writer.is_finished();
+        drop(staged_temp_lock);
+        drop(destination_lock);
+        let result = writer.join().expect("atomic writer thread panicked");
+
+        assert!(
+            staged_temp_locked,
+            "atomic write never completed temp-file staging"
+        );
+        assert!(
+            waited_for_retry,
+            "atomic write did not retry the sharing denial"
+        );
+        result.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert!(atomic_temp_path(&dir).is_none(), "temp file not cleaned up");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn atomic_write_exhausts_windows_retry_budget_without_losing_original() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!(
+            "tb_atomic_windows_persistent_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(&path, "old").unwrap();
+        let destination_lock = open_without_delete_sharing(&path);
+
+        let started = Instant::now();
+        let result = atomic_write(&path, "new");
+        let elapsed = started.elapsed();
+        drop(destination_lock);
+
+        assert!(result.is_err(), "persistent sharing denial must fail");
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "atomic write returned before exhausting the retry budget: {elapsed:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        assert!(atomic_temp_path(&dir).is_none(), "temp file not cleaned up");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn maps_claude_oauth_windows() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
@@ -5771,6 +6863,346 @@ mod tests {
         assert_eq!(windows[2].remaining_percent, 97.0);
         assert_eq!(windows[3].label, "Designs");
         assert_eq!(windows[3].remaining_percent, 100.0);
+    }
+
+    #[test]
+    fn maps_claude_fable_scoped_weekly_limit() {
+        let raw = r#"{
+            "limits": [{
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 12.5,
+                "resets_at": "2026-08-10T00:00:00Z",
+                "scope": {"model": {
+                    "id": "claude/fable.5:promo",
+                    "display_name": "Fable"
+                }}
+            }]
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let windows = claude_windows(&usage, now);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "Fable only");
+        assert_eq!(windows[0].card_id, "weekly_scoped.fable.v1");
+        assert_eq!(windows[0].used_percent, 12.5);
+        assert_eq!(
+            windows[0].resets_at.as_deref(),
+            Some("2026-08-10T00:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn maps_claude_scoped_limit_even_when_inactive() {
+        let raw = r#"{
+            "limits": [{
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 12.5,
+                "resets_at": "2026-08-10T00:00:00Z",
+                "is_active": false,
+                "scope": {"model": {
+                    "id": "claude/fable.5:promo",
+                    "display_name": "Fable"
+                }}
+            }]
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        assert_eq!(claude_windows(&usage, now).len(), 1);
+    }
+
+    #[test]
+    fn skips_claude_scoped_all_models_limit() {
+        let raw = r#"{
+            "limits": [{
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 12.5,
+                "scope": {"model": {
+                    "id": "claude/all-models",
+                    "display_name": "All Models"
+                }}
+            }]
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        assert!(claude_windows(&usage, now).is_empty());
+    }
+
+    #[test]
+    fn deduplicates_claude_scoped_opus_against_flat_window() {
+        let raw = r#"{
+            "seven_day_opus": {"utilization": 25},
+            "limits": [{
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 80,
+                "scope": {"model": {
+                    "id": "claude/opus.5",
+                    "display_name": "Opus"
+                }}
+            }]
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let windows = claude_windows(&usage, now);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "Opus");
+        assert!(!windows[0].label.ends_with(" only"));
+        assert_eq!(windows[0].used_percent, 25.0);
+    }
+
+    /// The migration case: once Anthropic drops a flat field, the scoped entry
+    /// must take over rather than leaving the model with no window at all — and
+    /// it must inherit the flat lane's identity, or the handover costs the user
+    /// their pinned gauge and the window's learned pace for a quota that never
+    /// actually changed.
+    #[test]
+    fn maps_claude_scoped_opus_when_flat_window_absent() {
+        let raw = r#"{
+            "limits": [{
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 80,
+                "scope": {"model": {
+                    "id": "claude/opus.5",
+                    "display_name": "Opus"
+                }}
+            }]
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let windows = claude_windows(&usage, now);
+        assert_eq!(windows.len(), 1);
+        // Identical to what the flat `seven_day_opus` lane emits, so a pinned
+        // gauge and its history survive the handover untouched.
+        assert_eq!(windows[0].label, "Opus");
+        assert_eq!(windows[0].card_id, "opus.weekly.v1");
+        assert_eq!(windows[0].window_key.as_deref(), Some("opus.weekly.v1"));
+        assert_eq!(windows[0].used_percent, 80.0);
+    }
+
+    /// `CLAUDE_SCOPED_FLAT_SUCCESSORS` is hand-written, so it can drift from the
+    /// identities `claude_windows()` actually emits for the flat fields. Drive
+    /// both lanes with the same quota and require the identity to be identical:
+    /// if either side is renamed or re-keyed without the other, this fails.
+    #[test]
+    fn claude_scoped_successors_match_their_flat_lane_identities() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let cases = [
+            ("seven_day_sonnet", "Sonnet"),
+            ("seven_day_opus", "Opus"),
+            ("seven_day_design", "Designs"),
+            ("seven_day_routines", "Daily Routines"),
+        ];
+
+        for (flat_field, display_name) in cases {
+            let flat = claude_windows(
+                &serde_json::from_str::<ClaudeUsageResponse>(&format!(
+                    r#"{{"{flat_field}": {{"utilization": 40}}}}"#
+                ))
+                .unwrap(),
+                now,
+            );
+            let scoped = claude_windows(
+                &serde_json::from_str::<ClaudeUsageResponse>(&format!(
+                    r#"{{"limits": [{{"kind": "weekly_scoped", "group": "weekly",
+                         "percent": 40,
+                         "scope": {{"model": {{"id": null,
+                                               "display_name": "{display_name}"}}}}}}]}}"#
+                ))
+                .unwrap(),
+                now,
+            );
+
+            assert_eq!(flat.len(), 1, "flat lane for {flat_field}");
+            assert_eq!(scoped.len(), 1, "scoped lane for {display_name}");
+            assert_eq!(
+                scoped[0].card_id, flat[0].card_id,
+                "card id drifted for {display_name}"
+            );
+            assert_eq!(
+                scoped[0].window_key, flat[0].window_key,
+                "window key drifted for {display_name}"
+            );
+            assert_eq!(
+                scoped[0].label, flat[0].label,
+                "label drifted for {display_name}"
+            );
+        }
+    }
+
+    /// End-to-end shape check against a real `oauth/usage` response captured
+    /// 2026-08-04 (percentages and timestamps replaced with neutral test
+    /// values; every field, including the ones we do not parse, kept verbatim).
+    ///
+    /// This pins three things the synthetic fixtures above cannot, because the
+    /// live payload differs from what the reference implementations led us to
+    /// expect:
+    ///   - the account-wide weekly entry is `kind: "weekly_all"` with a null
+    ///     scope, not an all-models scope, so `kind` is what actually keeps it
+    ///     out of the scoped lane;
+    ///   - the real Fable entry carries `scope.model.id: null`, so identity
+    ///     falls back to the display name;
+    ///   - the real Fable entry carries `resets_at: null` and must still
+    ///     produce a window.
+    #[test]
+    fn maps_live_claude_usage_payload_shape() {
+        let raw = r#"{
+            "five_hour": {"utilization": 55.0, "resets_at": "2026-08-10T20:40:00.197695+00:00",
+                          "limit_dollars": null, "used_dollars": null, "remaining_dollars": null},
+            "seven_day": {"utilization": 33.0, "resets_at": "2026-08-12T10:00:00.197716+00:00",
+                          "limit_dollars": null, "used_dollars": null, "remaining_dollars": null},
+            "seven_day_oauth_apps": null, "seven_day_opus": null, "seven_day_sonnet": null,
+            "seven_day_cowork": null, "seven_day_omelette": null, "tangelo": null,
+            "iguana_necktie": null, "omelette_promotional": null, "nimbus_quill": null,
+            "cinder_cove": null, "amber_ladder": null,
+            "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null,
+                            "utilization": null, "currency": null, "decimal_places": null,
+                            "disabled_reason": null, "user_disabled": true,
+                            "spend_limit_reached": false, "credits_ever_enabled": true,
+                            "daily": null, "weekly": null},
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 55, "severity": "normal",
+                 "resets_at": "2026-08-10T20:40:00.197695+00:00", "scope": null, "is_active": true},
+                {"kind": "weekly_all", "group": "weekly", "percent": 33, "severity": "normal",
+                 "resets_at": "2026-08-12T10:00:00.197716+00:00", "scope": null, "is_active": false},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "severity": "normal",
+                 "resets_at": null,
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+                 "is_active": false}
+            ],
+            "spend": {"used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+                      "limit": null, "percent": 0, "severity": "normal", "enabled": false,
+                      "disabled_reason": null, "cap": null, "balance": null, "auto_reload": null,
+                      "disclaimer": "Usage credits cover you when you hit your plan limits.",
+                      "can_purchase_credits": false, "can_toggle": false},
+            "member_dashboard_available": false
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let windows = claude_windows(&usage, now);
+
+        // Session and Weekly come from the flat fields; the `session` and
+        // `weekly_all` entries in `limits[]` describe the same two quotas and
+        // must not add duplicates.
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Session", "Weekly", "Fable only"]
+        );
+        assert_eq!(windows[0].used_percent, 55.0);
+        assert_eq!(windows[1].used_percent, 33.0);
+
+        let fable = &windows[2];
+        assert_eq!(fable.card_id, "weekly_scoped.fable.v1");
+        assert_eq!(fable.used_percent, 0.0);
+        assert_eq!(fable.remaining_percent, 100.0);
+        assert_eq!(fable.resets_at, None);
+    }
+
+    /// Per-entry tolerance: one unusable element must not discard its valid
+    /// siblings, which is what separates element-wise parsing from decoding the
+    /// array as a whole.
+    #[test]
+    fn keeps_valid_claude_scoped_limit_beside_malformed_sibling() {
+        let raw = r#"{
+            "limits": [
+                42,
+                {"kind": "weekly_scoped", "group": "weekly", "percent": "oops",
+                 "scope": {"model": {"display_name": "Broken"}}},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 12.5,
+                 "scope": {"model": {
+                    "id": "claude/fable.5:promo", "display_name": "Fable"
+                 }}}
+            ]
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let windows = claude_windows(&usage, now);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "Fable only");
+        assert_eq!(windows[0].used_percent, 12.5);
+    }
+
+    #[test]
+    fn ignores_malformed_claude_scoped_limits() {
+        let raw = r#"{
+            "limits": [
+                42,
+                {"kind": "session", "group": "weekly", "percent": 10,
+                 "scope": {"model": {"display_name": "Session"}}},
+                {"kind": "weekly_scoped", "group": "monthly", "percent": 10,
+                 "scope": {"model": {"display_name": "Monthly"}}},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": "NaN",
+                 "scope": {"model": {"display_name": "Infinite"}}},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 10,
+                 "scope": {"model": {"display_name": "   "}}}
+            ]
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        assert!(claude_windows(&usage, now).is_empty());
+    }
+
+    #[test]
+    fn deduplicates_duplicate_claude_scoped_limit_slugs_first_wins() {
+        let raw = r#"{
+            "limits": [
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 12,
+                 "scope": {"model": {
+                    "id": "claude/fable.5:promo", "display_name": "Fable"
+                 }}},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 99,
+                 "scope": {"model": {
+                    "id": "claude/fable.5:promo-v2", "display_name": "Fable"
+                 }}}
+            ]
+        }"#;
+        let usage: ClaudeUsageResponse = serde_json::from_str(raw).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let windows = claude_windows(&usage, now);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_percent, 12.0);
+        assert_eq!(windows[0].label, "Fable only");
+    }
+
+    /// Regression: `scope.model.id` is null in the live payload but the field
+    /// exists, so Anthropic populating it later must not move the window's
+    /// identity. A moved `card_id` silently drops the user's persisted gauge
+    /// selection (Swift matches `clientId|cardId` exactly) and restarts the
+    /// quota-history series, with no visible change to the label.
+    #[test]
+    fn claude_scoped_identity_survives_model_id_appearing() {
+        let with_null_id = r#"{
+            "limits": [{"kind": "weekly_scoped", "group": "weekly", "percent": 7,
+                        "scope": {"model": {"id": null, "display_name": "Fable"}}}]
+        }"#;
+        let with_populated_id = r#"{
+            "limits": [{"kind": "weekly_scoped", "group": "weekly", "percent": 7,
+                        "scope": {"model": {
+                            "id": "claude/fable.5:promo", "display_name": "Fable"
+                        }}}]
+        }"#;
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+
+        let before = claude_windows(
+            &serde_json::from_str::<ClaudeUsageResponse>(with_null_id).unwrap(),
+            now,
+        );
+        let after = claude_windows(
+            &serde_json::from_str::<ClaudeUsageResponse>(with_populated_id).unwrap(),
+            now,
+        );
+
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_eq!(before[0].card_id, "weekly_scoped.fable.v1");
+        assert_eq!(after[0].card_id, before[0].card_id);
+        assert_eq!(after[0].window_key, before[0].window_key);
     }
 
     #[test]
@@ -8263,6 +9695,42 @@ mod tests {
                         }),
                     ),
                     window(
+                        "current-fit.invalid",
+                        "Current fit",
+                        36.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.current-fit.invalid"),
+                        PaceState::Available,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        0,
+                        None,
+                        Some(HistoricalPacePayload {
+                            expected_used_percent: 30.0,
+                            eta_seconds: Some(5_400.0),
+                            will_last_to_reset: false,
+                            run_out_probability: None,
+                        }),
+                    ),
+                    window(
+                        "exhausted.invalid",
+                        "Exhausted quota",
+                        100.0,
+                        Some("2026-07-10T15:00:00Z"),
+                        Some("quota.exhausted.invalid"),
+                        PaceState::Available,
+                        Some(18_000),
+                        Some(DurationSource::Provider),
+                        0,
+                        None,
+                        Some(HistoricalPacePayload {
+                            expected_used_percent: 80.0,
+                            eta_seconds: Some(0.0),
+                            will_last_to_reset: false,
+                            run_out_probability: Some(1.0),
+                        }),
+                    ),
+                    window(
                         "learning-history.invalid",
                         "Learning history",
                         40.0,
@@ -8345,6 +9813,29 @@ mod tests {
         assert_eq!(fixture["schemaVersion"], 3);
         let mut serialized = serde_json::to_value(payload).unwrap();
         assert_eq!(serialized["publicationGeneration"], 1);
+        assert_eq!(
+            serialized["agents"][0]["windows"][2]["paceStatus"]["state"],
+            "available"
+        );
+        assert_eq!(
+            serialized["agents"][0]["windows"][2]["paceStatus"]["completeCycles"],
+            0
+        );
+        assert!(serialized["agents"][0]["windows"][2]["historicalPace"]
+            .get("runOutProbability")
+            .is_none());
+        assert_eq!(
+            serialized["agents"][0]["windows"][3]["historicalPace"]["etaSeconds"],
+            0.0
+        );
+        assert_eq!(
+            serialized["agents"][0]["windows"][3]["historicalPace"]["willLastToReset"],
+            false
+        );
+        assert_eq!(
+            serialized["agents"][0]["windows"][3]["historicalPace"]["runOutProbability"],
+            1.0
+        );
         serialized
             .as_object_mut()
             .expect("payload serializes as an object")

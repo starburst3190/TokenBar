@@ -1,9 +1,10 @@
+New:
+- A flat contribution heatmap joins the bar and 3D views in the usage chart. Press Command-G to cycle through all three.
+- Claude plans that report per-model weekly caps now show those limits alongside the session and weekly windows.
+
 Improved:
-- Animated Cat and Parrot icons now use a dedicated AppKit rendering surface. In controlled 40 FPS benchmarks, TokenBar process CPU fell from 14.938% to 0.458% for Cat and from 10.287% to 0.462% for Parrot while preserving the configured cadence; visible animation still carries WindowServer composition cost.
-- Usage cache validation now notices related files moving, appearing, or disappearing. The first scan after updating starts cold, then later refreshes use the rebuilt cache.
+- Reopening the popover no longer recomputes the hourly views, so they appear right away.
+- The turn count shows a loading state instead of looking empty while it is still being read.
 
 Fixes:
-- Quota cards keep the last known windows during transient same-account provider failures and show the current Error. Sign-outs, account changes, authentication failures, and invalid responses still clear stale data.
-- Local data discovery remains reliable when GUI launches lack a full shell environment.
-- Configured roots now cover the affected default local sources and credentials. OpenCode's default usage data and OAuth credentials use XDG_DATA_HOME, with an empty value falling back to $HOME/.local/share; Gemini CLI and Antigravity CLI data, plus Antigravity OAuth credentials, use GEMINI_CLI_HOME, falling back to $HOME/.gemini.
-- Claude version detection now runs at most once per TokenBar launch, avoiding repeated CLI starts during quota refreshes.
+- Non-square menu-bar animation art, such as the parrot, is fitted to the bar instead of being stretched to a square.

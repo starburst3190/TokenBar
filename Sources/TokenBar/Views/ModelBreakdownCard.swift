@@ -52,10 +52,11 @@ struct ModelBreakdownCard: View {
             title,
             trailing: {
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text("\(rows.count) model\(rows.count == 1 ? "" : "s") · \(Format.usd(totalCost))")
+                    Text((rows.count == 1 ? "%lld model · %@" : "%lld models · %@")
+                        .localized(rows.count, Format.usd(totalCost)))
                         .foregroundStyle(.secondary)
                     if let updatedAt = report?.pricingUpdatedAt {
-                        Text("Prices updated \(Format.relativeTime(updatedAt))")
+                        Text("Prices updated %@".localized(Format.relativeTime(updatedAt)))
                             .foregroundStyle(.tertiaryAdaptive)
                             .help("LiteLLM pricing data; refreshes automatically about once an hour")
                     }
@@ -79,7 +80,10 @@ struct ModelBreakdownCard: View {
                 }
                 let hidden = rows.count - min(rows.count, Self.maxRows)
                 if hidden > 0 {
-                    Button(expanded ? "Show less" : "Show \(hidden) more") {
+                    let title = expanded
+                        ? "Show less".localized
+                        : "Show %lld more".localized(hidden)
+                    Button(title) {
                         expanded.toggle()
                     }
                     .buttonStyle(.plain)
@@ -97,7 +101,7 @@ struct ModelBreakdownCard: View {
                     RoundedRectangle(cornerRadius: 1.5)
                         .fill(Color(hex: kind.color))
                         .frame(width: 7, height: 7)
-                    Text(kind.label)
+                    Text(kind.label.localized)
                 }
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -252,7 +256,7 @@ struct ModelUsageTooltip: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             HStack {
-                Text("\(Format.compactTokens(total)) tokens")
+                Text("%@ tokens".localized(Format.compactTokens(total)))
                 Spacer()
                 Text(Format.usd(cost))
             }
@@ -263,7 +267,7 @@ struct ModelUsageTooltip: View {
                     RoundedRectangle(cornerRadius: 1.5)
                         .fill(Color(hex: kind.color))
                         .frame(width: 6, height: 6)
-                    Text(kind.label)
+                    Text(kind.label.localized)
                     Spacer()
                     Text("\(Format.compactTokens(kind.value)) · \(Int((Double(kind.value) / Double(max(1, total)) * 100).rounded()))%")
                         .foregroundStyle(.secondary)

@@ -8,7 +8,9 @@ import TokenBarCore
 enum AppView: String, CaseIterable {
     case overview, models, monthly, daily, hourly, stats, agents
 
-    var label: String { rawValue.prefix(1).uppercased() + rawValue.dropFirst() }
+    /// Title-cased id, then looked up: the English label doubles as the
+    /// translation key, while `rawValue` stays the persisted id.
+    var label: String { (rawValue.prefix(1).uppercased() + rawValue.dropFirst()).localized }
 
     /// Lenses the user can individually hide via Settings. Overview and
     /// Models are fixed anchors — Overview is the fallback target for every
@@ -78,11 +80,9 @@ enum AgentUsagePublicationCoordinator {
 /// load so a fresh DashboardModel can start in `.ready` state instead of
 /// flashing "Loading usage…" every time the popover reopens.
 ///
-/// Only `hourly`/`agents` are excluded: they are the lazy lenses that
-/// `ensureData(for:)` refetches *solely when nil*, so restoring stale non-nil
-/// values would strand them on a previous year's slice (Codex P2-1/P2-3)
-/// until the 60s pollGraph tick. `agentUsage`/`trace` are NOT lazy lenses —
-/// their pollers (`pollAgentUsage`/`pollTrace`) fetch-first and overwrite
+/// `hourly` is excluded because it has its own year/client-keyed process cache;
+/// `agents` remains uncached. `agentUsage`/`trace` are NOT lazy lenses — their
+/// pollers (`pollAgentUsage`/`pollTrace`) fetch-first and overwrite
 /// unconditionally — so caching them is staleness-free and keeps the Overview
 /// tab's live/quota cards populated on reopen instead of flashing placeholders.
 private struct DashboardSnapshot {
@@ -101,6 +101,11 @@ private struct DashboardSnapshot {
 /// first time their lens becomes active, mirroring the Tauri app's
 /// empty-year short-circuit hooks.
 @MainActor @Observable final class DashboardModel {
+    private struct HourlyCacheKey: Hashable {
+        let year: String
+        let clients: Set<String>
+    }
+
     /// Survives the model's deallocation so the next PopoverView starts with
     /// cached data instead of `.loading`. A deliberate process-lifetime cache
     /// (one COW-shared value snapshot, never invalidated). Every model may
@@ -114,6 +119,12 @@ private struct DashboardSnapshot {
     /// popover open/close — that deletes this static, DashboardSnapshot, and
     /// the year guard while preserving the Phase B CPU win.
     private static var lastSnapshot: DashboardSnapshot?
+    /// Reopen cache for the expensive hourly fold. Multiple slices coexist so
+    /// Daily/Monthly's Codex+Claude report cannot evict Hourly's all-client one.
+    // ponytail: FIFO at eight slices bounds memory; use LRU only if churn shows misses.
+    private static let hourlyCacheLimit = 8
+    private static var hourlyCache: [HourlyCacheKey: HourlyReport] = [:]
+    private static var hourlyCacheOrder: [HourlyCacheKey] = []
     /// Whether this model owns the shared `lastSnapshot` (true only for the
     /// popover's model, whose teardown/rebuild is what the cache speeds up).
     private let cachesSnapshot: Bool
@@ -127,11 +138,16 @@ private struct DashboardSnapshot {
     private(set) var phase: Phase
     private static let yearKey = "tokenbar.dashboard.year"
 
+    /// Empty is the explicit identity for an all-time slice; nil below means
+    /// that no accepted payload/report exists yet, so it cannot masquerade as
+    /// all-time.
+    private static func identityYear(_ year: String?) -> String { year ?? "" }
+
     /// Resolve the active year filter: the `--year=` debug flag wins, else the
-    /// persisted selection. Shared by `init()`'s snapshot guard and the `year`
-    /// property initializer so the two can never drift (the guard MUST compute
-    /// the same value the property does, or it would mis-classify a consistent
-    /// snapshot as stale). nil = all time.
+    /// persisted selection. Used as `init()`'s default so the snapshot guard and
+    /// the model's `year` can never drift (the guard MUST compare the same value
+    /// the model fetches, or it would mis-classify a consistent snapshot as stale).
+    /// Callers that own process-wide settings may explicitly pass nil for all time.
     private static func resolveYear() -> String? {
         CommandLine.arguments
             .first(where: { $0.hasPrefix("--year=") })
@@ -144,24 +160,25 @@ private struct DashboardSnapshot {
     /// settings window passes false so it never writes the shared snapshot.
     init(
         cachesSnapshot: Bool = false,
-        source: any UsageDataSource = UsageDataSources.current
+        source: any UsageDataSource = UsageDataSources.current,
+        initialYear: String? = DashboardModel.resolveYear()
     ) {
         self.cachesSnapshot = cachesSnapshot
         self.source = source
+        self.year = initialYear
         // Guard snapshot restore on year-consistency: if the user changed the
         // year filter after the snapshot was written (e.g. setYear() persisted
         // the new year but reload() failed before apply() ran), the cached
         // payload is for the wrong slice — fall through to .loading so load()
-        // fetches fresh. resolveYear() is a static (no `self`); @Observable
-        // turns `year` into a computed accessor that touches self, so it is not
-        // readable here until `phase` is set — hence the shared static helper,
-        // which mirrors the `year` property initializer exactly.
-        if let snap = Self.lastSnapshot, snap.year == Self.resolveYear() {
+        // fetches fresh. Settings passes nil explicitly because its client-item
+        // controls must use the same all-time graph universe as AppDelegate.
+        if let snap = Self.lastSnapshot, snap.year == initialYear {
             payload = snap.payload
             stats = snap.stats
             modelReport = snap.modelReport
             colors = snap.colors
             knownYears = snap.knownYears
+            acceptedPayloadYear = Self.identityYear(initialYear)
             agentUsage = snap.agentUsage.map {
                 AgentUsagePublicationCoordinator.resolve($0)
             }
@@ -176,7 +193,7 @@ private struct DashboardSnapshot {
     /// nil = all time. Persisted so the selection survives the popover's
     /// rootView teardown/rebuild cycle.
     /// `--year=<yyyy>` preselects a year (debug/screenshot aid).
-    private(set) var year: String? = DashboardModel.resolveYear()
+    private(set) var year: String?
     /// Union of `payload.years` across loads — a year-filtered payload only
     /// reports the selected year, so remember the rest for the picker.
     private(set) var knownYears: [String] = []
@@ -185,8 +202,13 @@ private struct DashboardSnapshot {
     private(set) var modelReport: ModelReport?
     private(set) var colors = ModelColorMap(report: nil)
     private(set) var hourly: HourlyReport?
+    private(set) var hourlyLoading = false
     private(set) var agents: AgentsReport?
     private(set) var agentUsage: AgentUsagePayload?
+    /// True once the first `pollAgentUsage()` attempt has finished, whether it
+    /// succeeded or not. Lets a view show a terminal state instead of waiting on
+    /// a payload that may never arrive.
+    private(set) var agentUsageAttempted = false
     private(set) var trace: [TraceBucket] = []
 
     // Memo for the hidden-client Overview slice: lensContent re-evals on every
@@ -207,6 +229,12 @@ private struct DashboardSnapshot {
     // refetch. Background refreshes (reload/pollGraph) reuse the stored slice.
     @ObservationIgnored private var hourlyClients: Set<String>?
     @ObservationIgnored private var agentsClients: Set<String>?
+    /// Identity of the last payload/hourly report that actually committed.
+    /// These are separate from `year`: a newer request may complete in the
+    /// inverse order, and the presentation accessors must stay fail-closed.
+    @ObservationIgnored private var acceptedPayloadYear: String?
+    @ObservationIgnored private var hourlyYear: String?
+    @ObservationIgnored private var hourlyRequestToken = 0
 
     /// UsageStats for a client slice, with hidden clients already removed from
     /// `selected`. Returns the precomputed full `stats` when the slice covers
@@ -227,6 +255,24 @@ private struct DashboardSnapshot {
         return computed
     }
 
+    /// The Hourly lens can render a matching report as soon as it completes;
+    /// unlike Daily/Monthly it intentionally does not wait for the graph
+    /// payload, preserving the existing hourly behavior.
+    func hourlyReport(for clients: [String]) -> HourlyReport? {
+        guard let hourly,
+              hourlyClients == Set(clients),
+              hourlyYear == Self.identityYear(year)
+        else { return nil }
+        return hourly
+    }
+
+    /// Daily/Monthly receive a report only when both sides of the year
+    /// transition have committed the same slice and client set.
+    func turnsReport(for clients: [String]) -> HourlyReport? {
+        guard acceptedPayloadYear == Self.identityYear(year) else { return nil }
+        return hourlyReport(for: clients)
+    }
+
     /// The source owns the blocking FFI hop in live mode; demo mode returns
     /// synthetic values through the same async contract.
     func load() async {
@@ -241,7 +287,7 @@ private struct DashboardSnapshot {
             // so apply() never tags the new year — and the static snapshot —
             // with the old year's payload. Mirrors reload()/pollGraph().
             guard self.year == year else { return }
-            apply(payload: payload, report: report)
+            apply(payload: payload, report: report, expectedYear: year)
         } catch {
             // Keep showing stale data over an error screen when a previous
             // load succeeded — a transient failure must not blank the UI.
@@ -268,6 +314,7 @@ private struct DashboardSnapshot {
     func setYear(_ newYear: String?) async {
         guard newYear != year, !refreshing else { return }
         year = newYear
+        invalidateHourly()
         UserDefaults.standard.set(newYear, forKey: Self.yearKey)
         refreshing = true
         defer { refreshing = false }
@@ -291,20 +338,67 @@ private struct DashboardSnapshot {
         }
     }
 
+    private func beginHourlyRequest() -> Int {
+        hourlyRequestToken += 1
+        return hourlyRequestToken
+    }
+
+    private func invalidateHourly() {
+        hourly = nil
+        hourlyLoading = false
+        hourlyClients = nil
+        hourlyYear = nil
+        _ = beginHourlyRequest()
+    }
+
+    private func publishHourly(
+        _ report: HourlyReport, year: String?, clients: Set<String>
+    ) {
+        let yearKey = Self.identityYear(year)
+        hourly = report
+        hourlyClients = clients
+        hourlyYear = yearKey
+        if cachesSnapshot {
+            let cacheKey = HourlyCacheKey(year: yearKey, clients: clients)
+            if Self.hourlyCache[cacheKey] == nil {
+                Self.hourlyCacheOrder.append(cacheKey)
+                if Self.hourlyCacheOrder.count > Self.hourlyCacheLimit {
+                    Self.hourlyCache.removeValue(forKey: Self.hourlyCacheOrder.removeFirst())
+                }
+            }
+            Self.hourlyCache[cacheKey] = report
+        }
+    }
+
     private func reload(force: Bool) async {
         let year = self.year
         async let payloadTask = force
             ? source.refreshGraph(year: year, priority: .userInitiated)
             : source.graph(year: year, priority: .userInitiated)
         async let reportTask = source.modelReport(year: year, priority: .userInitiated)
-        guard let payload = try? await payloadTask else { return }
+        let payload: UsagePayload
+        do {
+            payload = try await payloadTask
+        } catch {
+            // A model that has never reached `.ready` must still settle. apply()
+            // spawns this reload for an emptied year filter and returns BEFORE
+            // setting `.ready`, so a failure here would otherwise strand phase on
+            // `.loading` forever — the dashboard spins and Settings keeps
+            // "looking for clients". Once ready, keep the stale-data-over-error
+            // behavior a manual refresh relies on.
+            if case .loading = phase {
+                phase = .failed("Failed to load usage: \(error)")
+            }
+            return
+        }
         let report = try? await reportTask
-        apply(payload: payload, report: report)
+        guard !Task.isCancelled, self.year == year else { return }
+        apply(payload: payload, report: report, expectedYear: year)
         // If apply() cleared a now-empty year filter, it spawned its own
         // unfiltered reload that re-fetches the lazy lenses for the new (nil)
         // year — skip the stale-`year` re-fetch here, or an empty year-filtered
         // hourly/agents could land after it and blank those lenses.
-        guard self.year == year else { return }
+        guard self.year == year, !Task.isCancelled else { return }
         // Re-fetch the lazy lenses that were already loaded, keeping the slice
         // they were last fetched for (an ordered array of the stored Set — the
         // FFI filter is membership-based, so order is irrelevant). Re-check the
@@ -314,9 +408,19 @@ private struct DashboardSnapshot {
         // strand the wrong slice on the lens.
         if hourly != nil {
             let captured = hourlyClients
+            let requestToken = beginHourlyRequest()
             let report = try? await source.hourlyReport(
                 year: year, clients: captured.map(Array.init), priority: .userInitiated)
-            if self.year == year, self.hourlyClients == captured { hourly = report }
+            if !Task.isCancelled,
+               self.year == year,
+               self.hourlyClients == captured,
+               self.hourlyYear == Self.identityYear(year),
+               hourlyRequestToken == requestToken,
+               let report,
+               let captured
+            {
+                publishHourly(report, year: year, clients: captured)
+            }
         }
         if agents != nil {
             let captured = agentsClients
@@ -326,7 +430,10 @@ private struct DashboardSnapshot {
         }
     }
 
-    private func apply(payload: UsagePayload, report: ModelReport?) {
+    private func apply(
+        payload: UsagePayload, report: ModelReport?, expectedYear: String? = nil
+    ) {
+        guard expectedYear == nil || self.year == expectedYear else { return }
         // A year-filtered payload reports only the selected year (empty if that
         // year has no data). Validate the filter against THIS fresh payload —
         // not the knownYears union, which never drops a year once seen — so a
@@ -334,12 +441,15 @@ private struct DashboardSnapshot {
         // stays open) clears instead of stranding the dashboard on an empty
         // slice. Re-fetch unfiltered so all data shows immediately.
         if let year, !payload.years.contains(where: { $0.year == year }) {
+            invalidateHourly()
+            acceptedPayloadYear = nil
             self.year = nil
             UserDefaults.standard.removeObject(forKey: Self.yearKey)
             Task { [weak self] in await self?.reload(force: false) }
             return
         }
         self.payload = payload
+        acceptedPayloadYear = Self.identityYear(year)
         stats = UsageStats(payload: payload, selectedClients: Set(payload.summary.clients))
         modelReport = report
         colors = ModelColorMap(report: report)
@@ -402,11 +512,11 @@ private struct DashboardSnapshot {
             // The year may have changed while we were off-actor; drop a stale
             // slice so the chart never flickers to the wrong year.
             guard self.year == year, let payload = fetched else { continue }
-            apply(payload: payload, report: report)
+            apply(payload: payload, report: report, expectedYear: year)
             // apply() may have cleared a now-empty year filter and spawned an
             // unfiltered reload; skip the stale-`year` lazy re-fetch so it
             // can't blank Hourly/Agents with empty year-filtered reports.
-            guard self.year == year else { continue }
+            guard self.year == year, !Task.isCancelled else { continue }
             // Re-fetch the lazy lenses that were already loaded (mirrors reload),
             // keeping each one's last-fetched client slice.
             // Re-check the stored slice after the await (see reload()): a tab
@@ -414,9 +524,19 @@ private struct DashboardSnapshot {
             // the fresh slice with the stale one.
             if hourly != nil {
                 let captured = hourlyClients
+                let requestToken = beginHourlyRequest()
                 let report = try? await source.hourlyReport(
                     year: year, clients: captured.map(Array.init), priority: .utility)
-                if self.year == year, self.hourlyClients == captured { hourly = report }
+                if !Task.isCancelled,
+                   self.year == year,
+                   self.hourlyClients == captured,
+                   self.hourlyYear == Self.identityYear(year),
+                   hourlyRequestToken == requestToken,
+                   let report,
+                   let captured
+                {
+                    publishHourly(report, year: year, clients: captured)
+                }
             }
             if agents != nil {
                 let captured = agentsClients
@@ -452,6 +572,11 @@ private struct DashboardSnapshot {
                 reconcileQuotaRemaining(with: resolved)
                 refreshSnapshotLiveData() // keep the reopen cache's quota cards current
             }
+            // Set on failure too: `agentUsage == nil` alone cannot distinguish
+            // "the first attempt is still in flight" from "the attempt finished
+            // and produced nothing", and UI that waits on the payload would spin
+            // forever against a persistent failure.
+            agentUsageAttempted = true
             try? await Task.sleep(for: .seconds(60))
         }
     }
@@ -484,28 +609,51 @@ private struct DashboardSnapshot {
     /// when the slice changes, not only when the report is nil — keyed on the
     /// slice as a Set so a reorder does not refetch. The year stale-guard
     /// mirrors reload()/pollGraph().
+    private func ensureHourlyData(
+        year: String?, clients: [String], clearOnEmpty: Bool
+    ) async {
+        let selection = Set(clients)
+        if clearOnEmpty, selection.isEmpty {
+            invalidateHourly()
+            return
+        }
+        let yearKey = Self.identityYear(year)
+        guard hourly == nil || hourlyClients != selection || hourlyYear != yearKey else { return }
+
+        // Restore the exact slice before refreshing so reopen and lens switches
+        // do not flash a loading state. Non-popover models neither read nor
+        // write this process cache.
+        let cacheKey = HourlyCacheKey(year: yearKey, clients: selection)
+        if cachesSnapshot, let cached = Self.hourlyCache[cacheKey] {
+            publishHourly(cached, year: year, clients: selection)
+        } else if hourly != nil {
+            hourly = nil
+            hourlyClients = nil
+            hourlyYear = nil
+        }
+        let requestToken = beginHourlyRequest()
+        hourlyLoading = true
+        let report = try? await source.hourlyReport(
+            year: year, clients: clients, priority: .userInitiated)
+        guard self.year == year, hourlyRequestToken == requestToken else { return }
+        hourlyLoading = false
+        guard !Task.isCancelled, let report else { return }
+        publishHourly(report, year: year, clients: selection)
+    }
+
     func ensureData(for view: AppView, clients: [String]) async {
         let year = self.year
-        let selection = Set(clients)
         switch view {
-        case .hourly where hourly == nil || hourlyClients != selection:
-            // Nil the stale report on a slice change so the view shows its
-            // loading state instead of rendering the OLD mixed-bucket totals
-            // against the NEW clientIds for one FFI latency (a shared hour's
-            // hidden stripe would flash). Also covers plain tab switches.
-            if hourly != nil, hourlyClients != selection { hourly = nil; hourlyClients = selection }
-            let report = try? await source.hourlyReport(
-                year: year, clients: clients, priority: .userInitiated)
-            // The source request may outlive this `.task(id:)`'s cancellation, so a
-            // tab switch or year change during the await must not let this
-            // superseded fetch commit: PopoverView cancels the task on an
-            // activeTab/year change, so isCancelled captures the slice switch
-            // (the model has no "desired selection" to compare against the way
-            // it does for year).
-            guard self.year == year, !Task.isCancelled else { return }
-            hourly = report
-            hourlyClients = selection
-        case .agents where agents == nil || agentsClients != selection:
+        case .hourly:
+            // Preserve the established nil/empty = all-client source behavior
+            // for Hourly; only Daily/Monthly treat an empty supported slice as
+            // an explicit no-data state.
+            await ensureHourlyData(year: year, clients: clients, clearOnEmpty: false)
+        case .daily, .monthly:
+            await ensureHourlyData(year: year, clients: clients, clearOnEmpty: true)
+        case .agents:
+            let selection = Set(clients)
+            guard agents == nil || agentsClients != selection else { return }
             // Nil the stale report on a slice change (see the hourly case).
             if agents != nil, agentsClients != selection { agents = nil; agentsClients = selection }
             let report = try? await source.agentsReport(

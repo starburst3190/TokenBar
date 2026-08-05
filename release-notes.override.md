@@ -1,14 +1,13 @@
 ## Highlights
 
-- **Animated status icons now use far less TokenBar CPU.** In controlled 40 FPS benchmarks, TokenBar process CPU fell from 14.938% to 0.458% for Cat and from 10.287% to 0.462% for Parrot while preserving the configured cadence. Visible animation still carries WindowServer composition cost. [#95](https://github.com/Nanako0129/TokenBar/pull/95)
-- **Quota cards now survive transient provider outages without hiding the error.** TokenBar keeps the last known windows for the same account and shows the current Error. Sign-outs, account changes, authentication failures, and invalid responses still clear stale data instead of reusing it. [#94](https://github.com/Nanako0129/TokenBar/pull/94)
+- **A flat contribution heatmap.** The usage chart gains a third view alongside the bars and the 3D graph: a year of daily activity as one dense grid, shaded by tokens or by cost. It opens scrolled to the most recent day, and days in the future are not drawn at all, so the latest day sits at the right edge rather than in the middle of an empty remainder of the year. `⌘G` now cycles all three views instead of toggling between two. [#136](https://github.com/Nanako0129/TokenBar/pull/136)
 
 ## Changes
 
-- **Usage cache validation now follows related files more precisely.** TokenBar invalidates cached source data when dependencies move, appear, or disappear. The first scan after updating starts cold, then later refreshes use the rebuilt cache. [#91](https://github.com/Nanako0129/TokenBar/pull/91)
+- **Claude plans that report per-model weekly caps now surface those windows.** They appear alongside the session and weekly limits rather than being folded into them. [#133](https://github.com/Nanako0129/TokenBar/pull/133)
+- The turn count shows a loading state while it is being read, instead of appearing empty. [#132](https://github.com/Nanako0129/TokenBar/pull/132)
 
 ## Fixes
 
-- **Local data discovery remains reliable when GUI launches lack a full shell environment.** Explicit source overrides keep their existing precedence. [#92](https://github.com/Nanako0129/TokenBar/pull/92)
-- **Configured roots now cover the affected default local sources and credentials.** OpenCode's default usage data and OAuth credentials use `XDG_DATA_HOME`, with an empty value falling back to `$HOME/.local/share`; Gemini CLI and Antigravity CLI data, plus Antigravity OAuth credentials, use `GEMINI_CLI_HOME`, falling back to `$HOME/.gemini`. [#97](https://github.com/Nanako0129/TokenBar/pull/97)
-- **Claude version detection now runs at most once per TokenBar launch,** avoiding repeated CLI starts during quota refreshes. [#93](https://github.com/Nanako0129/TokenBar/pull/93)
+- **Reopening the popover no longer recomputes the hourly views.** They now appear immediately, and the cache behind that is bounded, so a long history cannot grow it without limit. [#131](https://github.com/Nanako0129/TokenBar/pull/131)
+- Non-square menu-bar animation art — the parrot — is fitted to the bar instead of being stretched to a square. [#137](https://github.com/Nanako0129/TokenBar/pull/137)
