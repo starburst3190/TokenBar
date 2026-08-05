@@ -39,19 +39,31 @@ enum PopoverScale: String, CaseIterable {
 /// it is a no-op, so no extra layers are introduced in the default case.
 struct PopoverScaleModifier: ViewModifier {
     let baseWidth: CGFloat
-    let baseHeight: CGFloat
+    /// Unscaled content height to scale from. `nil` scales against the host's
+    /// live height instead, which is what a resizable surface needs: the
+    /// popover's drag handle resizes the AppKit window without publishing the
+    /// new height to the model, so any height read from the model lags the
+    /// window for the whole drag and the content stops short of the frame.
+    var baseHeight: CGFloat?
     let scale: CGFloat
 
     func body(content: Content) -> some View {
         if scale == 1.0 {
             content
-        } else {
+        } else if let baseHeight {
             content
                 .scaleEffect(scale, anchor: .topLeading)
                 .frame(
                     width: (baseWidth * scale).rounded(),
                     height: (baseHeight * scale).rounded(),
                     alignment: .topLeading)
+        } else {
+            GeometryReader { geo in
+                content
+                    .frame(width: baseWidth, height: max(1, geo.size.height / scale))
+                    .scaleEffect(scale, anchor: .topLeading)
+            }
+            .frame(width: (baseWidth * scale).rounded())
         }
     }
 }

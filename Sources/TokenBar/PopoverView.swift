@@ -179,15 +179,20 @@ struct PopoverView: View {
             Divider()
             footer
         }
-        // The scaled path needs a concrete base height to scale from, so it
-        // pins `chrome.height` and gives up the fill-the-host optimization
-        // below. At the default scale the modifier is a pass-through, so the
-        // unscaled path keeps AppKit's live drag size and does not republish a
-        // height — and rebuild this whole tree — on every pointer event.
-        .frame(width: chrome.width, height: popoverScale == 1 ? nil : chrome.height)
-        .frame(maxHeight: popoverScale == 1 ? .infinity : nil)
-        .modifier(PopoverScaleModifier(baseWidth: chrome.width, baseHeight: chrome.height,
-            scale: popoverScale))
+        // AppKit owns the live drag size. Filling the hosting view avoids
+        // publishing a new environment-object height — and rebuilding this
+        // entire view tree — for every pointer event.
+        //
+        // The scale factor cannot come from `chrome.height` here: a live drag
+        // resizes the AppKit window through `onResize` WITHOUT publishing
+        // `rawHeight` (see PopoverChrome.setHeight's `live` branch), so a
+        // content height derived from the model lags the window for the whole
+        // drag and leaves the backdrop showing under the footer. Scale against
+        // the host's real height instead, which is correct at every frame of
+        // the drag and at rest.
+        .frame(width: chrome.width)
+        .frame(maxHeight: .infinity)
+        .modifier(PopoverScaleModifier(baseWidth: chrome.width, scale: popoverScale))
         // Container-level tooltip invalidation: a tab switch swaps every card
         // under the cursor, and a payload refresh can change the data a shown
         // panel was built from while the cursor sits still (no hover event
