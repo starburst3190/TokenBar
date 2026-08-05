@@ -3121,7 +3121,7 @@ async fn request_claude_refresh(
 async fn refresh_claude_credentials_with<R, Reload, Request, RequestFuture, Save, Checkpoint>(
     original: &ClaudeCredentials,
     refresh: &R,
-    reload: Reload,
+    mut reload: Reload,
     request: Request,
     save: Save,
     mut checkpoint: Checkpoint,
@@ -3135,7 +3135,7 @@ async fn refresh_claude_credentials_with<R, Reload, Request, RequestFuture, Save
 >
 where
     R: RefreshScopeTransaction + ?Sized,
-    Reload: FnOnce(&ClaudeCredentials) -> Result<ClaudeCredentials, String>,
+    Reload: FnMut(&ClaudeCredentials) -> Result<ClaudeCredentials, String>,
     Request: FnOnce(String, ProviderCacheBinding) -> RequestFuture,
     RequestFuture:
         std::future::Future<Output = Result<ClaudeRefreshResponse, ProviderFetchFailure>>,
@@ -3172,7 +3172,39 @@ where
         })?
         .to_string();
     let old_marker = refresh_token.as_bytes().to_vec();
-    let token_response = request(refresh_token, pre_binding).await?;
+    let token_response = match request(refresh_token, pre_binding.clone()).await {
+        Ok(response) => response,
+        Err(failure) => {
+            // A hard rejection says the refresh token was already dead when we
+            // sent it — nearly always because the Claude CLI rotated it in the
+            // window between our reload and our request. Read the store once
+            // more before blaming the user's login: a live credential sitting
+            // there now IS that rotation, and adopting it is the whole fix. A
+            // still-expired store means the login really is gone, and the
+            // original terminal failure stands.
+            if !matches!(failure, ProviderFetchFailure::Terminal { .. }) {
+                return Err(failure);
+            }
+            let Some(adopted) = reload(original)
+                .ok()
+                .filter(|candidate| !claude_credentials_expired(candidate))
+            else {
+                return Err(failure);
+            };
+            let Some(marker) = adopted.scope_marker() else {
+                return Err(failure);
+            };
+            let Ok(scope) = refresh.resolve_current(
+                adopted.scope_slot.semantic_source,
+                &adopted.scope_slot.canonical_location,
+                marker,
+            ) else {
+                return Err(failure);
+            };
+            let binding = ProviderCacheBinding::primary(scope.clone());
+            return Ok((adopted, scope, Some(binding)));
+        }
+    };
     checkpoint(RefreshCheckpoint::NetworkReturned)?;
     let access_token = token_response.access_token.trim();
     if access_token.is_empty() {
@@ -3278,7 +3310,19 @@ fn save_claude_credentials_to_file(
 ) -> Result<(), String> {
     let current_raw = fs::read_to_string(path)
         .map_err(|e| format!("read current Claude credentials file: {e}"))?;
-    let data = merge_claude_credentials_json(credentials, &current_raw)?;
+    let data = match merge_claude_credentials_json(credentials, &current_raw) {
+        Ok(data) => data,
+        Err(error) if error == CLAUDE_STALE_WRITE_BACK => {
+            match resolve_claude_write_back_conflict(credentials, &current_raw)? {
+                // Nothing was persisted, so the refusal still stands as an
+                // error — the caller uses it to skip binding its cache to a
+                // credential the store does not hold.
+                ClaudeWriteBackPlan::KeepStored => return Err(error),
+                ClaudeWriteBackPlan::Overwrite(data) => data,
+            }
+        }
+        Err(error) => return Err(error),
+    };
     atomic_write(path, &data)
 }
 
@@ -3370,11 +3414,25 @@ fn merge_claude_credentials_json(
         .and_then(Value::as_object)
         .ok_or_else(|| "Current Claude credentials have no claudeAiOauth object.".to_string())?;
     if current_oauth != expected_oauth {
-        return Err(
-            "Claude credentials changed during refresh; refusing stale write-back.".to_string(),
-        );
+        return Err(CLAUDE_STALE_WRITE_BACK.to_string());
     }
 
+    apply_claude_rotated_tokens(credentials, &mut current_root)?;
+    serde_json::to_string(&current_root).map_err(|e| format!("encode Claude credentials: {}", e))
+}
+
+/// The one error from the write-back guard that is recoverable rather than
+/// fatal: the store moved under us. Compared by value at the save layer, so it
+/// stays distinct from the account-mismatch refusal next to it.
+const CLAUDE_STALE_WRITE_BACK: &str =
+    "Claude credentials changed during refresh; refusing stale write-back.";
+
+/// Stamp the rotated tokens onto an already-decoded credentials root, leaving
+/// every sibling the Claude CLI wrote untouched.
+fn apply_claude_rotated_tokens(
+    credentials: &ClaudeCredentials,
+    current_root: &mut Value,
+) -> Result<(), String> {
     let oauth = current_root
         .get_mut("claudeAiOauth")
         .and_then(Value::as_object_mut)
@@ -3392,7 +3450,57 @@ fn merge_claude_credentials_json(
             Value::Number(expires_at.timestamp_millis().into()),
         );
     }
-    serde_json::to_string(&current_root).map_err(|e| format!("encode Claude credentials: {}", e))
+    Ok(())
+}
+
+/// How to finish a write-back whose guard refused because the store changed.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeWriteBackPlan {
+    /// The store holds a credential we never consumed; it is not ours to touch.
+    KeepStored,
+    /// The store still holds the refresh token our rotation invalidated.
+    Overwrite(String),
+}
+
+/// Decide what a refused write-back should actually do.
+///
+/// Walking away is only safe when the store holds a credential that still
+/// works. The refresh we just completed *consumed* one specific refresh token —
+/// the server invalidated it the instant it issued ours — so abandoning a store
+/// that still holds exactly that token strands the sole live credential in this
+/// process. Every later poll then reloads the dead one, re-presents it, and is
+/// told to re-authenticate, until the Claude CLI happens to rotate the store
+/// itself. That is a burnt credential, not a stale write.
+///
+/// The test is token identity, never expiry. `expiresAt` describes the *access*
+/// token, and a refresh token routinely outlives it, so "expired" would not have
+/// meant "unusable" — a restored backup or a forward clock jump could have
+/// presented a perfectly good foreign credential as garbage to overwrite. We
+/// overwrite one thing only: the token we personally killed.
+fn resolve_claude_write_back_conflict(
+    credentials: &ClaudeCredentials,
+    current_raw: &str,
+) -> Result<ClaudeWriteBackPlan, String> {
+    // `raw_root` is the store as it looked when this refresh reloaded it, so it
+    // carries the refresh token we went on to present and invalidate.
+    let presented = credentials
+        .raw_root
+        .as_ref()
+        .and_then(|root| root.get("claudeAiOauth"))
+        .and_then(|oauth| oauth.get("refreshToken"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let stored = parse_claude_credentials_data(current_raw, credentials.source)?;
+    if presented.is_none() || stored.refresh_token.as_deref() != presented {
+        return Ok(ClaudeWriteBackPlan::KeepStored);
+    }
+    let mut current_root: Value = serde_json::from_str(current_raw)
+        .map_err(|e| format!("decode current Claude credentials: {e}"))?;
+    apply_claude_rotated_tokens(credentials, &mut current_root)?;
+    let data = serde_json::to_string(&current_root)
+        .map_err(|e| format!("encode Claude credentials: {}", e))?;
+    Ok(ClaudeWriteBackPlan::Overwrite(data))
 }
 
 fn prepare_claude_keychain_write<'a>(
@@ -3420,8 +3528,23 @@ fn save_claude_credentials_to_keychain(credentials: &ClaudeCredentials) -> Resul
     let current_raw = load_claude_credentials_from_keychain_item(Some(captured_account))?
         .ok_or_else(|| "Claude Keychain credentials disappeared during refresh.".to_string())?;
     let current_account = claude_keychain_account();
-    let (account, data) =
-        prepare_claude_keychain_write(credentials, current_account.as_deref(), &current_raw)?;
+    let (account, data) = match prepare_claude_keychain_write(
+        credentials,
+        current_account.as_deref(),
+        &current_raw,
+    ) {
+        Ok(pair) => pair,
+        // Only the store-moved refusal is recoverable. The account guard in
+        // that same function stays fatal: a different account is a different
+        // identity, never something to overwrite.
+        Err(error) if error == CLAUDE_STALE_WRITE_BACK => {
+            match resolve_claude_write_back_conflict(credentials, &current_raw)? {
+                ClaudeWriteBackPlan::KeepStored => return Err(error),
+                ClaudeWriteBackPlan::Overwrite(data) => (captured_account, data),
+            }
+        }
+        Err(error) => return Err(error),
+    };
 
     // NOTE: security(1) has no compare-and-swap operation. The exact-item read,
     // account guard, and target comparison close the network-wait race and the
@@ -8615,6 +8738,29 @@ mod tests {
         .await
     }
 
+    fn claude_store_json(access: &str, refresh: &str, expires_at_millis: i64) -> String {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": refresh,
+                "expiresAt": expires_at_millis
+            }
+        })
+        .to_string()
+    }
+
+    /// A credential in the state a completed refresh leaves it: live tokens we
+    /// hold, whose `raw_root` still describes the store we read before rotating.
+    fn claude_rotated_credentials(refresh_token: &str) -> ClaudeCredentials {
+        let raw = claude_store_json("pre-rotation-access", "pre-rotation-refresh", 0);
+        let mut credentials =
+            parse_claude_credentials_data(&raw, ClaudeCredentialSource::File).unwrap();
+        credentials.access_token = "ours-access".to_string();
+        credentials.refresh_token = Some(refresh_token.to_string());
+        credentials.expires_at = Some(Utc::now() + chrono::Duration::seconds(3_600));
+        credentials
+    }
+
     fn stored_claude_refresh_token(path: &Path) -> Option<String> {
         parse_claude_credentials_data(
             &fs::read_to_string(path).unwrap(),
@@ -8678,6 +8824,208 @@ mod tests {
         assert_eq!(cache_binding, None);
         assert!(save_failed.get());
         assert_eq!(fs::read(&path).unwrap(), B_BYTES);
+        scope.cleanup();
+    }
+
+    /// This pair is deliberately redundant: the two fixtures differ only in
+    /// `expiresAt`, and both must reach `KeepStored`. That is the point —
+    /// liveness is not an input to the decision, and these lock in that it
+    /// cannot become one again.
+    #[test]
+    fn claude_write_back_conflict_keeps_a_foreign_credential_that_is_live() {
+        let ours = claude_rotated_credentials("ours-refresh");
+        let live_store = claude_store_json(
+            "someone-else-access",
+            "someone-else-refresh",
+            4_102_444_800_000,
+        );
+
+        let plan = resolve_claude_write_back_conflict(&ours, &live_store).unwrap();
+
+        assert_eq!(plan, ClaudeWriteBackPlan::KeepStored);
+    }
+
+    /// A refresh token outlives the access token it sits beside, so a restored
+    /// backup — or a forward clock jump — can put a perfectly good foreign
+    /// credential in front of us wearing a past `expiresAt`. We never presented
+    /// its token, so it is not ours to destroy.
+    #[test]
+    fn claude_write_back_conflict_keeps_a_foreign_credential_that_looks_expired() {
+        let ours = claude_rotated_credentials("ours-refresh");
+        let foreign_but_recoverable = claude_store_json("stale-access", "stale-refresh", 0);
+
+        let plan = resolve_claude_write_back_conflict(&ours, &foreign_but_recoverable).unwrap();
+
+        assert_eq!(plan, ClaudeWriteBackPlan::KeepStored);
+    }
+
+    #[test]
+    fn claude_write_back_conflict_overwrites_the_token_our_rotation_killed() {
+        let ours = claude_rotated_credentials("ours-refresh");
+        // The store still carries the refresh token this refresh presented, so
+        // the server has already invalidated it. Only our copy still works.
+        let burnt_store = claude_store_json("cli-touched-access", "pre-rotation-refresh", 0);
+
+        let plan = resolve_claude_write_back_conflict(&ours, &burnt_store).unwrap();
+
+        let ClaudeWriteBackPlan::Overwrite(data) = plan else {
+            panic!("the token we invalidated must not be left in the store");
+        };
+        let written = parse_claude_credentials_data(&data, ClaudeCredentialSource::File).unwrap();
+        assert_eq!(written.refresh_token.as_deref(), Some("ours-refresh"));
+        assert_eq!(written.access_token, "ours-access");
+    }
+
+    /// The burn: a concurrent write lands while we refresh, and the store it
+    /// leaves behind is already expired. Refusing the write here would strand
+    /// the only live refresh token in this process and leave every later poll
+    /// re-presenting a token the server has already invalidated.
+    #[tokio::test]
+    async fn claude_file_refresh_rescues_a_dead_store_instead_of_burning_the_token() {
+        // The CLI rewrites the oauth object (tripping the guard) but leaves the
+        // refresh token this refresh already presented — so the store is holding
+        // a token the server killed the moment it issued ours.
+        const DEAD_CONCURRENT_WRITE: &str = r#"{
+            "claudeAiOauth": {
+                "accessToken": "claude-cli-touched-access",
+                "refreshToken": "claude-old-refresh",
+                "expiresAt": 0
+            },
+            "sibling": {"writer": "claude-cli", "revision": 2}
+        }"#;
+        let (scope, path, original, _, _, _) =
+            setup_claude_refresh("claude-file-dead-store-rescue");
+        let reload_path = path.clone();
+        let request_path = path.clone();
+        let save_path = path.clone();
+
+        let (refreshed, _, cache_binding) = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            move |refresh_token, _attempt_binding| async move {
+                assert_eq!(refresh_token, "claude-old-refresh");
+                fs::write(&request_path, DEAD_CONCURRENT_WRITE).unwrap();
+                Ok(ClaudeRefreshResponse {
+                    access_token: "claude-new-access".to_string(),
+                    refresh_token: Some("claude-new-refresh".to_string()),
+                    expires_in: 3_600,
+                })
+            },
+            move |credentials| save_claude_credentials_to_file(credentials, &save_path),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed.access_token, "claude-new-access");
+        // The live token reached the shared store, so the next poll reads a
+        // credential that still works rather than the invalidated one.
+        assert_eq!(
+            stored_claude_refresh_token(&path).as_deref(),
+            Some("claude-new-refresh")
+        );
+        assert!(
+            cache_binding.is_some(),
+            "a persisted rotation binds its cache"
+        );
+        // The concurrent writer's unrelated sibling still survives.
+        let root: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["sibling"]["writer"], "claude-cli");
+        scope.cleanup();
+    }
+
+    /// The race that produced the visible "Run `claude` to re-authenticate":
+    /// the CLI rotated the token between our reload and our request, so the
+    /// token endpoint rejected what we sent. The store is fine; adopt it.
+    #[tokio::test]
+    async fn claude_refresh_adopts_a_rotated_store_after_a_hard_rejection() {
+        let (scope, path, original, _, _, _) = setup_claude_refresh("claude-adopt-after-reject");
+        let reload_path = path.clone();
+        let request_path = path.clone();
+        let rotated = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "cli-rotated-access",
+                "refreshToken": "cli-rotated-refresh",
+                "expiresAt": 4_102_444_800_000i64
+            }
+        })
+        .to_string();
+
+        let (adopted, _, cache_binding) = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            move |_refresh_token, _attempt_binding| async move {
+                // The CLI's rotation lands while our request is in flight, and
+                // the server rejects the token we presented.
+                fs::write(&request_path, &rotated).unwrap();
+                Err(ProviderFetchFailure::terminal(
+                    "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
+                ))
+            },
+            |_| panic!("adoption must not write back"),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(adopted.access_token, "cli-rotated-access");
+        assert_eq!(
+            adopted.refresh_token.as_deref(),
+            Some("cli-rotated-refresh")
+        );
+        assert!(cache_binding.is_some());
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn claude_refresh_keeps_the_terminal_failure_when_the_store_is_still_dead() {
+        let (scope, path, original, _, _, _) = setup_claude_refresh("claude-reject-still-dead");
+        let reload_path = path.clone();
+
+        let failure = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            move |_refresh_token, _attempt_binding| async move {
+                Err(ProviderFetchFailure::terminal(
+                    "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
+                ))
+            },
+            |_| panic!("a rejected refresh must not write back"),
+            checkpoint_at(None),
+        )
+        .await
+        .expect_err("a dead store leaves the login genuinely broken");
+
+        // Nothing rotated the store, so the user really does need to re-auth.
+        assert!(matches!(
+            failure,
+            ProviderFetchFailure::Terminal { ref display }
+                if display.contains("re-authenticate")
+        ));
         scope.cleanup();
     }
 
