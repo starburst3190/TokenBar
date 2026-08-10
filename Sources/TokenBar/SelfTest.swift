@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import SwiftUI
 import TokenBarCore
@@ -22,7 +23,35 @@ private actor ControlledTurnUsageDataSource: UsageDataSource {
     private let hourlyResponses: [Set<String>: HourlyReport]
     private var blockedGraphYears: Set<String> = []
     private var blockedHourlyYears: Set<String> = []
-    private var pendingGraphs: [String: [CheckedContinuation<UsagePayload, Never>]] = [:]
+    /// Model-report call log. LP2B's claim is about *when* the model is
+    /// requested relative to the graph, so the count alone is not enough —
+    /// `modelCallsWhileGraphPending` records requests that arrived while a
+    /// graph was still blocked, which is exactly the contention being removed.
+    private var modelCalls = 0
+    private var modelCallsWhileGraphPending = 0
+    private var blockedModel = false
+    /// Fail the next model request once, then behave normally — the shape of a
+    /// transient FFI error, which is the case that must self-heal.
+    private var failModelOnce = false
+    /// Same shape for the graph: a transient failure leaves whatever payload
+    /// was already restored on screen, which is the state a model request must
+    /// not mistake for a committed one.
+    private var failGraphOnce = false
+    private var pendingModel: [CheckedContinuation<ModelReport, Never>] = []
+    private var pendingModelYears: [String?] = []
+    /// When set, each graph response advances the fixture's "today" so
+    /// `meta.generatedAt` actually moves between loads. Without this the demo
+    /// payload is byte-identical across a refresh, the model identity gate
+    /// always matches, and any test about per-generation refetching would pass
+    /// no matter what the production code does.
+    private var advancingGraphDays: Int?
+    /// Freezes the advance without disabling it: `graph()` keeps replaying the
+    /// CURRENT fixture day instead of moving to the next one. Needed so a
+    /// LP3 restore-gate fixture can call `load()` (a real fetch, satisfying
+    /// the gate) without that fetch itself moving the generation the test is
+    /// trying to hold fixed — see `lagRestored` below.
+    private var advancePaused = false
+    private var pendingGraphs: [String: [CheckedContinuation<UsagePayload, Error>]] = [:]
     private var pendingHourly: [String: [PendingHourly]] = [:]
 
     init(hourlyResponses: [Set<String>: HourlyReport] = [:]) {
@@ -50,6 +79,46 @@ private actor ControlledTurnUsageDataSource: UsageDataSource {
         continuations.forEach { $0.resume(returning: payload) }
     }
 
+    func pendingGraphCount(year: String?) -> Int {
+        (pendingGraphs[Self.key(year)] ?? []).count
+    }
+
+    /// Release exactly ONE parked graph fetch, chosen by park order, with a
+    /// fixture day that makes its payload distinguishable. `releaseGraph`
+    /// resumes every parked fetch with the same payload, so it cannot express
+    /// "the later fetch commits first and the earlier one lands after".
+    func releaseGraph(year: String?, index: Int, day: Int) {
+        let key = Self.key(year)
+        guard var parked = pendingGraphs[key], parked.indices.contains(index) else { return }
+        let continuation = parked.remove(at: index)
+        pendingGraphs[key] = parked
+        if parked.isEmpty { blockedGraphYears.remove(key) }
+        continuation.resume(returning: DemoData.payload(for: year, today: Self.fixtureDay(day)))
+    }
+
+    /// Fail exactly ONE parked graph fetch, chosen by park order, leaving the
+    /// rest parked — the failure analog of `releaseGraph(year:index:day:)`,
+    /// needed to fail specifically the OLDER of two overlapping fetches while
+    /// a newer one stays in flight.
+    func failGraph(year: String?, index: Int) {
+        let key = Self.key(year)
+        guard var parked = pendingGraphs[key], parked.indices.contains(index) else { return }
+        let continuation = parked.remove(at: index)
+        pendingGraphs[key] = parked
+        if parked.isEmpty { blockedGraphYears.remove(key) }
+        continuation.resume(throwing: CancellationError())
+    }
+
+    /// Release a parked graph fetch as a FAILURE. Needed to land a stale
+    /// fetch's error after a newer one has already committed, which no
+    /// one-shot `failNextGraph` can order.
+    func failPendingGraph(year: String?) {
+        let key = Self.key(year)
+        blockedGraphYears.remove(key)
+        let continuations = pendingGraphs.removeValue(forKey: key) ?? []
+        continuations.forEach { $0.resume(throwing: CancellationError()) }
+    }
+
     func releaseHourly(year: String?) {
         let key = Self.key(year)
         blockedHourlyYears.remove(key)
@@ -61,14 +130,54 @@ private actor ControlledTurnUsageDataSource: UsageDataSource {
         }
     }
 
+    /// Returned verbatim for the NEXT `graph()` call regardless of the year
+    /// requested — simulates the real scenario `apply()`'s empty-year branch
+    /// exists for (the selected year's logs were deleted/moved mid-session),
+    /// which `DemoData.payload(for:)` cannot reproduce on its own since it
+    /// always manufactures data for whatever year it is asked for.
+    private var forcedPayloadOnce: UsagePayload?
+    func forceNextGraphPayload(_ payload: UsagePayload) { forcedPayloadOnce = payload }
+
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
         _ = priority
+        if failGraphOnce {
+            failGraphOnce = false
+            throw CancellationError()
+        }
+        if let forced = forcedPayloadOnce {
+            forcedPayloadOnce = nil
+            return forced
+        }
         let key = Self.key(year)
         if blockedGraphYears.contains(key) {
-            return await withCheckedContinuation { pendingGraphs[key, default: []].append($0) }
+            return try await withCheckedThrowingContinuation {
+                pendingGraphs[key, default: []].append($0)
+            }
+        }
+        if let day = advancingGraphDays {
+            if !advancePaused { advancingGraphDays = day + 1 }
+            return DemoData.payload(for: year, today: Self.fixtureDay(day))
         }
         return DemoData.payload(for: year)
     }
+
+    /// Freezes the advance AND rewinds it one step, so the next `graph()`
+    /// call (and every one after it, while paused) replays the exact fixture
+    /// day the MOST RECENT call already returned, rather than the day that
+    /// call's own advance had already moved on to.
+    func pauseGraphAdvance() {
+        advancePaused = true
+        if let day = advancingGraphDays, day > 0 { advancingGraphDays = day - 1 }
+    }
+    func resumeGraphAdvance() { advancePaused = false }
+
+    /// Deterministic fixture dates far from any real "today" so the advancing
+    /// sequence cannot collide with the default fixture.
+    private static func fixtureDay(_ offset: Int) -> String {
+        String(format: "2037-06-%02d", 10 + offset)
+    }
+
+    func advanceGraphGenerationPerCall() { advancingGraphDays = 0 }
 
     func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
         try await graph(year: year, priority: priority)
@@ -76,7 +185,46 @@ private actor ControlledTurnUsageDataSource: UsageDataSource {
 
     func modelReport(year: String?, priority: TaskPriority) async throws -> ModelReport {
         _ = priority
+        modelCalls += 1
+        if !pendingGraphs.values.allSatisfy(\.isEmpty) || !blockedGraphYears.isEmpty {
+            modelCallsWhileGraphPending += 1
+        }
+        if failModelOnce {
+            failModelOnce = false
+            throw CancellationError()
+        }
+        if blockedModel {
+            pendingModelYears.append(year)
+            return await withCheckedContinuation { pendingModel.append($0) }
+        }
         return DemoData.modelReport(for: year)
+    }
+
+    func modelCallCount() -> Int { modelCalls }
+    func modelCallsRacingGraph() -> Int { modelCallsWhileGraphPending }
+    func blockModel() { blockedModel = true }
+    func failNextModel() { failModelOnce = true }
+    func failNextGraph() { failGraphOnce = true }
+    func pendingModelCount() -> Int { pendingModel.count }
+
+    /// Retire the oldest parked model request while leaving the rest parked —
+    /// needed to reproduce a stale scan completing underneath a live one.
+    func releaseOneModel() {
+        guard !pendingModel.isEmpty else { return }
+        let continuation = pendingModel.removeFirst()
+        let year = pendingModelYears.removeFirst()
+        continuation.resume(returning: DemoData.modelReport(for: year))
+    }
+
+    func releaseModel() {
+        blockedModel = false
+        let waiting = pendingModel
+        let years = pendingModelYears
+        pendingModel = []
+        pendingModelYears = []
+        for (index, continuation) in waiting.enumerated() {
+            continuation.resume(returning: DemoData.modelReport(for: years[index]))
+        }
     }
 
     func hourlyReport(
@@ -110,14 +258,324 @@ private actor ControlledTurnUsageDataSource: UsageDataSource {
     func tokensPerMin() async throws -> Double { DemoData.tokensPerMin }
 }
 
+/// Wait for a condition another task has to establish.
+///
+/// Bounded by a deadline rather than by an iteration count. A fixed number of
+/// yields measures scheduler turns, not elapsed time, so how long it actually
+/// waits depends on how much other work shares the cooperative pool — which
+/// made the tests that use it fail intermittently as unrelated cases were added
+/// ahead of them. The failure was always a false negative: the condition would
+/// have held, the wait just gave up first.
+///
+/// The deadline is generous because the cost of raising it is only paid when a
+/// test is genuinely about to fail, while the cost of setting it too low is a
+/// flake that looks like a product defect.
 private func waitUntil(
+    timeout: Duration = .seconds(5),
     _ predicate: @escaping @Sendable () async -> Bool
 ) async -> Bool {
-    for _ in 0..<1_000 {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
         if await predicate() { return true }
         await Task.yield()
     }
-    return false
+    return await predicate()
+}
+
+private enum DashboardModelTestError: Error {
+    case graphUnavailable
+}
+
+private struct DashboardModelTestSource: UsageDataSource {
+    let failingGraphYear: String
+    let allowsQuotaCachePersistence = false
+
+    func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        _ = priority
+        if year == failingGraphYear { throw DashboardModelTestError.graphUnavailable }
+        return DemoData.payload(for: year)
+    }
+
+    func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        try await graph(year: year, priority: priority)
+    }
+
+    func modelReport(year: String?, priority: TaskPriority) async throws -> ModelReport {
+        _ = priority
+        let marker = year ?? "all"
+        let tokens = year == "2024" ? 24 : year == "2023" ? 23 : 1
+        let json = """
+        {"entries":[{"client":"claude","model":"loaded-MARKER","provider":"test",
+         "input":TOKENS,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+         "total":TOKENS,"messageCount":1,"cost":1.0,"msPer1kTokens":null}],
+         "totalInput":TOKENS,"totalOutput":0,"totalCacheRead":0,"totalCacheWrite":0,
+         "totalMessages":1,"totalCost":1.0}
+        """
+        .replacingOccurrences(of: "MARKER", with: marker)
+        .replacingOccurrences(of: "TOKENS", with: String(tokens))
+        return try JSONDecoder().decode(ModelReport.self, from: Data(json.utf8))
+    }
+
+    func hourlyReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> HourlyReport {
+        _ = priority
+        return DemoData.hourlyReport(for: year, clients: clients)
+    }
+
+    func agentsReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> AgentsReport {
+        _ = priority
+        return DemoData.agentsReport(for: year, clients: clients)
+    }
+
+    func agentUsage() async throws -> AgentUsagePayload { DemoData.agentUsage }
+
+    func usageTrace(windowSecs: Int64) async throws -> [TraceBucket] {
+        DemoData.trace(windowSecs: windowSecs)
+    }
+
+    func tokensPerMin() async throws -> Double { DemoData.tokensPerMin }
+}
+
+private final class AttributedSeriesTestSource: UsageDataSource, @unchecked Sendable {
+    let graphPayload: UsagePayload
+    let refreshPayload: UsagePayload
+    let allowsQuotaCachePersistence = false
+    var graphYears: [String?] = []
+    var refreshYears: [String?] = []
+
+    init(graphPayload: UsagePayload, refreshPayload: UsagePayload) {
+        self.graphPayload = graphPayload
+        self.refreshPayload = refreshPayload
+    }
+
+    func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        _ = priority
+        graphYears.append(year)
+        return graphPayload
+    }
+
+    func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        _ = priority
+        refreshYears.append(year)
+        return refreshPayload
+    }
+
+    func modelReport(year: String?, priority: TaskPriority) async throws -> ModelReport {
+        _ = priority
+        return DemoData.modelReport(for: year)
+    }
+
+    func hourlyReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> HourlyReport {
+        _ = priority
+        return DemoData.hourlyReport(for: year, clients: clients)
+    }
+
+    func agentsReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> AgentsReport {
+        _ = priority
+        return DemoData.agentsReport(for: year, clients: clients)
+    }
+
+    func agentUsage() async throws -> AgentUsagePayload { DemoData.agentUsage }
+
+    func usageTrace(windowSecs: Int64) async throws -> [TraceBucket] {
+        DemoData.trace(windowSecs: windowSecs)
+    }
+
+    func tokensPerMin() async throws -> Double { DemoData.tokensPerMin }
+}
+
+/// Runs a hook while an acquisition is suspended, so a self-test can make the
+/// world change underneath an in-flight load.
+private final class AttributedSeriesHookSource: UsageDataSource, @unchecked Sendable {
+    let payload: UsagePayload
+    let allowsQuotaCachePersistence = false
+    var onAcquire: (@MainActor @Sendable () -> Void)?
+    var graphCalls = 0
+    var refreshCalls = 0
+
+    init(payload: UsagePayload) { self.payload = payload }
+
+    private func serve() async -> UsagePayload {
+        if let onAcquire { await MainActor.run { onAcquire() } }
+        return payload
+    }
+
+    func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        _ = (year, priority)
+        graphCalls += 1
+        return await serve()
+    }
+
+    func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        _ = (year, priority)
+        refreshCalls += 1
+        return await serve()
+    }
+
+    func modelReport(year: String?, priority: TaskPriority) async throws -> ModelReport {
+        _ = priority
+        return DemoData.modelReport(for: year)
+    }
+
+    func hourlyReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> HourlyReport {
+        _ = priority
+        return DemoData.hourlyReport(for: year, clients: clients)
+    }
+
+    func agentsReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> AgentsReport {
+        _ = priority
+        return DemoData.agentsReport(for: year, clients: clients)
+    }
+
+    func agentUsage() async throws -> AgentUsagePayload { DemoData.agentUsage }
+
+    func usageTrace(windowSecs: Int64) async throws -> [TraceBucket] {
+        DemoData.trace(windowSecs: windowSecs)
+    }
+
+    func tokensPerMin() async throws -> Double { DemoData.tokensPerMin }
+}
+
+/// Runs a complete nested load while an outer acquisition is suspended, which
+/// is the actor-reentrancy shape made deterministic: the inner load publishes
+/// first and the outer one then resumes holding an older payload.
+private final class AttributedSeriesReentrantSource: UsageDataSource, @unchecked Sendable {
+    struct Failure: Error {}
+
+    let outerPayload: UsagePayload
+    let innerPayload: UsagePayload
+    let allowsQuotaCachePersistence = false
+    /// Runs only while the first acquisition is suspended.
+    var onFirstAcquire: (@MainActor @Sendable () async -> Void)?
+    var failOuter = false
+    var calls = 0
+
+    init(outerPayload: UsagePayload, innerPayload: UsagePayload) {
+        self.outerPayload = outerPayload
+        self.innerPayload = innerPayload
+    }
+
+    private func serve() async throws -> UsagePayload {
+        calls += 1
+        guard calls == 1 else { return innerPayload }
+        if let onFirstAcquire { await onFirstAcquire() }
+        if failOuter { throw Failure() }
+        return outerPayload
+    }
+
+    func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        _ = (year, priority)
+        return try await serve()
+    }
+
+    func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        _ = (year, priority)
+        return try await serve()
+    }
+
+    func modelReport(year: String?, priority: TaskPriority) async throws -> ModelReport {
+        _ = priority
+        return DemoData.modelReport(for: year)
+    }
+
+    func hourlyReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> HourlyReport {
+        _ = priority
+        return DemoData.hourlyReport(for: year, clients: clients)
+    }
+
+    func agentsReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> AgentsReport {
+        _ = priority
+        return DemoData.agentsReport(for: year, clients: clients)
+    }
+
+    func agentUsage() async throws -> AgentUsagePayload { DemoData.agentUsage }
+
+    func usageTrace(windowSecs: Int64) async throws -> [TraceBucket] {
+        DemoData.trace(windowSecs: windowSecs)
+    }
+
+    func tokensPerMin() async throws -> Double { DemoData.tokensPerMin }
+}
+
+/// Serves one payload until `failing` is set, then throws from both acquisition
+/// paths — the transient-dependency-failure case. `onAcquire` runs while the
+/// acquisition is suspended, so a test can make the world change under a load
+/// that is about to fail.
+private final class AttributedSeriesFailingSource: UsageDataSource, @unchecked Sendable {
+    struct Failure: Error {}
+
+    let graphPayload: UsagePayload
+    let allowsQuotaCachePersistence = false
+    var failing = false
+    var onAcquire: (@MainActor @Sendable () -> Void)?
+
+    init(graphPayload: UsagePayload) { self.graphPayload = graphPayload }
+
+    private func serve() async throws -> UsagePayload {
+        if let onAcquire { await MainActor.run { onAcquire() } }
+        if failing { throw Failure() }
+        return graphPayload
+    }
+
+    func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        _ = (year, priority)
+        return try await serve()
+    }
+
+    func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        _ = (year, priority)
+        return try await serve()
+    }
+
+    func modelReport(year: String?, priority: TaskPriority) async throws -> ModelReport {
+        _ = priority
+        return DemoData.modelReport(for: year)
+    }
+
+    func hourlyReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> HourlyReport {
+        _ = priority
+        return DemoData.hourlyReport(for: year, clients: clients)
+    }
+
+    func agentsReport(
+        year: String?, clients: [String]?, priority: TaskPriority
+    ) async throws -> AgentsReport {
+        _ = priority
+        return DemoData.agentsReport(for: year, clients: clients)
+    }
+
+    func agentUsage() async throws -> AgentUsagePayload { DemoData.agentUsage }
+
+    func usageTrace(windowSecs: Int64) async throws -> [TraceBucket] {
+        DemoData.trace(windowSecs: windowSecs)
+    }
+
+    func tokensPerMin() async throws -> Double { DemoData.tokensPerMin }
+}
+
+private struct DashboardModelTestObservation: Sendable {
+    let selectedYear: String?
+    let loadedYear: String?
+    let loadedModel: String?
+    let loadedTokens: Int64?
+    let cardRangeLabel: String
 }
 
 enum SelfTest {
@@ -272,6 +730,1812 @@ enum SelfTest {
         expect(ModelColors.shadeFromBase("#da7756", rank: 0) == "#da7756", "shade rank 0 is base")
         // rank 1 factor 0.11: 59→81 (0x51), 130→144 (0x90), 246→247 (0xf7)
         expect(ModelColors.shadeFromBase("#3b82f6", rank: 1) == "#5190f7", "shade rank 1 lerp")
+
+        let providerSplitReportJSON = """
+        {"entries":[
+          {"client":"claude","model":"shared-model","provider":"openai",
+           "input":100,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+           "total":100,"messageCount":1,"cost":6.0,"msPer1kTokens":2.0},
+          {"client":"claude","model":"shared-model","provider":"nvidia",
+           "input":200,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+           "total":200,"messageCount":1,"cost":5.0,"msPer1kTokens":3.0},
+          {"client":"claude","model":"runner-up","provider":"openai",
+           "input":150,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+           "total":150,"messageCount":1,"cost":9.0,"msPer1kTokens":1.0}
+        ],"totalInput":450,"totalOutput":0,"totalCacheRead":0,"totalCacheWrite":0,
+        "totalMessages":3,"totalCost":20.0}
+        """
+        let providerSplitReport = try! JSONDecoder().decode(
+            ModelReport.self, from: Data(providerSplitReportJSON.utf8))
+        let modelLevelEntries = providerSplitReport.modelLevelEntries
+        let favoriteModel = modelLevelEntries.max { $0.cost < $1.cost }
+        expect(
+            favoriteModel?.model == "shared-model" && favoriteModel?.cost == 11.0,
+            "provider-split favorite uses combined model cost")
+        let modelCardRows = modelLevelEntries.filter { $0.client == "claude" }
+        expect(
+            modelCardRows.count == 2 && modelCardRows.filter { $0.model == "shared-model" }.count == 1,
+            "provider-split model count treats one model as one row")
+        expect(
+            modelLevelEntries.first { $0.model == "shared-model" }?.provider == "nvidia, openai",
+            "provider-split model fold preserves merged providers")
+        expect(
+            modelLevelEntries.first { $0.model == "shared-model" }?.msPer1kTokens == nil,
+            "provider-split model fold omits unrecomputable throughput")
+
+        // Usage attribution: declarations are explicit, provider-level by
+        // default, and model overrides are more specific. Suggestions never
+        // participate in effective-state resolution.
+        func attributionEntry(
+            client: String, provider: String, model: String,
+            total: Int64 = 1, cost: Double = 0.0
+        ) -> ModelReportEntry {
+            let json = """
+            {"client":"\(client)","model":"\(model)","provider":"\(provider)",
+             "input":1,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+             "total":\(total),"messageCount":1,"cost":\(cost),"msPer1kTokens":null}
+            """
+            return try! JSONDecoder().decode(
+                ModelReportEntry.self, from: Data(json.utf8))
+        }
+
+        func contributionJSON(
+            date: String,
+            clients: [(String, String, String, Int64, Double)],
+            totalsTokens: Int64,
+            totalsCost: Double
+        ) -> String {
+            let clientJSON = clients.map { client in
+                """
+                {"client":"\(client.0)","modelId":"\(client.1)","providerId":"\(client.2)","tokens":{"input":\(client.3),"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},"cost":\(client.4),"messages":1}
+                """
+            }.joined(separator: ",")
+            return """
+            {"date":"\(date)","totals":{"tokens":\(totalsTokens),"cost":\(totalsCost),"messages":\(clients.count)},"intensity":0,"tokenBreakdown":{"input":\(totalsTokens),"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},"clients":[\(clientJSON)]}
+            """
+        }
+
+        func contributionFixture(_ json: String) -> Contribution {
+            try! JSONDecoder().decode(Contribution.self, from: Data(json.utf8))
+        }
+
+        func payloadFixture(_ contributionJSON: [String]) -> UsagePayload {
+            let json = """
+            {"meta":{"generatedAt":"now","version":"selftest","dateRange":{"start":"2023-12-31","end":"2024-12-31"}},"summary":{"totalTokens":0,"totalCost":0.0,"totalDays":0,"activeDays":0,"averagePerDay":0.0,"maxCostInSingleDay":0.0,"clients":[],"models":[]},"years":[],"contributions":[\(contributionJSON.joined(separator: ","))]}
+            """
+            return try! JSONDecoder().decode(UsagePayload.self, from: Data(json.utf8))
+        }
+
+        let claudeOpenAIEntry = attributionEntry(
+            client: "claude", provider: "openai", model: "gpt-5.6-sol")
+        expect(
+            UsageAttribution.resolve(
+                client: "claude", provider: "openai", model: "gpt-5.6-sol", records: [])
+                == .unassigned,
+            "empty attribution table resolves unassigned")
+
+        let providerDeclaration = UsageAttribution.Record(
+            client: "claude", provider: "openai", state: .excluded)
+        let modelDeclaration = UsageAttribution.Record(
+            client: "claude", provider: "openai", model: "gpt-5.6-sol",
+            state: .assigned("codex"))
+        expect(
+            UsageAttribution.resolve(claudeOpenAIEntry, records: [providerDeclaration, modelDeclaration])
+                == .assigned("codex"),
+            "model attribution override wins over provider declaration")
+
+        let crossAssignment = UsageAttribution.Record(
+            client: "claude", provider: "openai", state: .assigned("codex"))
+        let crossAssignmentRaw = UsageAttribution.confirmedRaw(
+            updating: nil, record: crossAssignment)
+        expect(
+            crossAssignmentRaw
+                == "[{\"client\":\"claude\",\"model\":null,\"provider\":\"openai\",\"state\":\"assigned\",\"target\":\"codex\"}]"
+                && UsageAttribution.parseRaw(crossAssignmentRaw).records.first?.state
+                    == .assigned("codex"),
+            "cross-client attribution round-trips its target")
+
+        let emptyProviderDeclaration = UsageAttribution.Record(
+            client: "opencode", provider: "", state: .assigned("codex"))
+        let namedProviderDeclaration = UsageAttribution.Record(
+            client: "opencode", provider: "nvidia", state: .excluded)
+        let emptyProviderEntry = attributionEntry(
+            client: "opencode", provider: "", model: "deepseek-v4-pro")
+        let namedProviderEntry = attributionEntry(
+            client: "opencode", provider: "nvidia", model: "deepseek-v4-pro")
+        func applyConfirmed(_ records: [UsageAttribution.Record]) -> String? {
+            records.reduce(String?.none) { raw, record in
+                UsageAttribution.confirmedRaw(updating: raw, record: record)
+            }
+        }
+        let emptyProviderRaw = applyConfirmed([namedProviderDeclaration, emptyProviderDeclaration])
+        expect(
+            UsageAttribution.resolve(emptyProviderEntry, records: [namedProviderDeclaration, emptyProviderDeclaration])
+                == .assigned("codex")
+                && UsageAttribution.resolve(namedProviderEntry, records: [namedProviderDeclaration, emptyProviderDeclaration])
+                    == .excluded
+                && emptyProviderRaw
+                    == "[{\"client\":\"opencode\",\"model\":null,\"provider\":\"\",\"state\":\"assigned\",\"target\":\"codex\"},{\"client\":\"opencode\",\"model\":null,\"provider\":\"nvidia\",\"state\":\"excluded\"}]",
+            "empty provider is a distinct usable source key")
+
+        let providerRows = UsageAttributionSettings.rows(
+            entries: [
+                attributionEntry(
+                    client: "claude", provider: "openai", model: "shared-model",
+                    total: 100, cost: 6.0),
+                attributionEntry(
+                    client: "claude", provider: "nvidia", model: "shared-model",
+                    total: 200, cost: 5.0),
+                attributionEntry(
+                    client: "claude", provider: "openai", model: "other-model",
+                    total: 50, cost: 1.0),
+            ],
+            confirmed: [],
+            suggestions: [])
+        expect(
+                providerRows.count == 2
+                && providerRows.map(\.provider) == ["openai", "nvidia"]
+                && providerRows.map(\.tokens) == [150, 200]
+                && providerRows.map(\.cost) == [7.0, 5.0],
+            "attribution rows retain two providers for one model")
+
+        // Stats attribution consumes raw provider rows. Keep bucket totals
+        // lossless so a mixed model cannot hide a source classification.
+        let breakdownEntries = [
+            attributionEntry(
+                client: "claude", provider: "anthropic", model: "claude-model",
+                total: 100, cost: 1.0),
+            attributionEntry(
+                client: "claude", provider: "openai", model: "gpt-model",
+                total: 200, cost: 2.0),
+            attributionEntry(
+                client: "claude", provider: "nvidia", model: "deepseek-model",
+                total: 300, cost: 3.0),
+        ]
+        let breakdownRecords = [
+            UsageAttribution.Record(
+                client: "claude", provider: "anthropic", state: .assigned("claude")),
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", state: .excluded),
+        ]
+        let oneEachBreakdown = UsageAttributionBreakdown.rows(
+            entries: breakdownEntries, clientIds: ["claude"], confirmed: breakdownRecords)
+        expect(
+            oneEachBreakdown.map(\.state) == [
+                UsageAttribution.State.assigned("claude"), .excluded, .unassigned,
+            ]
+                && oneEachBreakdown.map(\.tokens) == [100, 200, 300]
+                && oneEachBreakdown.map(\.cost) == [1.0, 2.0, 3.0],
+            "attribution breakdown reports assigned, excluded, and unassigned buckets")
+
+        // Unpriced/local usage still carries tokens. Keep every bucket's
+        // non-zero guard load-bearing so zero-cost rows cannot vanish.
+        let zeroCostBreakdown = UsageAttributionBreakdown.rows(
+            entries: [
+                attributionEntry(
+                    client: "claude", provider: "anthropic", model: "zero-assigned",
+                    total: 11, cost: 0.0),
+                attributionEntry(
+                    client: "claude", provider: "openai", model: "zero-excluded",
+                    total: 22, cost: 0.0),
+                attributionEntry(
+                    client: "claude", provider: "local", model: "zero-unassigned",
+                    total: 33, cost: 0.0),
+            ],
+            clientIds: ["claude"],
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "claude", provider: "anthropic", state: .assigned("claude")),
+                UsageAttribution.Record(
+                    client: "claude", provider: "openai", state: .excluded),
+            ])
+        expect(
+            zeroCostBreakdown.map(\.state) == [
+                UsageAttribution.State.assigned("claude"), .excluded, .unassigned,
+            ]
+                && zeroCostBreakdown.map(\.tokens) == [11, 22, 33]
+                && zeroCostBreakdown.map(\.cost) == [0.0, 0.0, 0.0],
+            "zero-cost tokens remain visible in every attribution bucket")
+
+        let mergedBreakdown = UsageAttributionBreakdown.rows(
+            entries: [
+                attributionEntry(
+                    client: "claude", provider: "openai", model: "one",
+                    total: 10, cost: 1.0),
+                attributionEntry(
+                    client: "claude", provider: "anthropic", model: "two",
+                    total: 20, cost: 2.0),
+                attributionEntry(
+                    client: "claude", provider: "nvidia", model: "three",
+                    total: 30, cost: 3.0),
+            ],
+            clientIds: ["claude"],
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "claude", provider: "openai", state: .assigned("codex")),
+                UsageAttribution.Record(
+                    client: "claude", provider: "anthropic", state: .assigned("codex")),
+                UsageAttribution.Record(
+                    client: "claude", provider: "nvidia", state: .assigned("claude")),
+            ])
+        expect(
+            mergedBreakdown.map(\.state) == [
+                UsageAttribution.State.assigned("claude"), .assigned("codex"),
+            ]
+                && mergedBreakdown.map(\.tokens) == [30, 30]
+                && mergedBreakdown.map(\.cost) == [3.0, 3.0],
+            "attribution breakdown merges same targets and keeps targets separate")
+
+        expect(
+            oneEachBreakdown.reduce(Int64.zero) { $0 + $1.tokens } == 600
+                && oneEachBreakdown.reduce(0.0) { $0 + $1.cost } == 6.0,
+            "attribution breakdown preserves pinned unfiltered totals")
+
+        let overrideBreakdown = UsageAttributionBreakdown.rows(
+            entries: [claudeOpenAIEntry],
+            clientIds: ["claude"],
+            confirmed: [providerDeclaration, modelDeclaration])
+        expect(
+            overrideBreakdown.count == 1
+                && overrideBreakdown[0].state == .assigned("codex")
+                && overrideBreakdown[0].tokens == 1
+                && overrideBreakdown[0].cost == 0.0,
+            "attribution breakdown delegates model override resolution")
+
+        let suggestionOnlyRecords = UsageAttributionSettings.suggestionRecords(
+            entries: [
+                attributionEntry(
+                    client: "claude", provider: "anthropic", model: "claude-model",
+                    total: 40, cost: 4.0),
+            ],
+            confirmed: [],
+            subscriptionClients: ["claude"])
+        let suggestionOnlyBreakdown = UsageAttributionBreakdown.rows(
+            entries: [
+                attributionEntry(
+                    client: "claude", provider: "anthropic", model: "claude-model",
+                    total: 40, cost: 4.0),
+            ],
+            clientIds: ["claude"],
+            confirmed: [])
+        expect(
+            suggestionOnlyRecords.count == 1
+                && suggestionOnlyBreakdown.count == 1
+                && suggestionOnlyBreakdown[0].state == .unassigned
+                && suggestionOnlyBreakdown[0].tokens == 40
+                && suggestionOnlyBreakdown[0].cost == 4.0,
+            "suggestion-only attribution remains unassigned")
+
+        let emptyBreakdown = UsageAttributionBreakdown.rows(
+            entries: [
+                attributionEntry(
+                    client: "claude", provider: "openai", model: "one",
+                    total: 10, cost: 1.0),
+                attributionEntry(
+                    client: "claude", provider: "nvidia", model: "two",
+                    total: 20, cost: 2.0),
+            ],
+            clientIds: ["claude"],
+            confirmed: [])
+        expect(
+            emptyBreakdown.count == 1
+                && emptyBreakdown[0].state == .unassigned
+                && emptyBreakdown[0].tokens == 30
+                && emptyBreakdown[0].cost == 3.0,
+            "empty attribution table puts all usage in unassigned")
+
+        let selectedOnlyBreakdown = UsageAttributionBreakdown.rows(
+            entries: [
+                attributionEntry(
+                    client: "claude", provider: "openai", model: "selected-assigned",
+                    total: 10, cost: 1.0),
+                attributionEntry(
+                    client: "claude", provider: "anthropic", model: "selected-excluded",
+                    total: 20, cost: 2.0),
+                attributionEntry(
+                    client: "claude", provider: "nvidia", model: "selected-unassigned",
+                    total: 30, cost: 3.0),
+                attributionEntry(
+                    client: "codex", provider: "openai", model: "hidden-assigned",
+                    total: 100, cost: 10.0),
+                attributionEntry(
+                    client: "codex", provider: "anthropic", model: "hidden-excluded",
+                    total: 200, cost: 20.0),
+                attributionEntry(
+                    client: "codex", provider: "nvidia", model: "hidden-unassigned",
+                    total: 300, cost: 30.0),
+            ],
+            clientIds: ["claude"],
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "claude", provider: "openai", state: .assigned("codex")),
+                UsageAttribution.Record(
+                    client: "claude", provider: "anthropic", state: .excluded),
+                UsageAttribution.Record(
+                    client: "codex", provider: "openai", state: .assigned("codex")),
+                UsageAttribution.Record(
+                    client: "codex", provider: "anthropic", state: .excluded),
+            ])
+        expect(
+            selectedOnlyBreakdown.map(\.state) == [
+                UsageAttribution.State.assigned("codex"), .excluded, .unassigned,
+            ]
+                && selectedOnlyBreakdown.map(\.tokens) == [10, 20, 30]
+                && selectedOnlyBreakdown.map(\.cost) == [1.0, 2.0, 3.0],
+            "attribution breakdown filters every bucket by selected clients")
+
+        let emptyProviderRow = UsageAttributionSettings.rows(
+            entries: [attributionEntry(
+                client: "opencode", provider: "", model: "shared-model", total: 7, cost: 1.5)],
+            confirmed: [],
+            suggestions: []).first
+        expect(
+            emptyProviderRow?.provider.isEmpty == true
+                && emptyProviderRow?.providerLabel == "Unspecified provider",
+            "empty provider row has a readable label")
+
+        let attributionTargets = UsageAttributionSettings.subscriptionClients(
+            from: DemoData.agentUsage)
+        let claudeProviderRow = providerRows.first { $0.client == "claude" }
+        expect(
+            claudeProviderRow?.client == "claude" && attributionTargets.contains("codex"),
+            "claude source rows can target a different subscription client")
+
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "copilot", provider: "openai",
+                subscriptionClients: attributionTargets) == .assigned("copilot"),
+            "copilot openai usage suggests copilot")
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "copilot", provider: "anthropic",
+                subscriptionClients: attributionTargets) == .assigned("copilot"),
+            "copilot anthropic usage suggests copilot")
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "claude", provider: "anthropic",
+                subscriptionClients: attributionTargets) == .assigned("claude"),
+            "claude anthropic usage suggests claude")
+        // The case the whole feature exists for: a gateway routes Claude Code to
+        // an OpenAI model, so the row says claude/openai while the subscription
+        // consumed is Codex. Asking source-first would leave exactly these rows
+        // unsuggested, which is most of the usage on a gateway user's machine.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "claude", provider: "openai",
+                subscriptionClients: ["claude", "codex"]) == .assigned("codex"),
+            "gateway-routed openai usage suggests the codex subscription")
+        // opencode is a router with no plan of its own, so with nothing declared
+        // about what it is signed into, nothing can be said. This used to answer
+        // `.excluded` — an assertion that the tokens were bought — which the
+        // 2026-08 survey showed there was never evidence for.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "opencode", provider: "anthropic",
+                subscriptionClients: ["claude", "codex"]) == nil,
+            "an undeclared router produces no suggestion")
+        // Declare what it is signed into and the answer follows from that, not
+        // from any policy about who may reach anthropic from where: the user
+        // authed to Copilot here deliberately.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "opencode", provider: "anthropic",
+                subscriptionClients: ["claude", "copilot"],
+                routedSubscriptions: ["opencode": ["copilot"]]) == .assigned("copilot"),
+            "a declared router spends the subscription it is signed into")
+        // Two of its subscriptions cover the provider, so which one paid is not
+        // decidable from here.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "opencode", provider: "anthropic",
+                subscriptionClients: ["claude", "copilot"],
+                routedSubscriptions: ["opencode": ["claude", "copilot"]]) == nil,
+            "a router signed into two covering subscriptions produces no suggestion")
+        // copilot accepts openai too, so with both subscribed nothing here can
+        // tell which one paid. Suggesting either would be a coin flip presented
+        // as an inference.
+        // claude does not sell an openai plan, so this falls to the cross-agent
+        // path where codex and copilot both cover it — undecidable from here.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "claude", provider: "openai",
+                subscriptionClients: ["claude", "codex", "copilot"]) == nil,
+            "two subscriptions covering one provider produce no suggestion")
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "claude", provider: "openai",
+                subscriptionClients: ["claude"]) == nil,
+            "no subscription covering the provider produces no suggestion")
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "copilot", provider: "openai",
+                subscriptionClients: ["codex", "copilot"]) == .assigned("copilot"),
+            "an owning source client wins over another subscription that also covers it")
+        // xAI signs third-party agents in with the subscription itself, and
+        // that usage draws on the same weekly pool, so it really is the
+        // subscription being spent.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "claude", provider: "xai",
+                subscriptionClients: ["claude", "grok"]) == .assigned("grok"),
+            "xai reached from another client is spending the grok subscription")
+        // Cursor bundles a jointly-trained Grok, so an xai row it logged is its
+        // own plan — the survey's clearest example of a reseller relationship
+        // that the old provider-keyed model could not express.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "cursor", provider: "xai",
+                subscriptionClients: ["grok"]) == .assigned("cursor"),
+            "cursor's bundled grok is cursor's own spend")
+        // The two policies contradict each other, so no provider may appear in
+        // both — otherwise which one wins depends on the order of the branches.
+        expect(
+            UsageAttributionSettings.crossAgentSubscriptionProviders
+                .isDisjoint(with: UsageAttributionSettings.subscriptionBoundProviders),
+            "a provider cannot be both safe and unsafe to assign across agents")
+        // Every provider a subscription can serve needs a decided policy. This
+        // is what stops a new entry in the map from silently inheriting the
+        // permissive branch: adding one without choosing a side fails here.
+        let policedProviders = UsageAttributionSettings.crossAgentSubscriptionProviders
+            .union(UsageAttributionSettings.subscriptionBoundProviders)
+        let servedProviders = Set(
+            UsageAttributionSettings.subscriptionProviderMap.values.flatMap { $0 })
+        expect(
+            servedProviders.isSubset(of: policedProviders),
+            "every provider a subscription serves has a checked cross-agent policy")
+
+        let codexOnlyPayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self,
+            from: Data(#"{"generatedAt":"now","agents":[{"clientId":"codex","source":"fixture","updatedAt":"now","identity":{"plan":"Plus"},"windows":[]}]}"#.utf8))
+        let codexOnlySubscriptions = UsageAttributionSettings.subscriptionClients(
+            from: codexOnlyPayload)
+        let terminalAndLastGoodPayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self,
+            from: Data(#"{"generatedAt":"now","agents":[{"clientId":"codex","source":"fixture","updatedAt":"now","windows":[],"error":"not configured"},{"clientId":"claude","source":"fixture","updatedAt":"now","windows":[],"error":"not configured"},{"clientId":"copilot","source":"fixture","updatedAt":"now","identity":{"plan":"Pro"},"windows":[],"error":"temporarily unavailable"}]}"#.utf8))
+        expect(
+            UsageAttributionSettings.subscriptionClients(from: terminalAndLastGoodPayload)
+                == ["copilot"],
+            "terminal empty provider cards are not subscription candidates, but last-good cards remain")
+
+        // A subscription reached only through opencode has no snapshot of its
+        // own — just the empty placeholder the filter above removes — so without
+        // folding the labels back in, exactly the rows that consume it cannot
+        // name it. This is the case the placeholder filter regressed.
+        let opencodeOnlyPayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self,
+            from: Data(#"{"generatedAt":"now","agents":[{"clientId":"codex","source":"fixture","updatedAt":"now","windows":[],"error":"not configured"}],"opencodeSubscriptions":["Codex","Gemini"]}"#.utf8))
+        expect(
+            UsageAttributionSettings.subscriptionClients(from: opencodeOnlyPayload)
+                == ["codex", "antigravity"],
+            "an opencode-only subscription is still an assignment target")
+        // Both statements naming the same client must not produce it twice.
+        let opencodeDuplicatePayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self,
+            from: Data(#"{"generatedAt":"now","agents":[{"clientId":"codex","source":"fixture","updatedAt":"now","identity":{"plan":"Plus"},"windows":[]}],"opencodeSubscriptions":["Codex"]}"#.utf8))
+        expect(
+            UsageAttributionSettings.subscriptionClients(from: opencodeDuplicatePayload) == ["codex"],
+            "a subscription reported by both sources appears once")
+
+        // The structural guard, not another hand-kept row. Rust's
+        // `subscription_label` renames four providers and capitalizes the rest,
+        // so every provider a subscription serves must be reachable from its
+        // capitalized label. `xai` was not — a Grok subscription reached only
+        // through opencode could not be named — and only a check derived from
+        // the map itself fails when the next provider is added.
+        // opencode emits a label only for a vendor the user actually authed to,
+        // so the set it can produce is the vendors that sell first-party access
+        // — not every vendor some subscription carries. `microsoft`, `amazon`,
+        // `open-weights` and `own` are sold only inside someone else's bundle
+        // and can never appear as an oauth entry. The assertion is therefore
+        // that every first-party vendor resolves, and that resolution names
+        // that vendor's own client rather than a reseller that also carries it.
+        let firstPartyVendors = UsageAttributionSettings.providerOwnClient
+        let unresolvableVendors = firstPartyVendors.filter { vendor, expected in
+            let label = vendor.prefix(1).uppercased() + vendor.dropFirst()
+            return UsageAttributionSettings.subscriptionClient(forLabel: label) != expected
+        }
+        expect(
+            unresolvableVendors.isEmpty,
+            "every first-party vendor resolves from its opencode label to its own client (broken: \(unresolvableVendors.keys.sorted()))")
+        // The four the producer renames rather than capitalizes.
+        expect(
+            ClientRegistry.subscriptionLabelAliases.allSatisfy { label, id in
+                UsageAttributionSettings.subscriptionClient(forLabel: label) == id
+                    && ClientRegistry.allIds.contains(id)
+            },
+            "every renamed opencode label resolves to a registered client")
+        expect(
+            UsageAttributionSettings.subscriptionClient(forLabel: "Xai") == "grok",
+            "an opencode xai subscription names the grok client")
+        // opencode's provider keys carry the plan: `minimax-coding-plan` becomes
+        // the label `Minimax-coding-plan`, which no vendor lookup matches. These
+        // vendors sell per-plan keys, so the qualifier is trimmed rather than
+        // each plan enumerated.
+        expect(
+            UsageAttributionSettings.subscriptionClient(forLabel: "Minimax-coding-plan") == "micode"
+                && UsageAttributionSettings.subscriptionClient(forLabel: "Kimi-for-coding") == "kimi",
+            "a plan-qualified opencode label resolves to its vendor's client")
+        // Trimming must not turn an unknown vendor into a known one.
+        expect(
+            UsageAttributionSettings.subscriptionClient(forLabel: "Crush-plan") == nil,
+            "trimming a qualifier does not invent a subscription")
+
+        // Routing is a second input to every suggestion, and it can change while
+        // the resolved target list does not: a Codex snapshot contributes
+        // `codex` whether or not opencode also holds an OpenAI oauth entry.
+        let routingEntries = [attributionEntry(
+            client: "opencode", provider: "openai", model: "gpt-5.6-sol", total: 1, cost: 0.1)]
+        expect(
+            UsageAttributionSettings.signature(
+                entries: routingEntries, subscriptionClients: ["codex"],
+                routedSubscriptions: [:])
+                != UsageAttributionSettings.signature(
+                    entries: routingEntries, subscriptionClients: ["codex"],
+                    routedSubscriptions: ["opencode": ["codex"]]),
+            "routing state changes the refresh signature even when targets do not")
+        // A label that lowercases to a registered client which sells no plan
+        // must still name nothing — returning it would put an unresolvable
+        // target in the picker. `Kiro` no longer serves as the example: the
+        // corrected table says Kiro does sell one, so the case moved to a client
+        // that genuinely does not.
+        expect(
+            UsageAttributionSettings.subscriptionClient(forLabel: "Crush") == nil
+                && ClientRegistry.allIds.contains("crush")
+                && UsageAttributionSettings.subscriptionProviderMap["crush"] == nil,
+            "an opencode label naming no subscription is not a target")
+
+        // These three previously encoded the reseller rule as a property of the
+        // *provider*: anthropic reached from anywhere else was assigned to
+        // whichever non-Claude subscription covered it. The survey showed the
+        // premise is wrong — an opencode row is paid by whatever opencode is
+        // signed into, and that is declared, not inferred from who else carries
+        // anthropic. Undeclared, the honest answer is nothing.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "opencode", provider: "anthropic",
+                subscriptionClients: ["copilot"]) == nil,
+            "an undeclared router is not assigned to whoever happens to cover the provider")
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "opencode", provider: "anthropic",
+                subscriptionClients: ["copilot"],
+                routedSubscriptions: ["opencode": ["copilot"]]) == .assigned("copilot"),
+            "the same row is assigned once the routing is declared")
+        // Anthropic's own subscription is still never a cross-agent target: a
+        // client that sells no anthropic plan and routes nowhere gets excluded.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "zed", provider: "xai",
+                subscriptionClients: ["grok"]) == .assigned("grok"),
+            "a surveyed client that does not sell the provider still uses the cross-agent path")
+        // Every provider a subscription serves must name the client whose own
+        // subscription it is, or the eligibility filter above silently keeps a
+        // bound owner assignable.
+        // Only a bound provider needs an own client — that entry names who the
+        // restriction protects. Requiring one for permitted providers would be
+        // inventing a fact; requiring one for bound providers is what stops the
+        // eligibility filter from silently leaving a bound owner assignable.
+        let unownedBound = UsageAttributionSettings.subscriptionBoundProviders
+            .filter { UsageAttributionSettings.providerOwnClient[$0] == nil }
+        expect(
+            unownedBound.isEmpty,
+            "every bound provider names the client it protects (missing: \(unownedBound.sorted()))")
+        let ownClientsAreRegistered = UsageAttributionSettings.providerOwnClient.values
+            .allSatisfy { ClientRegistry.allIds.contains($0) }
+        expect(ownClientsAreRegistered, "every protected client is registered")
+
+        // The table is hand-maintained product knowledge, so every client in it
+        // must be a client this app knows — a typo would otherwise sit there
+        // covering nothing.
+        let unknownSubscriptionClients = UsageAttributionSettings.subscriptionProviderMap.keys
+            .filter { !ClientRegistry.allIds.contains($0) }
+        expect(
+            unknownSubscriptionClients.isEmpty,
+            "every subscription client is registered (unknown: \(unknownSubscriptionClients.sorted()))")
+
+        // The case the whole survey was run for. Cursor sells its own plan
+        // covering Anthropic models, and TokenBar has no Cursor quota gauge — so
+        // a rule that asks `subscriptionClients` cannot see it, and the row gets
+        // proposed against whatever else happens to cover anthropic.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "cursor", provider: "anthropic",
+                subscriptionClients: ["claude", "copilot"]) == .assigned("cursor"),
+            "a client's own subscription wins even without a quota snapshot")
+        // And the same row must not be offered to a subscription that merely
+        // also covers anthropic.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "cursor", provider: "anthropic",
+                subscriptionClients: ["copilot"]) != .assigned("copilot"),
+            "a foreign subscription is never proposed for a client that has its own")
+        // A source the table says nothing about yields nothing. `crush` is
+        // registered but no plan has been established for it, and that is not
+        // the same claim as "its plan does not cover anthropic".
+        expect(
+            UsageAttributionSettings.subscriptionProviderMap["crush"] == nil
+                && UsageAttributionSettings.suggestionTarget(
+                    sourceClient: "crush", provider: "anthropic",
+                    subscriptionClients: ["claude", "copilot"]) == nil,
+            "an unsurveyed source produces no suggestion rather than a guess")
+
+        // "No subscriptions" and "not asked yet" both render an empty target
+        // list, so without the lifecycle token the signature is unchanged when a
+        // payload arrives carrying zero candidates — the refresh never reruns
+        // and stale proposals stop being suppressed without being reconciled.
+        let signatureEntries = [attributionEntry(
+            client: "claude", provider: "openai", model: "gpt-5.6-sol", total: 1, cost: 0.1)]
+        expect(
+            UsageAttributionSettings.signature(
+                entries: signatureEntries, subscriptionClients: [], targetsKnown: false)
+                != UsageAttributionSettings.signature(
+                    entries: signatureEntries, subscriptionClients: [], targetsKnown: true),
+            "an empty target list is distinguishable from an unknown one")
+
+        // A stored proposal names a target, and until the quota payload says
+        // which subscriptions exist there is nothing to check it against.
+        let staleSuggestionRows = UsageAttributionSettings.rows(
+            entries: [attributionEntry(
+                client: "claude", provider: "openai", model: "gpt-5.6-sol", total: 5, cost: 0.5)],
+            confirmed: [],
+            suggestions: [])
+        expect(
+            staleSuggestionRows.count == 1 && staleSuggestionRows[0].suggestedState == nil
+                && UsageAttributionSettings.acceptanceRecords(rows: staleSuggestionRows).isEmpty,
+            "suppressed suggestions offer nothing to accept")
+
+        expect(
+            [
+                UsageAttributionSettings.pageState(hasReport: false, rowCount: 0, isLoading: true),
+                UsageAttributionSettings.pageState(hasReport: false, rowCount: 0, isLoading: false),
+                UsageAttributionSettings.pageState(hasReport: true, rowCount: 0, isLoading: false),
+                UsageAttributionSettings.pageState(hasReport: true, rowCount: 2, isLoading: false),
+            ] == [.loading, .unavailable, .empty, .rows],
+            "the attribution page separates a failed report from one with no rows")
+        expect(
+            UsageAttributionSettings.Copy.all.contains(UsageAttributionSettings.Copy.unavailable)
+                && UsageAttributionSettings.Copy.unavailable
+                    != UsageAttributionSettings.Copy.noRows,
+            "the attribution page has distinct copy for an unavailable report")
+
+        // `antigravity-cli` is its own client but spends the `antigravity`
+        // subscription, exactly as the quota views already fold it. Comparing
+        // the raw id finds no owner and falls through to the subscription-bound
+        // branch, which would call the CLI's own subscription usage API spend.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "antigravity-cli", provider: "google",
+                subscriptionClients: ["antigravity"]) == .assigned("antigravity"),
+            "antigravity-cli usage suggests the antigravity subscription it spends")
+        // The fold decides ownership only. A router with nothing declared says
+        // nothing, and a surveyed client that genuinely sells no google plan
+        // still gets the bound-provider answer.
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "opencode", provider: "google",
+                subscriptionClients: ["antigravity"]) == nil,
+            "an undeclared router reaching google produces no suggestion")
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "kimi", provider: "google",
+                subscriptionClients: ["antigravity"]) == .excluded,
+            "a surveyed client that sells no google plan is API spend")
+        let missingSourceSuggestions = UsageAttributionSettings.suggestionRecords(
+            entries: [
+                attributionEntry(client: "copilot", provider: "openai", model: "gpt-5.6-sol"),
+                attributionEntry(client: "copilot", provider: "anthropic", model: "claude-sonnet-4-6"),
+            ],
+            confirmed: [],
+            subscriptionClients: codexOnlySubscriptions)
+        // Copilot sells both, so both rows are its own spend regardless of what
+        // the quota payload lists. Before the survey this table claimed Copilot
+        // covered only openai and anthropic, and the anthropic row came back as
+        // API spend — the same shape of error as the Cursor row that started
+        // this: a subscription the user holds, unrecognised.
+        expect(
+            missingSourceSuggestions.map(\.state)
+                == [UsageAttribution.State.assigned("copilot"), .assigned("copilot")]
+                && missingSourceSuggestions.map(\.provider) == ["openai", "anthropic"],
+            "a client that sells both providers keeps both rows as its own spend")
+
+        let suggestionRows = UsageAttributionSettings.rows(
+            entries: [
+                attributionEntry(
+                    client: "copilot", provider: "openai", model: "gpt-5.6-sol",
+                    total: 10, cost: 1.0),
+                attributionEntry(
+                    client: "claude", provider: "openai", model: "gpt-5.6-sol",
+                    total: 20, cost: 2.0),
+            ],
+            confirmed: [],
+            suggestions: UsageAttributionSettings.suggestionRecords(
+                entries: [
+                    attributionEntry(client: "copilot", provider: "openai", model: "gpt-5.6-sol"),
+                    attributionEntry(client: "claude", provider: "openai", model: "gpt-5.6-sol"),
+                ],
+                confirmed: [],
+                subscriptionClients: attributionTargets))
+        let acceptedAttributionRecords = UsageAttributionSettings.acceptanceRecords(
+            rows: suggestionRows)
+        let acceptedAttributionRaw = UsageAttribution.confirmedRaw(
+            updating: nil, records: acceptedAttributionRecords)
+        let acceptedAttributionTable = UsageAttribution.parseRaw(acceptedAttributionRaw)
+        expect(
+            acceptedAttributionRecords.count == 1
+                && UsageAttribution.resolve(
+                    client: "copilot", provider: "openai", model: nil,
+                    records: acceptedAttributionTable.records) == .assigned("copilot")
+                && UsageAttribution.resolve(
+                    client: "claude", provider: "openai", model: nil,
+                    records: acceptedAttributionTable.records) == .unassigned,
+            "accept all assigns only suggested rows")
+
+        let staleSuggestion = UsageAttribution.Record(
+            client: "claude", provider: "stale-provider", state: .excluded)
+        let currentSuggestion = UsageAttribution.Record(
+            client: "claude", provider: "openai", state: .assigned("codex"))
+        let staleSuggestionRaw = UsageAttribution.suggestionsRaw(
+            updating: nil, records: [staleSuggestion, currentSuggestion])
+        let reconciledSuggestionRaw = UsageAttribution.suggestionsRaw(
+            replacing: staleSuggestionRaw, with: [currentSuggestion])
+        expect(
+            UsageAttribution.parseRaw(reconciledSuggestionRaw).records == [currentSuggestion],
+            "suggestion reconciliation drops sources absent from the current report")
+
+        let nearLimitRecords = (0..<(UsageAttribution.maxEntries - 1)).map {
+            UsageAttribution.Record(
+                client: "opencode", provider: "provider-\($0)", state: .excluded)
+        }
+        let nearLimitRaw = UsageAttribution.confirmedRaw(
+            updating: nil, records: nearLimitRecords)
+        let overflowingBatch = [
+            UsageAttribution.Record(client: "claude", provider: "new-a", state: .excluded),
+            UsageAttribution.Record(client: "claude", provider: "new-b", state: .excluded),
+        ]
+        let rejectedBatchRaw = UsageAttribution.confirmedRaw(
+            updating: nearLimitRaw, records: overflowingBatch)
+        expect(
+            UsageAttribution.parseRaw(nearLimitRaw).records.count
+                == UsageAttribution.maxEntries - 1
+                && rejectedBatchRaw == nil
+                && UsageAttributionSettings.writeFailure(
+                    table: UsageAttribution.parseRaw(nearLimitRaw),
+                    records: overflowingBatch,
+                    result: rejectedBatchRaw) == .entryLimit,
+            "accept-all batch validates the complete result before any write")
+
+        let refusedAttributionWrite = UsageAttributionSettings.writeFailure(
+            table: UsageAttribution.parseRaw("not-json"),
+            record: crossAssignment,
+            result: nil)
+        expect(
+            refusedAttributionWrite != nil
+                && refusedAttributionWrite?.message.contains("Could not save") == true,
+            "refused attribution writes are reported as failures")
+        expect(
+            (UsageAttributionSettings.Copy.all + UsageAttributionBreakdown.Copy.all).allSatisfy {
+                let copy = $0.lowercased()
+                return !copy.contains("consumed") && !copy.contains("deducted")
+            },
+            "attribution screen copy does not claim consumption or deduction")
+
+        let savedCardRaw = UserDefaults.standard.object(forKey: UsageAttribution.confirmedKey)
+        let cardRaw = UsageAttribution.confirmedRaw(updating: nil, record: crossAssignment)
+        UserDefaults.standard.set(cardRaw, forKey: UsageAttribution.confirmedKey)
+        let cardState = awaitMainActorValue { () -> UsageAttribution.State? in
+            let card = UsageAttributionBreakdownCard(
+                report: nil, clientIds: [], singleClient: nil)
+            return UsageAttribution.resolve(
+                client: "claude", provider: "openai", model: nil, records: card.confirmed)
+        }
+        // Reading the right value is not the defect. A computed read of
+        // UserDefaults returns the same records; what it does not create is a
+        // dependency SwiftUI can invalidate on, so a mounted card kept showing
+        // the previous split after Settings wrote. Only a stored @AppStorage
+        // creates it, so assert the storage itself is present.
+        let cardObservesStore = awaitMainActorValue { () -> Bool in
+            let card = UsageAttributionBreakdownCard(
+                report: nil, clientIds: [], singleClient: nil)
+            return Mirror(reflecting: card).children.contains {
+                String(describing: type(of: $0.value)).hasPrefix("AppStorage<")
+            }
+        }
+        if let savedCardRaw {
+            UserDefaults.standard.set(savedCardRaw, forKey: UsageAttribution.confirmedKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: UsageAttribution.confirmedKey)
+        }
+        expect(
+            cardState == .some(.assigned("codex")) && cardObservesStore == true,
+            "attribution card derives confirmed records from an observed stored value")
+
+        // A nil report is two different states. `load()` fetches the report with
+        // `try?` and still reaches `.ready` on the graph alone, so treating nil
+        // as in-flight leaves the card spinning forever once the report keeps
+        // failing. The flag is what separates them, and the copy differs from
+        // `noUsage`, which is an answer about a report that did arrive.
+        expect(
+            UsageAttributionBreakdown.Copy.all.contains(
+                UsageAttributionBreakdown.Copy.unavailable)
+                && UsageAttributionBreakdown.Copy.unavailable
+                    != UsageAttributionBreakdown.Copy.noUsage,
+            "the breakdown card has distinct copy for an unavailable report")
+        // Assert the branch the body actually takes, not just that the flag can
+        // be set — a card that stored the flag and ignored it would satisfy the
+        // weaker check while still spinning forever.
+        let cardStates = awaitMainActorValue { () -> [UsageAttributionBreakdownCard.ContentState] in
+            [
+                UsageAttributionBreakdownCard.contentState(
+                    rowCount: nil, reportLoading: true),
+                UsageAttributionBreakdownCard.contentState(
+                    rowCount: nil, reportLoading: false),
+                UsageAttributionBreakdownCard.contentState(
+                    rowCount: 0, reportLoading: false),
+                UsageAttributionBreakdownCard.contentState(
+                    rowCount: 3, reportLoading: false),
+            ]
+        }
+        expect(
+            cardStates ?? [] == [.loading, .unavailable, .empty, .rows],
+            "the breakdown card separates an in-flight report from a finished one with none")
+
+        let canonicalRecords = [
+            UsageAttribution.Record(
+                client: "opencode", provider: "nvidia", model: "deepseek-v4-pro",
+                state: .assigned("codex")),
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", state: .assigned("codex")),
+            UsageAttribution.Record(
+                client: "opencode", provider: "nvidia", state: .excluded),
+        ]
+        let canonicalExpected = "[{\"client\":\"claude\",\"model\":null,\"provider\":\"openai\",\"state\":\"assigned\",\"target\":\"codex\"},{\"client\":\"opencode\",\"model\":null,\"provider\":\"nvidia\",\"state\":\"excluded\"},{\"client\":\"opencode\",\"model\":\"deepseek-v4-pro\",\"provider\":\"nvidia\",\"state\":\"assigned\",\"target\":\"codex\"}]"
+        let canonicalForward = applyConfirmed(canonicalRecords)
+        let canonicalReverse = applyConfirmed(Array(canonicalRecords.reversed()))
+        let excludedEntry = attributionEntry(
+            client: "opencode", provider: "nvidia", model: "other-model")
+        let unassignedEntry = attributionEntry(
+            client: "gemini", provider: "openai", model: "other-model")
+        let canonicalTable = UsageAttribution.parseRaw(canonicalForward)
+        expect(
+            canonicalForward == canonicalExpected && canonicalReverse == canonicalExpected
+                && UsageAttribution.resolve(claudeOpenAIEntry, records: canonicalTable.records)
+                    == .assigned("codex")
+                && UsageAttribution.resolve(excludedEntry, records: canonicalTable.records)
+                    == .excluded
+                && UsageAttribution.resolve(unassignedEntry, records: canonicalTable.records)
+                    == .unassigned,
+            "attribution serialization is canonical and preserves all states")
+        expect(
+            UsageAttribution.confirmedRaw(
+                updating: nil,
+                record: UsageAttribution.Record(
+                    client: "claude", provider: "openai", state: .unassigned)
+            ) == "[]",
+            "unassigned attribution update removes its declaration")
+
+        let attributionDefaultsName = "TokenBar.SelfTest.UsageAttribution.\(UUID().uuidString)"
+        if let attributionDefaults = UserDefaults(suiteName: attributionDefaultsName) {
+            defer { attributionDefaults.removePersistentDomain(forName: attributionDefaultsName) }
+            let suggestion = UsageAttribution.Record(
+                client: "claude", provider: "openai", state: .assigned("codex"))
+            let suggestionRaw = UsageAttribution.suggestionsRaw(updating: nil, record: suggestion)
+            attributionDefaults.set(suggestionRaw, forKey: UsageAttribution.suggestionsKey)
+            expect(
+                UsageAttribution.suggestions(defaults: attributionDefaults).records.count == 1
+                    && UsageAttribution.effectiveState(
+                        for: claudeOpenAIEntry, defaults: attributionDefaults) == .unassigned,
+                "suggestion alone does not affect effective attribution")
+        } else {
+            expect(false, "isolated attribution defaults suite is available")
+        }
+
+        let malformedAttributionRaw = "not-json"
+        // An unregistered *target* is what cannot be persisted: it names a quota
+        // bucket the app cannot render. The source is whatever the report
+        // observed, and the report emits ids outside the registry
+        // (`cc-mirror/*`), so constraining it would render those rows and then
+        // refuse every classification made on them.
+        let invalidAttributionRecordRaw = "[{\"client\":\"claude\",\"model\":null,\"provider\":\"openai\",\"state\":\"assigned\",\"target\":\"not-registered\"}]"
+        let dynamicSourceRecord = UsageAttribution.Record(
+            client: "cc-mirror/sonnet", provider: "anthropic", state: .excluded)
+        let dynamicSourceRaw = UsageAttribution.confirmedRaw(
+            updating: nil, record: dynamicSourceRecord)
+        expect(
+            UsageAttribution.parseRaw(dynamicSourceRaw).records == [dynamicSourceRecord]
+                && !ClientRegistry.allIds.contains("cc-mirror/sonnet"),
+            "a dynamic report client can carry a declaration")
+        expect(
+            UsageAttribution.parseRaw(malformedAttributionRaw).records.isEmpty
+                && !UsageAttribution.parseRaw(malformedAttributionRaw).isWritable
+                && UsageAttribution.confirmedRaw(
+                    updating: malformedAttributionRaw, record: crossAssignment) == nil
+                && UsageAttribution.suggestionsRaw(
+                    replacing: malformedAttributionRaw, with: [crossAssignment]) == nil,
+            "malformed attribution raw fails closed and refuses writes")
+        expect(
+            UsageAttribution.parseRaw(invalidAttributionRecordRaw).records.isEmpty
+                && !UsageAttribution.parseRaw(invalidAttributionRecordRaw).isWritable
+                && UsageAttribution.confirmedRaw(
+                    updating: invalidAttributionRecordRaw, record: crossAssignment) == nil,
+            "invalid attribution records are rejected at parse time")
+
+        let malformedDefaultsName = "TokenBar.SelfTest.UsageAttribution.Malformed.\(UUID().uuidString)"
+        if let malformedDefaults = UserDefaults(suiteName: malformedDefaultsName) {
+            defer { malformedDefaults.removePersistentDomain(forName: malformedDefaultsName) }
+            malformedDefaults.set("not-json", forKey: UsageAttribution.confirmedKey)
+            let read = UsageAttribution.confirmed(defaults: malformedDefaults)
+            var records = read.records
+            records.append(crossAssignment)
+            let attemptedRaw = UsageAttribution.confirmedRaw(
+                updating: malformedDefaults.object(forKey: UsageAttribution.confirmedKey),
+                record: records.last!)
+            if let attemptedRaw {
+                malformedDefaults.set(attemptedRaw, forKey: UsageAttribution.confirmedKey)
+            }
+            expect(
+                records.count == 1 && !read.isWritable && attemptedRaw == nil
+                    && (malformedDefaults.object(forKey: UsageAttribution.confirmedKey) as? String)
+                        == "not-json",
+                "public attribution read-modify-write preserves rejected raw bytes")
+        } else {
+            expect(false, "isolated malformed attribution defaults suite is available")
+        }
+
+        let wrongTypeDefaultsName = "TokenBar.SelfTest.UsageAttribution.WrongType.\(UUID().uuidString)"
+        if let wrongTypeDefaults = UserDefaults(suiteName: wrongTypeDefaultsName) {
+            defer { wrongTypeDefaults.removePersistentDomain(forName: wrongTypeDefaultsName) }
+            wrongTypeDefaults.set(["foreign"], forKey: UsageAttribution.confirmedKey)
+            let read = UsageAttribution.confirmed(defaults: wrongTypeDefaults)
+            var records = read.records
+            records.append(crossAssignment)
+            let attemptedRaw = UsageAttribution.confirmedRaw(
+                updating: wrongTypeDefaults.object(forKey: UsageAttribution.confirmedKey),
+                record: records.last!)
+            if let attemptedRaw {
+                wrongTypeDefaults.set(attemptedRaw, forKey: UsageAttribution.confirmedKey)
+            }
+            expect(
+                records.count == 1 && !read.isWritable && attemptedRaw == nil
+                    && (wrongTypeDefaults.object(forKey: UsageAttribution.confirmedKey)
+                        as? [String]) == ["foreign"],
+                "wrong-typed attribution defaults value is non-writable")
+        } else {
+            expect(false, "isolated wrong-type attribution defaults suite is available")
+        }
+
+        let absentDefaultsName = "TokenBar.SelfTest.UsageAttribution.Absent.\(UUID().uuidString)"
+        if let absentDefaults = UserDefaults(suiteName: absentDefaultsName) {
+            defer { absentDefaults.removePersistentDomain(forName: absentDefaultsName) }
+            let read = UsageAttribution.confirmed(defaults: absentDefaults)
+            let firstWriteRaw = UsageAttribution.confirmedRaw(
+                updating: absentDefaults.object(forKey: UsageAttribution.confirmedKey),
+                record: crossAssignment)
+            if let firstWriteRaw {
+                absentDefaults.set(firstWriteRaw, forKey: UsageAttribution.confirmedKey)
+            }
+            expect(
+                read.records.isEmpty && read.isWritable
+                    && firstWriteRaw
+                        == "[{\"client\":\"claude\",\"model\":null,\"provider\":\"openai\",\"state\":\"assigned\",\"target\":\"codex\"}]"
+                    && absentDefaults.string(forKey: UsageAttribution.confirmedKey)
+                        == firstWriteRaw,
+                "absent attribution defaults value remains writable")
+        } else {
+            expect(false, "fresh attribution defaults suite is available")
+        }
+
+        // QD-1: retain date, attribution bucket, and canonical model while
+        // resolving each raw contribution-client row.
+        let oneDayContributions = [contributionFixture(contributionJSON(
+            date: "2024-01-01",
+            clients: [
+                ("opencode", "excluded-model", "nvidia", 10, 1.0),
+                ("claude", "cross-model", "openai", 20, 2.0),
+                ("claude", "merged-model", "anthropic, github_copilot", 30, 3.0),
+                ("claude", "zero-model", "openai", 0, 0.0),
+            ],
+            totalsTokens: 999,
+            totalsCost: 999.0))]
+        let oneDayConfirmed = [
+            UsageAttribution.Record(
+                client: "opencode", provider: "nvidia", state: .excluded),
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", state: .assigned("codex")),
+        ]
+        let oneDaySuggestions = [
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", state: .excluded),
+        ]
+        let oneDayPoints = AttributedDailySeries.points(
+            contributions: oneDayContributions, confirmed: oneDayConfirmed)
+        let expectedOneDayPoints = [
+            AttributedDailySeries.Point(
+                date: "2024-01-01", state: .assigned("codex"), model: "cross-model",
+                tokens: 20, cost: 2.0),
+            AttributedDailySeries.Point(
+                date: "2024-01-01", state: .excluded, model: "excluded-model",
+                tokens: 10, cost: 1.0),
+            AttributedDailySeries.Point(
+                date: "2024-01-01", state: .unassigned, model: "merged-model",
+                tokens: 30, cost: 3.0),
+        ]
+        let suggestionRaw = oneDaySuggestions.reduce(String?.none) {
+            UsageAttribution.suggestionsRaw(updating: $0, record: $1)
+        }
+        let suggestionTable = UsageAttribution.parseRaw(suggestionRaw)
+        let oneDayDefaultsName = "TokenBar.SelfTest.AttributedSeries.\(UUID().uuidString)"
+        if let oneDayDefaults = UserDefaults(suiteName: oneDayDefaultsName) {
+            defer { oneDayDefaults.removePersistentDomain(forName: oneDayDefaultsName) }
+            let confirmedRaw = oneDayConfirmed.reduce(String?.none) {
+                UsageAttribution.confirmedRaw(updating: $0, record: $1)
+            }
+            oneDayDefaults.set(confirmedRaw, forKey: UsageAttribution.confirmedKey)
+            oneDayDefaults.set(suggestionRaw, forKey: UsageAttribution.suggestionsKey)
+            let storedConfirmed = UsageAttribution.confirmed(defaults: oneDayDefaults).records
+            let storedSuggestions = UsageAttribution.suggestions(defaults: oneDayDefaults).records
+            let oneDayFromStore = AttributedDailySeries.points(
+                contributions: oneDayContributions, confirmed: storedConfirmed)
+            expect(
+                oneDayPoints == expectedOneDayPoints
+                    && suggestionTable.records == oneDaySuggestions
+                    && storedSuggestions == oneDaySuggestions
+                    && oneDayFromStore == expectedOneDayPoints,
+                "attributed daily series keeps buckets and ignores stored suggestions")
+        } else {
+            expect(false, "attributed series defaults suite is available")
+        }
+
+        let fullKeyContributions = [
+            contributionFixture(contributionJSON(
+                date: "2024-01-02",
+                clients: [
+                    ("claude", "shared-model", "openai", 30, 3.0),
+                    ("opencode", "shared-model", "nvidia", 40, 4.0),
+                ],
+                totalsTokens: 70,
+                totalsCost: 7.0)),
+            contributionFixture(contributionJSON(
+                date: "2024-01-01",
+                clients: [
+                    ("claude", "shared-model", "openai", 10, 1.0),
+                    ("opencode", "shared-model", "nvidia", 20, 2.0),
+                ],
+                totalsTokens: 30,
+                totalsCost: 3.0)),
+        ]
+        let fullKeyPoints = AttributedDailySeries.points(
+            contributions: fullKeyContributions,
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "claude", provider: "openai", state: .assigned("codex")),
+                UsageAttribution.Record(
+                    client: "opencode", provider: "nvidia", state: .assigned("claude")),
+            ])
+        let expectedFullKeyPoints = [
+            AttributedDailySeries.Point(
+                date: "2024-01-01", state: .assigned("claude"), model: "shared-model",
+                tokens: 20, cost: 2.0),
+            AttributedDailySeries.Point(
+                date: "2024-01-01", state: .assigned("codex"), model: "shared-model",
+                tokens: 10, cost: 1.0),
+            AttributedDailySeries.Point(
+                date: "2024-01-02", state: .assigned("claude"), model: "shared-model",
+                tokens: 40, cost: 4.0),
+            AttributedDailySeries.Point(
+                date: "2024-01-02", state: .assigned("codex"), model: "shared-model",
+                tokens: 30, cost: 3.0),
+        ]
+        expect(
+            fullKeyPoints == expectedFullKeyPoints,
+            "attributed daily series sorts and retains the full date-state-model key")
+
+        let maxContribution = contributionFixture(contributionJSON(
+            date: "2024-01-03",
+            clients: [
+                ("claude", "max-model", "openai", Int64.max, 1.0),
+                ("claude", "max-model", "openai", 7, 2.0),
+            ],
+            totalsTokens: 0,
+            totalsCost: 0.0))
+        let maxPoints = AttributedDailySeries.points(
+            contributions: [maxContribution],
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "claude", provider: "openai", state: .assigned("codex")),
+            ])
+        expect(
+            maxPoints.count == 1 && maxPoints[0].tokens == Int64.max
+                && maxPoints[0].cost == 3.0,
+            "attributed daily series saturates Int64.max token folds")
+
+        let droppedPointContribution = contributionFixture(contributionJSON(
+            date: "2024-01-03",
+            clients: [
+                ("claude", "cancels-model", "openai", 1, 0.0),
+                ("claude", "cancels-model", "openai", -1, 0.0),
+            ],
+            totalsTokens: 0,
+            totalsCost: 0.0))
+        let droppedPoints = AttributedDailySeries.points(
+            contributions: [droppedPointContribution],
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "claude", provider: "openai", state: .assigned("codex")),
+            ])
+        expect(
+            droppedPoints.isEmpty,
+            "attributed daily series drops a point that aggregates to zero")
+
+        let mergedBypassContribution = contributionFixture(contributionJSON(
+            date: "2024-01-04",
+            clients: [
+                ("opencode", "merged-model", "nvidia, openai", 9, 0.9),
+            ],
+            totalsTokens: 9,
+            totalsCost: 0.9))
+        let mergedBypassPoints = AttributedDailySeries.points(
+            contributions: [mergedBypassContribution],
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "opencode", provider: "nvidia", state: .excluded),
+                UsageAttribution.Record(
+                    client: "opencode", provider: "nvidia, openai", state: .assigned("codex")),
+            ])
+        expect(
+            mergedBypassPoints.count == 1 && mergedBypassPoints[0].state == .unassigned,
+            "merged providers remain unassigned despite a literal joined declaration")
+
+        let conservationContributions = [
+            contributionFixture(contributionJSON(
+                date: "2024-02-01",
+                clients: [("claude", "conservation-model", "anthropic", 7, 0.1)],
+                totalsTokens: 999,
+                totalsCost: 999.0)),
+            contributionFixture(contributionJSON(
+                date: "2024-02-01",
+                clients: [("claude", "conservation-model", "anthropic", 5, 0.2)],
+                totalsTokens: 999,
+                totalsCost: 999.0)),
+            contributionFixture(contributionJSON(
+                date: "2024-02-01",
+                clients: [("claude", "conservation-model", "openai", 11, 4.75)],
+                totalsTokens: 999,
+                totalsCost: 999.0)),
+            contributionFixture(contributionJSON(
+                date: "2024-02-01",
+                clients: [("claude", "conservation-model", "nvidia", 13, 0.125)],
+                totalsTokens: 999,
+                totalsCost: 999.0)),
+        ]
+        let conservationRecords = [
+            UsageAttribution.Record(
+                client: "claude", provider: "anthropic", state: .assigned("claude")),
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", state: .excluded),
+        ]
+        let conservationPoints = AttributedDailySeries.points(
+            contributions: conservationContributions, confirmed: conservationRecords)
+        let permutedConservationPoints = AttributedDailySeries.points(
+            contributions: Array(conservationContributions.reversed()), confirmed: conservationRecords)
+        let conservationTokens = conservationPoints.reduce(Int64.zero) {
+            $0.saturatingAdding($1.tokens)
+        }
+        let conservationCost = conservationPoints.reduce(0.0) { $0 + $1.cost }
+        let conservationBucketsCorrect = conservationPoints.count == 3
+            && conservationPoints[0].state == .assigned("claude")
+            && conservationPoints[0].tokens == 12
+            && abs(conservationPoints[0].cost - 0.3) < 1e-9
+            && conservationPoints[1].state == .excluded
+            && conservationPoints[1].tokens == 11
+            && abs(conservationPoints[1].cost - 4.75) < 1e-9
+            && conservationPoints[2].state == .unassigned
+            && conservationPoints[2].tokens == 13
+            && abs(conservationPoints[2].cost - 0.125) < 1e-9
+        let conservationOrderIndependent = conservationPoints.count == permutedConservationPoints.count
+            && zip(conservationPoints, permutedConservationPoints).allSatisfy { left, right in
+                left.date == right.date && left.state == right.state && left.model == right.model
+                    && left.tokens == right.tokens && abs(left.cost - right.cost) < 1e-9
+            }
+        expect(
+            conservationBucketsCorrect && conservationTokens == 36
+                && abs(conservationCost - 5.175) < 1e-9
+                && conservationOrderIndependent,
+            "attributed daily series conserves row-derived tokens and costs")
+
+        let literalProviderContributions = [contributionFixture(contributionJSON(
+            date: "2024-02-02",
+            clients: [
+                ("claude", "codex-model", "openai-codex", 8, 0.8),
+                ("claude", "openai-model", "openai", 9, 0.9),
+            ],
+            totalsTokens: 17,
+            totalsCost: 1.7))]
+        let literalProviderPoints = AttributedDailySeries.points(
+            contributions: literalProviderContributions,
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "claude", provider: "openai-codex", state: .assigned("codex")),
+                UsageAttribution.Record(
+                    client: "claude", provider: "openai", state: .excluded),
+            ])
+        expect(
+            literalProviderPoints.map(\.state) == [.assigned("codex"), .excluded],
+            "attributed daily series compares provider IDs literally")
+
+        let exactResolverRecords = [
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", model: "exact-model",
+                state: .assigned("codex")),
+        ]
+        let nonMatchingResolverRecords = [
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", state: .excluded),
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", model: "other-model",
+                state: .assigned("codex")),
+        ]
+        let coexistingResolverRecords = [
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", state: .excluded),
+            UsageAttribution.Record(
+                client: "claude", provider: "openai", model: "exact-model",
+                state: .assigned("codex")),
+        ]
+        // Drive the three model-record cases through the producer, not the
+        // resolver: calling resolve directly would stay green even if the
+        // producer stopped passing the row's model at all.
+        func modelRecordState(
+            model: String, records: [UsageAttribution.Record]
+        ) -> UsageAttribution.State? {
+            let points = AttributedDailySeries.points(
+                contributions: [contributionFixture(contributionJSON(
+                    date: "2024-04-01",
+                    clients: [("claude", model, "openai", 5, 0.5)],
+                    totalsTokens: 5,
+                    totalsCost: 0.5))],
+                confirmed: records)
+            guard points.count == 1, points[0].model == model else { return nil }
+            return points[0].state
+        }
+        expect(
+            modelRecordState(model: "exact-model", records: exactResolverRecords)
+                == .assigned("codex")
+                // The row's model has no override of its own, so the only
+                // override present must not apply and the provider-level
+                // declaration stands.
+                && modelRecordState(model: "unlisted-model", records: nonMatchingResolverRecords)
+                    == .excluded
+                && modelRecordState(model: "exact-model", records: coexistingResolverRecords)
+                    == .assigned("codex"),
+            "attributed daily series resolves exact, non-matching, and provider model records")
+
+        expect(
+            UsageAttributionSettings.Copy.all.contains(UsageAttributionSettings.Copy.canonicalizationHint)
+                && UsageAttributionSettings.Copy.canonicalizationHint.contains(
+                    "compared exactly as the source emitted")
+                && !UsageAttributionSettings.Copy.canonicalizationHint.contains("canonicalized"),
+            "attribution copy describes exact provider comparison")
+
+        let allTimeSource = AttributedSeriesTestSource(
+            graphPayload: payloadFixture([
+                contributionJSON(
+                    date: "2023-12-31",
+                    clients: [("claude", "year-model", "openai", 12, 1.2)],
+                    totalsTokens: 12,
+                    totalsCost: 1.2),
+                contributionJSON(
+                    date: "2024-01-01",
+                    clients: [("claude", "year-model", "openai", 34, 3.4)],
+                    totalsTokens: 34,
+                    totalsCost: 3.4),
+            ]),
+            refreshPayload: payloadFixture([]))
+        let allTimePoints = awaitMainActorValue { () -> [AttributedDailySeries.Point]? in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("UTC")
+            let model = AttributedSeriesModel()
+            await model.load(source: allTimeSource, confirmed: [], timeZone: "UTC")
+            return model.points
+        }
+        expect(
+            allTimeSource.graphYears == [nil] && allTimeSource.refreshYears.isEmpty
+                && allTimePoints??.map(\.date) == ["2023-12-31", "2024-01-01"],
+            "attributed series acquisition always requests the all-time graph")
+
+        let timezoneSource = AttributedSeriesTestSource(
+            graphPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-01",
+                    clients: [("claude", "timezone-model", "openai", 1, 0.1)],
+                    totalsTokens: 1,
+                    totalsCost: 0.1),
+            ]),
+            refreshPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-02",
+                    clients: [("claude", "timezone-model", "openai", 2, 0.2)],
+                    totalsTokens: 2,
+                    totalsCost: 0.2),
+            ]))
+        let timezonePoints = awaitMainActorValue { () -> [AttributedDailySeries.Point]? in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            let model = AttributedSeriesModel()
+            await model.load(source: timezoneSource, confirmed: [], timeZone: "Zone/A")
+            await model.load(source: timezoneSource, confirmed: [], timeZone: "Zone/B")
+            return model.points
+        }
+        expect(
+            timezoneSource.graphYears == [nil] && timezoneSource.refreshYears == [nil]
+                && timezonePoints??.map(\.date) == ["2024-03-02"],
+            "attributed series refreshes when the effective timezone changes")
+
+        // The baseline has to outlive the model: PopoverView holds these as
+        // @State and StatusItemController rebuilds it on every open, so a
+        // per-instance baseline would be nil again by the time the user's new
+        // timezone reaches a load and the stale cached day keys would be served.
+        let remountSource = AttributedSeriesTestSource(
+            graphPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-01",
+                    clients: [("claude", "timezone-model", "openai", 1, 0.1)],
+                    totalsTokens: 1,
+                    totalsCost: 0.1),
+            ]),
+            refreshPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-02",
+                    clients: [("claude", "timezone-model", "openai", 2, 0.2)],
+                    totalsTokens: 2,
+                    totalsCost: 0.2),
+            ]))
+        let remountPoints = awaitMainActorValue { () -> [AttributedDailySeries.Point]? in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            await AttributedSeriesModel().load(
+                source: remountSource, confirmed: [], timeZone: "Zone/A")
+            // A brand-new model, exactly as a reopened popover would build it.
+            let remounted = AttributedSeriesModel()
+            await remounted.load(source: remountSource, confirmed: [], timeZone: "Zone/B")
+            return remounted.points
+        }
+        expect(
+            remountSource.refreshYears == [nil]
+                && remountPoints??.map(\.date) == ["2024-03-02"],
+            "attributed series still refreshes when a remounted model sees a new timezone")
+
+        // AppDelegate's title-refresh loop warms the all-time graph cache from
+        // launch, so the very first QD-1 load can be the first one to see a
+        // changed timezone. Without the launch baseline it would accept those
+        // cached pre-change day buckets and then stamp them as current.
+        let firstLoadSource = AttributedSeriesTestSource(
+            graphPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-01",
+                    clients: [("claude", "timezone-model", "openai", 1, 0.1)],
+                    totalsTokens: 1,
+                    totalsCost: 0.1),
+            ]),
+            refreshPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-02",
+                    clients: [("claude", "timezone-model", "openai", 2, 0.2)],
+                    totalsTokens: 2,
+                    totalsCost: 0.2),
+            ]))
+        let firstLoadPoints = awaitMainActorValue { () -> [AttributedDailySeries.Point]? in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            let model = AttributedSeriesModel()
+            await model.load(source: firstLoadSource, confirmed: [], timeZone: "Zone/B")
+            return model.points
+        }
+        expect(
+            firstLoadSource.graphYears.isEmpty && firstLoadSource.refreshYears == [nil]
+                && firstLoadPoints??.map(\.date) == ["2024-03-02"],
+            "attributed series recomputes on its first load when the timezone already changed")
+
+        // A failed fetch must not go on publishing the classification the user
+        // just changed away from: the rows are still held, so re-derive them.
+        let failingSource = AttributedSeriesFailingSource(
+            graphPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-05-01",
+                    clients: [("claude", "stale-model", "openai", 4, 0.4)],
+                    totalsTokens: 4,
+                    totalsCost: 0.4),
+            ]))
+        let staleInputStates = awaitMainActorValue { () -> [UsageAttribution.State]? in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            let model = AttributedSeriesModel()
+            await model.load(
+                source: failingSource, confirmed: [], timeZone: "Zone/A")
+            let before = model.points?.map(\.state) ?? []
+            failingSource.failing = true
+            await model.load(
+                source: failingSource,
+                confirmed: [UsageAttribution.Record(
+                    client: "claude", provider: "openai", state: .excluded)],
+                timeZone: "Zone/A")
+            return before + (model.points?.map(\.state) ?? [])
+        }
+        expect(
+            staleInputStates ?? [] == [.unassigned, .excluded],
+            "a failed reload re-derives held rows against the current declarations")
+
+        // Day keys cannot be salvaged that way, so a recompute that fails after
+        // a timezone change publishes nothing rather than known-misdated buckets.
+        let failingTimezoneSource = AttributedSeriesFailingSource(
+            graphPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-05-01",
+                    clients: [("claude", "stale-model", "openai", 4, 0.4)],
+                    totalsTokens: 4,
+                    totalsCost: 0.4),
+            ]))
+        let droppedOnTimezoneFailure = awaitMainActorValue { () -> Bool in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            let model = AttributedSeriesModel()
+            await model.load(source: failingTimezoneSource, confirmed: [], timeZone: "Zone/A")
+            guard model.points?.isEmpty == false else { return false }
+            failingTimezoneSource.failing = true
+            await model.load(source: failingTimezoneSource, confirmed: [], timeZone: "Zone/B")
+            return model.points == nil
+        }
+        expect(
+            droppedOnTimezoneFailure == true,
+            "a failed recompute after a timezone change drops the series")
+
+        // Travel A -> B -> A. Another consumer rewrites the shared cache under
+        // B; by the time QD-1 first loads the zone reads A again, so comparing
+        // identifiers would see a match and accept B's day buckets. Only having
+        // dropped the marker on the transitions catches it.
+        let roundTripSource = AttributedSeriesTestSource(
+            graphPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-01",
+                    clients: [("claude", "timezone-model", "openai", 1, 0.1)],
+                    totalsTokens: 1,
+                    totalsCost: 0.1),
+            ]),
+            refreshPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-02",
+                    clients: [("claude", "timezone-model", "openai", 2, 0.2)],
+                    totalsTokens: 2,
+                    totalsCost: 0.2),
+            ]))
+        let roundTripPoints = awaitMainActorValue { () -> [AttributedDailySeries.Point]? in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            // NotificationCenter delivers to the main queue on a later turn, so
+            // wait for the observer to actually run rather than assuming one
+            // yield is enough. Giving up here fails the assertion below; it can
+            // never pass by luck.
+            let before = AttributedSeriesModel.timeZoneGenerationForTesting
+            NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
+            NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
+            for _ in 0..<1000
+            where AttributedSeriesModel.timeZoneGenerationForTesting == before {
+                await Task.yield()
+            }
+            let model = AttributedSeriesModel()
+            await model.load(source: roundTripSource, confirmed: [], timeZone: "Zone/A")
+            return model.points
+        }
+        expect(
+            roundTripSource.graphYears.isEmpty && roundTripSource.refreshYears == [nil]
+                && roundTripPoints??.map(\.date) == ["2024-03-02"],
+            "a timezone round trip still recomputes rather than trusting the shared cache")
+
+        // The same round trip, but landing while an acquisition is suspended.
+        // Stamping unconditionally on resume would overwrite the invalidation
+        // with a zone nobody verified this payload was built under — and unlike
+        // a stale in-flight payload, no later load could correct that.
+        let suspendedSource = AttributedSeriesHookSource(
+            payload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-01",
+                    clients: [("claude", "timezone-model", "openai", 1, 0.1)],
+                    totalsTokens: 1,
+                    totalsCost: 0.1),
+            ]))
+        let suspendedOutcome = awaitMainActorValue { () -> (Int, Bool) in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            suspendedSource.onAcquire = {
+                // A -> B -> A while the first acquisition is in flight.
+                AttributedSeriesModel.invalidateTimeZoneProvenance()
+                AttributedSeriesModel.invalidateTimeZoneProvenance()
+            }
+            let stranded = AttributedSeriesModel()
+            await stranded.load(
+                source: suspendedSource, confirmed: [], timeZone: "Zone/A")
+            // Its payload was acquired under a zone nobody can vouch for, so it
+            // must not reach the view either.
+            let published = stranded.points == nil
+            suspendedSource.onAcquire = nil
+            await AttributedSeriesModel().load(
+                source: suspendedSource, confirmed: [], timeZone: "Zone/A")
+            return (suspendedSource.refreshCalls, published)
+        }
+        expect(
+            suspendedSource.graphCalls == 1 && suspendedOutcome?.0 == 1
+                && suspendedOutcome?.1 == true,
+            "a transition during a suspended acquisition is neither published nor stamped")
+
+        // Invalidation is process-wide but retained rows are per-instance. A
+        // model that last succeeded before a transition must not re-derive its
+        // old-zone rows on a later failure, even once another model has already
+        // stamped the new zone and made the marker match again.
+        let strandedRowsSource = AttributedSeriesFailingSource(
+            graphPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-06-01",
+                    clients: [("claude", "stranded-model", "openai", 3, 0.3)],
+                    totalsTokens: 3,
+                    totalsCost: 0.3),
+            ]))
+        let strandedRowsDropped = awaitMainActorValue { () -> Bool in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            let stale = AttributedSeriesModel()
+            await stale.load(source: strandedRowsSource, confirmed: [], timeZone: "Zone/A")
+            guard stale.points?.isEmpty == false else { return false }
+            AttributedSeriesModel.invalidateTimeZoneProvenance()
+            // Another model brings the process up to date under the new zone.
+            await AttributedSeriesModel().load(
+                source: strandedRowsSource, confirmed: [], timeZone: "Zone/B")
+            strandedRowsSource.failing = true
+            await stale.load(source: strandedRowsSource, confirmed: [], timeZone: "Zone/B")
+            return stale.points == nil
+        }
+        expect(
+            strandedRowsDropped == true,
+            "rows retained before a transition are never re-derived after it")
+
+        // The same drop, but for a transition that lands *during* a failing
+        // acquisition. `shouldRefresh` was decided before it and reads false, so
+        // only comparing the generation catches this one; the captured flag would
+        // happily re-derive day buckets already known to be misdated.
+        let failDuringTransitionSource = AttributedSeriesFailingSource(
+            graphPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-07-01",
+                    clients: [("claude", "transition-model", "openai", 5, 0.5)],
+                    totalsTokens: 5,
+                    totalsCost: 0.5),
+            ]))
+        let failDuringTransitionDropped = awaitMainActorValue { () -> Bool in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            let model = AttributedSeriesModel()
+            await model.load(
+                source: failDuringTransitionSource, confirmed: [], timeZone: "Zone/A")
+            guard model.points?.isEmpty == false else { return false }
+            // Same zone and no transition seen yet, so this load takes the cheap
+            // cached path and captures `shouldRefresh == false`.
+            failDuringTransitionSource.failing = true
+            failDuringTransitionSource.onAcquire = {
+                AttributedSeriesModel.invalidateTimeZoneProvenance()
+            }
+            await model.load(
+                source: failDuringTransitionSource, confirmed: [], timeZone: "Zone/A")
+            failDuringTransitionSource.onAcquire = nil
+            return model.points == nil
+        }
+        expect(
+            failDuringTransitionDropped == true,
+            "a transition during a failing acquisition drops the retained rows")
+
+        // Two loads overlap: the newer one publishes while the older is still
+        // suspended. The older must not resume and overwrite it, neither with its
+        // stale payload nor with the `confirmed` set it captured.
+        let supersededSource = AttributedSeriesReentrantSource(
+            outerPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-08-01",
+                    clients: [("claude", "superseded-model", "openai", 1, 0.1)],
+                    totalsTokens: 1,
+                    totalsCost: 0.1),
+            ]),
+            innerPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-08-02",
+                    clients: [("claude", "current-model", "openai", 2, 0.2)],
+                    totalsTokens: 2,
+                    totalsCost: 0.2),
+            ]))
+        let supersededDates = awaitMainActorValue { () -> [String]? in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            let model = AttributedSeriesModel()
+            supersededSource.onFirstAcquire = { @MainActor @Sendable in
+                await model.load(
+                    source: supersededSource, confirmed: [], timeZone: "Zone/A")
+            }
+            await model.load(source: supersededSource, confirmed: [], timeZone: "Zone/A")
+            supersededSource.onFirstAcquire = nil
+            return model.points?.map(\.date)
+        }
+        expect(
+            supersededDates ?? [] == ["2024-08-02"],
+            "a superseded attributed-series load does not overwrite the newer result")
+
+        // The failure path publishes too, by re-deriving retained rows, so it
+        // needs the same guard: a superseded load that then fails would republish
+        // the declarations the user has already moved on from.
+        let supersededFailureSource = AttributedSeriesReentrantSource(
+            outerPayload: payloadFixture([]),
+            innerPayload: payloadFixture([
+                contributionJSON(
+                    date: "2024-08-03",
+                    clients: [("claude", "current-model", "openai", 3, 0.3)],
+                    totalsTokens: 3,
+                    totalsCost: 0.3),
+            ]))
+        supersededFailureSource.failOuter = true
+        let supersededFailureStates = awaitMainActorValue { () -> [UsageAttribution.State]? in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            let model = AttributedSeriesModel()
+            supersededFailureSource.onFirstAcquire = { @MainActor @Sendable in
+                // The newer load classifies this source as excluded.
+                await model.load(
+                    source: supersededFailureSource,
+                    confirmed: [UsageAttribution.Record(
+                        client: "claude", provider: "openai", state: .excluded)],
+                    timeZone: "Zone/A")
+            }
+            // The older load carries no declarations and then fails.
+            await model.load(source: supersededFailureSource, confirmed: [], timeZone: "Zone/A")
+            supersededFailureSource.onFirstAcquire = nil
+            return model.points?.map(\.state)
+        }
+        expect(
+            supersededFailureStates ?? [] == [.excluded],
+            "a superseded load that fails does not re-derive with its stale declarations")
+
+        // One recompute cannot outrun the producer race: a computation begun
+        // before the transition can still land in the shared entry afterwards.
+        // So once a transition is seen, stop reading that entry for good.
+        let bypassSource = AttributedSeriesHookSource(
+            payload: payloadFixture([
+                contributionJSON(
+                    date: "2024-06-02",
+                    clients: [("claude", "bypass-model", "openai", 6, 0.6)],
+                    totalsTokens: 6,
+                    totalsCost: 0.6),
+            ]))
+        let bypassCalls = awaitMainActorValue { () -> (Int, Int) in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            let model = AttributedSeriesModel()
+            await model.load(source: bypassSource, confirmed: [], timeZone: "Zone/A")
+            AttributedSeriesModel.invalidateTimeZoneProvenance()
+            await model.load(source: bypassSource, confirmed: [], timeZone: "Zone/B")
+            // Third load, zone unchanged since the second and the marker now
+            // matches — the cheap cached path must still not come back.
+            await model.load(source: bypassSource, confirmed: [], timeZone: "Zone/B")
+            return (bypassSource.graphCalls, bypassSource.refreshCalls)
+        }
+        expect(
+            bypassCalls?.0 == 1 && bypassCalls?.1 == 2,
+            "the shared cache is never read again after a transition")
+
+        // Seeding is a launch-time statement about an empty cache. Repeating it
+        // later would re-assert a provenance that has since been invalidated.
+        let reseedSource = AttributedSeriesHookSource(
+            payload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-01",
+                    clients: [("claude", "timezone-model", "openai", 1, 0.1)],
+                    totalsTokens: 1,
+                    totalsCost: 0.1),
+            ]))
+        // Deliberately a re-capture under a DIFFERENT zone with no transition
+        // observed. Pairing it with a transition instead would prove nothing:
+        // the post-transition cache bypass would force a refresh on its own and
+        // mask whether this guard exists at all.
+        let reseedRefreshCalls = awaitMainActorValue { () -> Int in
+            AttributedSeriesModel.resetForTesting()
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/A")
+            AttributedSeriesModel.captureLaunchTimeZone("Zone/B")
+            await AttributedSeriesModel().load(
+                source: reseedSource, confirmed: [], timeZone: "Zone/B")
+            return reseedSource.refreshCalls
+        }
+        expect(
+            reseedRefreshCalls == 1 && reseedSource.graphCalls == 0,
+            "a repeated launch capture cannot re-seed provenance to another zone")
+
+        // Without the launch hook provenance simply starts unknown, so the first
+        // load recomputes and installs the observer itself. That is what makes
+        // deleting the hook a cost, not a correctness defect — assert it rather
+        // than asserting it in prose.
+        let unseededSource = AttributedSeriesHookSource(
+            payload: payloadFixture([
+                contributionJSON(
+                    date: "2024-03-01",
+                    clients: [("claude", "timezone-model", "openai", 1, 0.1)],
+                    totalsTokens: 1,
+                    totalsCost: 0.1),
+            ]))
+        let unseededRefreshCalls = awaitMainActorValue { () -> Int in
+            AttributedSeriesModel.resetForTesting()
+            let model = AttributedSeriesModel()
+            await model.load(source: unseededSource, confirmed: [], timeZone: "Zone/A")
+            let before = AttributedSeriesModel.timeZoneGenerationForTesting
+            NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
+            for _ in 0..<1000
+            where AttributedSeriesModel.timeZoneGenerationForTesting == before {
+                await Task.yield()
+            }
+            await model.load(source: unseededSource, confirmed: [], timeZone: "Zone/A")
+            return unseededSource.refreshCalls
+        }
+        expect(
+            unseededRefreshCalls == 2 && unseededSource.graphCalls == 0,
+            "an unseeded process still observes transitions without the launch hook")
+
+        // tb_quota_curve across the real seam: the ctb.h declaration, the built
+        // symbol, and the envelope. A Rust-side unit test cannot see a header
+        // that disagrees with the library. No binding exists in this process
+        // (no agent-usage publication has run), so every selection must fail
+        // closed — and the polarity matters as much as the message, since a
+        // success envelope carrying an error string would read the same to a
+        // substring check.
+        func quotaCurveFailure(client: String, window: String, generation: UInt64) -> String? {
+            do {
+                _ = try TBCore.quotaCurve(
+                    clientId: client, windowKey: window, generation: generation)
+                return nil
+            } catch let TBCoreError.bridge(message) {
+                return message
+            } catch {
+                return "unexpected: \(error)"
+            }
+        }
+        let unboundCurve = quotaCurveFailure(
+            client: "codex", window: "main.session.v1", generation: 1)
+        let emptyClientCurve = quotaCurveFailure(client: "", window: "weekly.v1", generation: 1)
+        let emptyWindowCurve = quotaCurveFailure(client: "codex", window: "", generation: 1)
+        expect(
+            unboundCurve?.contains("binding") == true
+                && emptyClientCurve?.contains("client_id") == true
+                && emptyWindowCurve?.contains("window_key") == true,
+            "tb_quota_curve fails closed through the built C ABI for unbound and invalid selections")
+
+        // A bound series with no history answers {"ok":true,"data":null}. The
+        // ordinary envelope path treats a missing payload on ok:true as a decode
+        // failure, which is right everywhere else and wrong here — so the
+        // optional path gets its own check, including that it still rejects a
+        // failure envelope rather than swallowing it as "no history".
+        func decodeOptionalCurve(_ json: String) -> Result<QuotaCurve?, any Error> {
+            Result { try TBCore.decodeOptionalEnvelope(Data(json.utf8)) as QuotaCurve? }
+        }
+        func curveValue(_ result: Result<QuotaCurve?, any Error>) -> QuotaCurve?? {
+            switch result {
+            case let .success(value): return .some(value)
+            case .failure: return nil
+            }
+        }
+        let curvePointJSON = #"{"sampledAt":10,"usedPercent":4.5,"resetAt":106,"durationSeconds":96,"durationSource":"provider","origin":"liveV3"}"#
+        let curveCoverageJSON = #"{"oldestSampledAt":10,"newestSampledAt":10,"sampleCount":1}"#
+        let curveDataJSON = #"{"points":["# + curvePointJSON + #"],"coverage":"# + curveCoverageJSON
+            + #","activeResetAt":106,"generation":3}"#
+        let nullCurve = curveValue(decodeOptionalCurve(#"{"ok":true,"data":null}"#))
+        let realCurve = curveValue(decodeOptionalCurve(#"{"ok":true,"data":"# + curveDataJSON + "}"))
+        let failedCurve = curveValue(decodeOptionalCurve(#"{"ok":false,"err":"nope"}"#))
+        expect(
+            nullCurve == .some(nil)
+                && realCurve??.points.first?.sampledAt == 10
+                && realCurve??.coverage.sampleCount == 1
+                && realCurve??.generation == 3
+                && failedCurve == nil,
+            "an empty-history curve decodes as nil while a failure envelope still throws")
 
         // ModelColorMap: cost ranking drives shades; unseen models fall back.
         let map = ModelColorMap(entries: [
@@ -462,11 +2726,22 @@ enum SelfTest {
             "linear mode ignores available historical")
         expect(UsagePace.compute(window: availableWindow, now: now)?.basis == .linear,
             "direct pace compute stays linear")
+        // The warning color is basis-independent: a Linear estimate in deficit
+        // is colored exactly like a Historical one, so the marker cannot blink
+        // out when the Historical fit stops re-qualifying. `linear` is the
+        // 50%/50% available window — on track, so not colored — and `hist` is a
+        // historical *reserve*, the negative control on the other side.
+        let linearDeficit = UsagePace.compute(
+            window: v3Window(used: 80, state: .available, historicalPace: historicalLasts),
+            mode: .linear, now: now)
         expect(
-            AgentLimitsCard.PacePresentation.isHistoricalDeficit(risky)
-                && !AgentLimitsCard.PacePresentation.isHistoricalDeficit(learningEstimate)
-                && !AgentLimitsCard.PacePresentation.isHistoricalDeficit(linear),
-            "UI warning color requires historical-basis deficit")
+            AgentLimitsCard.PacePresentation.isDeficit(risky)
+                && AgentLimitsCard.PacePresentation.isDeficit(learningEstimate)
+                && AgentLimitsCard.PacePresentation.isDeficit(linearDeficit)
+                && linearDeficit?.basis == .linear
+                && !AgentLimitsCard.PacePresentation.isDeficit(linear)
+                && !AgentLimitsCard.PacePresentation.isDeficit(hist),
+            "UI warning color follows the deficit stage, not the pace basis")
         let unavailableWindow = v3Window(used: 50, state: .unavailable)
         expect(UsagePace.compute(
             window: unavailableWindow, mode: .historical, now: now) == nil,
@@ -890,6 +3165,21 @@ enum SelfTest {
         expect(ClientRegistry.style("kimi").displayName == "Kimi", "Kimi registry covers CLI and Code")
         expect(ClientRegistry.style("junie").displayName == "Junie", "Junie registry metadata")
         expect(ClientRegistry.style("opencodereview").displayName == "OpenCodeReview", "OpenCodeReview registry metadata")
+        // Sources that are not surface-scoped carry no form-factor suffix:
+        // ~/.codex/sessions is majority Codex Desktop, ~/.copilot merges CLI
+        // OTel with the desktop app's data.db, and the cursor source is an
+        // account-level billing export. Naming any of them "... CLI"/"... IDE"
+        // claims a scope the data does not have.
+        for (id, name) in [("codex", "Codex"), ("copilot", "Copilot"), ("cursor", "Cursor")] {
+            expect(ClientRegistry.style(id).displayName == name,
+                "\(id) carries no form-factor suffix — its source spans CLI, IDE and desktop")
+            expect(ClientRegistry.shortName(id) == name,
+                "\(id) legend label is unchanged by dropping the suffix")
+        }
+        // The " IDE" arm of shortName was dropped with "Cursor IDE"; it stays
+        // dropped only while no registered name ends in it.
+        expect(ClientRegistry.allIds.allSatisfy { !ClientRegistry.style($0).displayName.hasSuffix(" IDE") },
+            "no registered display name ends in \" IDE\" (shortName no longer strips it)")
         // AgentLimitsCard keeps its own generic "-cli" fold for quota-card
         // attribution: explicit aliases via the registry, then a local strip so
         // antigravity-cli shares the antigravity quota snapshot — this fold must
@@ -1200,6 +3490,91 @@ enum SelfTest {
         expect(
             settingsModelUsesAllTime,
             "Settings can pin its client universe to the all-time graph")
+
+        // The invariant is that the card never labels rows with a range they do
+        // not cover. `invalidateModel()` drops the report the moment the slice
+        // changes — deliberately, so a late in-flight scan cannot publish the
+        // previous year's models — so on a failed switch there are no rows left
+        // to mislabel and the subtitle falls back to the unscoped form. The two
+        // successful switches are where the pairing is actually exercised.
+        let dashboardYearKey = "tokenbar.dashboard.year"
+        let savedDashboardYear = UserDefaults.standard.object(forKey: dashboardYearKey)
+        let reportRangeSequence: [DashboardModelTestObservation] = awaitMainActorValue {
+            let source = DashboardModelTestSource(failingGraphYear: "2022")
+            let model = DashboardModel(source: source, initialYear: "2024")
+            await model.load()
+            // PR #187 took the model report off the critical path: `load()`
+            // fetches the graph alone and a model-dependent lens asks for the
+            // report when it appears. The Stats lens is where this card lives,
+            // so that is the call that has to drive this sequence now.
+            await model.ensureModelData(for: .stats)
+            let initial = DashboardModelTestObservation(
+                selectedYear: model.year,
+                loadedYear: model.modelYear,
+                loadedModel: model.modelReport?.entries.first?.model,
+                loadedTokens: model.modelReport?.entries.first?.total,
+                cardRangeLabel: UsageAttributionBreakdownCard.rangeLabel(
+                    reportYear: model.modelYear))
+            await model.setYear("2023")
+            await model.ensureModelData(for: .stats)
+            let successfulSwitch = DashboardModelTestObservation(
+                selectedYear: model.year,
+                loadedYear: model.modelYear,
+                loadedModel: model.modelReport?.entries.first?.model,
+                loadedTokens: model.modelReport?.entries.first?.total,
+                cardRangeLabel: UsageAttributionBreakdownCard.rangeLabel(
+                    reportYear: model.modelYear))
+            await model.setYear("2022")
+            await model.ensureModelData(for: .stats)
+            let failedSwitch = DashboardModelTestObservation(
+                selectedYear: model.year,
+                loadedYear: model.modelYear,
+                loadedModel: model.modelReport?.entries.first?.model,
+                loadedTokens: model.modelReport?.entries.first?.total,
+                cardRangeLabel: UsageAttributionBreakdownCard.rangeLabel(
+                    reportYear: model.modelYear))
+            return [initial, successfulSwitch, failedSwitch]
+        } ?? []
+        if let savedDashboardYear {
+            UserDefaults.standard.set(savedDashboardYear, forKey: dashboardYearKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: dashboardYearKey)
+        }
+        expect(
+            reportRangeSequence.count == 3
+                && reportRangeSequence.map(\.selectedYear) == ["2024", "2023", "2022"]
+                && reportRangeSequence.map(\.loadedYear) == ["2024", "2023", nil]
+                && reportRangeSequence.map(\.loadedModel)
+                    == ["loaded-2024", "loaded-2023", nil]
+                && reportRangeSequence.map(\.loadedTokens) == [24, 23, nil]
+                // Never "2022": the label always states the range the rows come
+                // from, and with no rows it states no range at all.
+                && reportRangeSequence.map(\.cardRangeLabel)
+                    == ["2024", "2023", "All years"],
+            "attribution card labels rows only with the range they come from |"
+                + " selected=\(reportRangeSequence.map(\.selectedYear))"
+                + " loaded=\(reportRangeSequence.map(\.loadedYear))"
+                + " model=\(reportRangeSequence.map(\.loadedModel))"
+                + " label=\(reportRangeSequence.map(\.cardRangeLabel))")
+
+        // The card's figures change with BOTH the year and the client tab, so
+        // naming only the year let a client subtotal read as an account-wide
+        // breakdown. Overview passes nil rather than relying on a one-element
+        // clientIds, which Overview can legitimately produce.
+        expect(
+            UsageAttributionBreakdownCard.subtitle(
+                reportYear: "2026", singleClient: nil) == "2026"
+                && UsageAttributionBreakdownCard.subtitle(
+                    reportYear: "2026", singleClient: "claude")
+                    == "2026 · \(ClientRegistry.shortName("claude"))"
+                && UsageAttributionBreakdownCard.subtitle(
+                    reportYear: nil, singleClient: "claude")
+                    == "All years · \(ClientRegistry.shortName("claude"))"
+                // Empty is the identity form's all-time marker, so it must read
+                // the same as never having been scoped.
+                && UsageAttributionBreakdownCard.subtitle(
+                    reportYear: "", singleClient: nil) == "All years",
+            "attribution card subtitle names the client scope, not only the year")
 
         // Browsing a client inside the MAIN popover must not decide what that
         // client's own item opens on.
@@ -2141,6 +4516,7 @@ enum SelfTest {
          "years":[],
          "contributions":[
            {"date":"2026-01-01","totals":{"tokens":0,"cost":0,"messages":5},"intensity":0,
+            "turnsByClient":{"codex":7},
             "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
             "clients":[
               {"client":"codex","modelId":"m1","providerId":"p","cost":0,"messages":5,
@@ -2205,38 +4581,69 @@ enum SelfTest {
         """
         let turnReport = try! JSONDecoder().decode(
             HourlyReport.self, from: Data(turnReportJSON.utf8))
-        let turnsByDay = TurnCountBuckets.byDay(turnReport)
-        let turnsByMonth = TurnCountBuckets.byMonth(turnReport)
+        // `supportedTurnClients` decides which clients Daily/Monthly sum turns
+        // for and which names the "Turns · X only" subtitle reports. Its only
+        // coverage was removed with the hourly folds it happened to sit beside;
+        // an unsupported client contributing nothing is now harmless, but
+        // wrongly EXCLUDING codex or claude would silently undercount with no
+        // test turning red.
         expect(
-            turnsByDay["2025-12-31"] == 2 && turnsByDay["2026-01-01"] == 7
-                && turnsByDay["2026-02-01"] == 0 && turnsByDay["2026-02-30"] == nil,
-            "turn buckets fold valid local hours by day and retain a loaded zero")
+            PopoverView.supportedTurnClients(["gemini", "claude", "opencode", "codex"])
+                == ["claude", "codex"],
+            "the turn scope keeps only the supported clients, in the order given")
         expect(
-            turnsByMonth["2025-12"] == 2 && turnsByMonth["2026-01"] == 7
-                && turnsByMonth["2026-02"] == 0 && turnsByMonth.count == 3,
-            "turn buckets do not leak across month or year boundaries")
+            PopoverView.supportedTurnClients(["gemini", "opencode"]).isEmpty
+                && PopoverView.supportedTurnClients([]).isEmpty,
+            "a slice with no supported client yields an empty turn scope")
         expect(
-            TurnCountBuckets.byDay(nil).isEmpty
-                && TurnCountBuckets.byDay(turnReport)["2026-02-01"] == 0,
-            "a missing turn report stays distinct from a loaded zero")
+            TurnCountBuckets.scope(["codex"]) == "Turns · Codex only"
+                && TurnCountBuckets.scope([]) == nil,
+            "the turn subtitle names the scope it actually summed")
+
+        // LP2A — turns now ride the graph payload. What has to hold is that the
+        // per-client map is respected exactly: a client outside the supported
+        // turn set contributes nothing, and a hidden one is subtractable —
+        // which is precisely what a single per-day total could not express.
+        let turnsPayload = DemoData.payload(for: nil)
+        let turnsDay = turnsPayload.contributions.first { ($0.turnsByClient ?? [:]).count > 1 }
         expect(
-            PopoverView.supportedTurnClients(
-                ["gemini", "claude", "codex", "opencode"]
-            ) == ["claude", "codex"]
-                && PopoverView.supportedTurnClients(["gemini", "opencode"]).isEmpty,
-            "turn scope preserves display order and excludes unsupported clients")
+            turnsDay != nil,
+            "the demo payload carries a per-client turn map (without this every "
+                + "assertion below would pass on absent data)")
+        if let turnsDay, let map = turnsDay.turnsByClient {
+            let present = map.keys.sorted()
+            let first = present[0]
+            let both = turnsDay.turns(for: present)
+            let single = turnsDay.turns(for: [first])
+            let expectedTotal = present.reduce(Int64(0)) { $0 + (map[$1] ?? 0) }
+            expect(
+                both == expectedTotal && single == map[first],
+                "a day's turns are the sum over exactly the requested clients")
+            expect(
+                turnsDay.turns(for: present.dropFirst().map { $0 })
+                    == expectedTotal - (map[first] ?? 0),
+                "dropping a client subtracts exactly its own turns — the reason the "
+                    + "engine keys the map by client instead of emitting one daily total")
+            expect(
+                turnsDay.turns(for: ["not-a-client"]) == 0,
+                "an unknown client contributes zero rather than falling back to a total")
+            expect(
+                turnsDay.turns(for: []) == nil,
+                "an empty selection is 'nothing selected', not 'zero turns'")
+        }
+        // Monthly is the same map summed across the month's days.
+        let monthlyTurnRows = MonthlyView.monthRows(
+            payload: turnsPayload, clientIds: ClientRegistry.allIds,
+            turnClientIds: ["codex", "claude"])
+        let monthlyTurnsExpected: Int64 = turnsPayload.contributions.reduce(Int64(0)) {
+            $0 + ($1.turns(for: ["codex", "claude"]) ?? 0)
+        }
         expect(
-            TurnCountBuckets.showsLoading(
-                report: nil, requestInFlight: true, clientIds: ["codex", "claude"])
-                && !TurnCountBuckets.showsLoading(
-                    report: turnReport, requestInFlight: true, clientIds: ["codex"])
-                && !TurnCountBuckets.showsLoading(
-                    report: nil, requestInFlight: false, clientIds: ["codex"])
-                && !TurnCountBuckets.showsLoading(
-                    report: nil, requestInFlight: true, clientIds: []),
-            "turn spinner appears only while a supported report is in flight")
+            monthlyTurnRows.reduce(Int64(0)) { $0 + ($1.turns ?? 0) } == monthlyTurnsExpected,
+            "the monthly rows sum each day's turns for the same client slice")
+
         let dailyMessageOnlyView = DailyView(
-            payload: messageOnlyPayload, clientIds: ["codex"], hourlyReport: turnReport,
+            payload: messageOnlyPayload, clientIds: ["codex"],
             turnClientIds: ["codex", "claude"], colors: ModelColorMap(report: nil)
         )
         let dailyMessageOnlyRows = dailyMessageOnlyView.rows
@@ -2254,7 +4661,7 @@ enum SelfTest {
             "a message-only Daily row retains its model drill-down")
 
         let dashboardYearDefaultsKey = "tokenbar.dashboard.year"
-        let savedDashboardYear = UserDefaults.standard.object(forKey: dashboardYearDefaultsKey)
+        let savedAttributionDashboardYear = UserDefaults.standard.object(forKey: dashboardYearDefaultsKey)
         let turnTransitionChecks = awaitMainActorValue { () async -> [String: Bool] in
             let yearA = "2037"
             let yearB = "2038"
@@ -2266,7 +4673,7 @@ enum SelfTest {
             await staleModel.load()
             await staleSource.blockHourly(year: yearA)
             let staleTask = Task {
-                await staleModel.ensureData(for: .monthly, clients: clients)
+                await staleModel.ensureData(for: .hourly, clients: clients)
             }
             let stalePending = await waitUntil {
                 await staleSource.hasPendingHourly(year: yearA)
@@ -2274,9 +4681,9 @@ enum SelfTest {
             await staleModel.setYear(yearB)
             await staleSource.releaseHourly(year: yearA)
             await staleTask.value
-            let staleSuppressed = await staleModel.turnsReport(for: clients) == nil
-            await staleModel.ensureData(for: .monthly, clients: clients)
-            let matchingBAfterStale = await staleModel.turnsReport(for: clients) != nil
+            let staleSuppressed = await staleModel.hourlyReport(for: clients) == nil
+            await staleModel.ensureData(for: .hourly, clients: clients)
+            let matchingBAfterStale = await staleModel.hourlyReport(for: clients) != nil
 
             // The inverse ordering is also fail-closed: B's hourly report may
             // arrive while graph A is still displayed, but remains hidden until
@@ -2284,42 +4691,758 @@ enum SelfTest {
             let inverseSource = ControlledTurnUsageDataSource()
             let inverseModel = DashboardModel(source: inverseSource, initialYear: yearA)
             await inverseModel.load()
-            await inverseModel.ensureData(for: .monthly, clients: clients)
-            let initialAVisible = await inverseModel.turnsReport(for: clients) != nil
+            await inverseModel.ensureData(for: .hourly, clients: clients)
+            let initialAVisible = await inverseModel.hourlyReport(for: clients) != nil
             await inverseSource.blockGraph(year: yearB)
             let switchTask = Task { await inverseModel.setYear(yearB) }
             let graphBPending = await waitUntil {
                 await inverseSource.hasPendingGraph(year: yearB)
             }
-            let oldReportSuppressed = await inverseModel.turnsReport(for: clients) == nil
-            await inverseModel.ensureData(for: .monthly, clients: clients)
-            let newReportBeforePayloadSuppressed =
-                await inverseModel.turnsReport(for: clients) == nil
+            let oldReportSuppressed = await inverseModel.hourlyReport(for: clients) == nil
+            await inverseModel.ensureData(for: .hourly, clients: clients)
             await inverseSource.releaseGraph(year: yearB)
             await switchTask.value
-            let matchingBVisible = await inverseModel.turnsReport(for: clients) != nil
+            let matchingBVisible = await inverseModel.hourlyReport(for: clients) != nil
 
-            let emptySource = ControlledTurnUsageDataSource()
-            let emptyModel = DashboardModel(source: emptySource, initialYear: yearA)
-            await emptyModel.load()
-            await emptySource.blockHourly(year: yearA)
-            await emptyModel.ensureData(for: .monthly, clients: [])
-            let emptyDidNotFetch = !(await emptySource.hasPendingHourly(year: yearA))
+            // The phantom-slice guard: `setYear` moves `year` synchronously
+            // while the payload catches up only when reload commits, so the
+            // model task can fire with a new year against the previous
+            // payload. Scanning for that pairing issues a report the year
+            // guard must then discard. Blocking the graph holds the model in
+            // exactly that window.
+            let phantomSource = ControlledTurnUsageDataSource()
+            let phantomModel = DashboardModel(source: phantomSource, initialYear: yearA)
+            await phantomModel.load()
+            await phantomSource.blockGraph(year: yearB)
+            let phantomSwitch = Task { await phantomModel.setYear(yearB) }
+            _ = await waitUntil { await phantomSource.hasPendingGraph(year: yearB) }
+            let phantomCallsBefore = await phantomSource.modelCallCount()
+            await phantomModel.ensureModelData(for: .overview)
+            let phantomIssuedNoScan =
+                await phantomSource.modelCallCount() == phantomCallsBefore
+            // Issuing nothing is only half of it. The cards distinguish
+            // "loading" from "completed and found nothing" by this flag alone,
+            // so leaving it down here made Models and Overview claim the new
+            // year had no model usage for the whole graph reload.
+            let phantomReadsAsLoading = await phantomModel.modelLoading
+            await phantomSource.releaseGraph(year: yearB)
+            await phantomSwitch.value
+
+            // Codex P2 — reopening the popover must not put the model scan
+            // back beside the graph. A restored snapshot makes the dashboard
+            // renderable before `load()` fetches anything, so the model task
+            // has a real key on its first body evaluation and fires at once.
+            // The "no model scan until a payload commits" property therefore
+            // held only for a first-ever open; a reopen whose snapshot carries
+            // no current model report is the common case that broke it.
+            let reopenYear = "2041"
+            let reopenSource = ControlledTurnUsageDataSource()
+            let reopenSeed = DashboardModel(
+                cachesSnapshot: true, source: reopenSource, initialYear: reopenYear)
+            await reopenSeed.load()
+            // Seeded from a session that never opened a model lens, so the
+            // snapshot carries a payload but no report.
+            let seededWithoutModel = await reopenSource.modelCallCount() == 0
+            await reopenSource.blockGraph(year: reopenYear)
+            let reopened = DashboardModel(
+                cachesSnapshot: true, source: reopenSource, initialYear: reopenYear)
+            let reopenRestored = reopened.payload != nil && reopened.modelReport == nil
+            let reopenLoad = Task { await reopened.load() }
+            _ = await waitUntil { await reopenSource.hasPendingGraph(year: reopenYear) }
+            let reopenLens = Task { await reopened.ensureModelData(for: .overview) }
+            let reopenRaced = await waitUntil { await reopenSource.modelCallCount() > 0 }
+            let reopenDidNotRace = !reopenRaced
+            // Codex P2 — deferring the scan must not read as an answered
+            // "none". The restored snapshot is already `.ready`, so the model
+            // cards are on screen for the whole wait above; with the flag down
+            // they render "No model usage in this range" for the length of a
+            // cold scan, reporting a deferred read as a finished one.
+            let reopenLoadingWhileDeferred = reopened.modelLoading
+            await reopenSource.releaseGraph(year: reopenYear)
+            await reopenLoad.value
+            await reopenLens.value
+            // Deferring must not mean dropping: the report still arrives.
+            let reopenModelArrived = await reopened.modelReport != nil
+
+            // Codex P2 — a manual refresh must share the same gate. Only the
+            // initial load installed it, and the reasoning that excused refresh
+            // ("the slice key cannot move while it runs, so no model task
+            // fires") covered one trigger of two: the task is keyed on the LENS
+            // as well as the slice, so opening Overview mid-refresh raises a
+            // request with the key standing still.
+            let refreshGateYear = "2042"
+            let refreshGateSource = ControlledTurnUsageDataSource()
+            let refreshGateModel = DashboardModel(
+                source: refreshGateSource, initialYear: refreshGateYear)
+            await refreshGateModel.load()
+            // Control: the graph-only load leaves no report, so the lens below
+            // has a real scan to issue rather than an idempotent no-op.
+            let refreshGateCallsBefore = await refreshGateSource.modelCallCount()
+            let refreshGateNeedsModel =
+                refreshGateModel.modelReport == nil && refreshGateCallsBefore == 0
+            await refreshGateSource.blockGraph(year: refreshGateYear)
+            let refreshGateTask = Task { await refreshGateModel.refresh() }
+            _ = await waitUntil { await refreshGateSource.hasPendingGraph(year: refreshGateYear) }
+            let refreshGateLens = Task {
+                await refreshGateModel.ensureModelData(for: .overview)
+            }
+            let refreshGateRaced = await waitUntil {
+                await refreshGateSource.modelCallCount() > 0
+            }
+            let refreshGateDeferred = !refreshGateRaced
+            await refreshGateSource.releaseGraph(year: refreshGateYear)
+            await refreshGateTask.value
+            await refreshGateLens.value
+            let refreshGateRacingCalls = await refreshGateSource.modelCallsRacingGraph()
+            let refreshGateModelArrived =
+                refreshGateModel.modelReport != nil && refreshGateRacingCalls == 0
+
+            // Codex P2 — the poll's retry restated the staleness rule and got
+            // it wrong. A failure that lands while a LAST-GOOD report is
+            // displayed keeps that report, so `modelReport == nil` was false
+            // and the retry never fired: the cards sat on generation A's models
+            // beside a chart that had moved to B, with no spinner and no error.
+            // Every graph call here returns a new generation, so the refresh
+            // genuinely moves the committed slice out from under the report.
+            let staleGenSource = ControlledTurnUsageDataSource()
+            await staleGenSource.advanceGraphGenerationPerCall()
+            let staleGenModel = DashboardModel(source: staleGenSource, initialYear: nil)
+            await staleGenModel.load()
+            await staleGenModel.ensureModelData(for: .overview)
+            let staleGenSeeded = staleGenModel.modelReport != nil
+            await staleGenSource.failNextModel()
+            await staleGenModel.refresh()
+            await staleGenModel.ensureModelData(for: .overview)
+            // Control: the failure has to leave a report standing, or the old
+            // `modelReport == nil` gate would have retried anyway and this
+            // assertion would pass on the very state it exists to exclude.
+            let staleGenKeptLastGood = staleGenModel.modelReport != nil
+            let staleGenCallsBefore = await staleGenSource.modelCallCount()
+            await staleGenModel.retryMissingModelForTest()
+            let staleGenCallsAfter = await staleGenSource.modelCallCount()
+            let staleGenRetried = staleGenCallsAfter > staleGenCallsBefore
+
+            // A reopen that commits a new generation scans the model exactly
+            // once, for the committed slice.
+            //
+            // This does NOT discriminate where the gate opens. Codex raised
+            // that the fetch-gated version let the waiter resume before
+            // `apply()` and scan a generation about to be superseded; moving
+            // the commit inside the gated task makes the ordering structural.
+            // But the fetch-gated version was mutated back in and survived
+            // three runs — both waiters register on the same task, and the
+            // fetch's owner registers first, so it commits first in practice.
+            // The language does not guarantee that; the fix removes the
+            // reliance rather than a reproduced defect. What this assertion is
+            // good for is catching a double scan arriving by any route.
+            let commitGenSource = ControlledTurnUsageDataSource()
+            await commitGenSource.advanceGraphGenerationPerCall()
+            let commitGenSeed = DashboardModel(
+                cachesSnapshot: true, source: commitGenSource, initialYear: nil)
+            await commitGenSeed.load()
+            let seededKey = commitGenSeed.committedSliceKey
+            await commitGenSource.blockGraph(year: nil)
+            let commitGenModel = DashboardModel(
+                cachesSnapshot: true, source: commitGenSource, initialYear: nil)
+            // Control: the reopen restores the seeded generation, so the fetch
+            // below genuinely moves it and a pre-commit read would be visible.
+            let commitGenRestoredStale = commitGenModel.committedSliceKey == seededKey
+            let commitGenLoad = Task { await commitGenModel.load() }
+            _ = await waitUntil { await commitGenSource.hasPendingGraph(year: nil) }
+            let commitGenLens = Task { await commitGenModel.ensureModelData(for: .overview) }
+            await commitGenSource.releaseGraph(year: nil)
+            await commitGenLoad.value
+            await commitGenLens.value
+            let commitGenAdvanced = commitGenModel.committedSliceKey != seededKey
+            let commitGenScannedOnce = await commitGenSource.modelCallCount() == 1
+
+            // Codex P2 — a restored payload is not a committed one. When the
+            // reopen's graph fetch fails, `try?` leaves the restored payload
+            // standing; scanning against it puts a reading of now beside a
+            // chart from the previous session, tagged as if they agreed.
+            // `tb_model_report` takes a year and nothing else, so the scan is
+            // always current logs — the generation is a cache identity, not a
+            // filter. Before the split, a throwing graph discarded the model
+            // with it, so this was the branch's own regression.
+            let failGraphSource = ControlledTurnUsageDataSource()
+            await failGraphSource.advanceGraphGenerationPerCall()
+            // Its own year: `lastSnapshot` is process-static and keyed on the
+            // year alone, so an all-time seed here would inherit — and re-cache
+            // — the model report an earlier all-time fixture published, leaving
+            // the control below unable to observe an absent report.
+            let failGraphYear = "2043"
+            let failGraphSeed = DashboardModel(
+                cachesSnapshot: true, source: failGraphSource, initialYear: failGraphYear)
+            await failGraphSeed.load()
+            let failGraphReopened = DashboardModel(
+                cachesSnapshot: true, source: failGraphSource, initialYear: failGraphYear)
+            // Control: the reopen really restores a renderable payload, so the
+            // assertion below cannot pass merely because nothing was on screen.
+            let failGraphRestored =
+                failGraphReopened.payload != nil && failGraphReopened.modelReport == nil
+            await failGraphSource.failNextGraph()
+            await failGraphReopened.load()
+            let failGraphCallsBefore = await failGraphSource.modelCallCount()
+            await failGraphReopened.ensureModelData(for: .overview)
+            let failGraphIssuedNoScan =
+                await failGraphSource.modelCallCount() == failGraphCallsBefore
+            // Absent, but the answer is not "none": the cards must read as
+            // loading rather than claim the range has no model usage.
+            let failGraphReadsAsLoading = failGraphReopened.modelLoading
+            // A later successful commit heals it — the guard defers the scan,
+            // it does not abandon it.
+            await failGraphReopened.load()
+            await failGraphReopened.ensureModelData(for: .overview)
+            let failGraphHealed = failGraphReopened.modelReport != nil
+
+            // Codex P2 — an overtaken fetch must not report failure over a
+            // newer commit. `load()` for year A can still be in flight when the
+            // user picks year B (the phantom-slice guards exist for exactly
+            // that overlap); if B commits first and A then fails, an
+            // unconditional flag marks the DISPLAYED slice failed and strands
+            // its model cards on a spinner until the next successful poll.
+            let overtakeA = "2044"
+            let overtakeB = "2045"
+            let overtakeSource = ControlledTurnUsageDataSource()
+            let overtakeModel = DashboardModel(source: overtakeSource, initialYear: overtakeA)
+            await overtakeSource.blockGraph(year: overtakeA)
+            let overtakeLoad = Task { await overtakeModel.load() }
+            _ = await waitUntil { await overtakeSource.hasPendingGraph(year: overtakeA) }
+            // B overtakes and commits while A is still parked.
+            await overtakeModel.setYear(overtakeB)
+            // Control: B really is the committed slice before A settles, or the
+            // assertion below would pass on a model that was never displaced.
+            let overtakeBCommitted = overtakeModel.committedSliceKey.hasPrefix(overtakeB)
+            await overtakeSource.failPendingGraph(year: overtakeA)
+            await overtakeLoad.value
+            await overtakeModel.ensureModelData(for: .overview)
+            let overtakeServedB = overtakeModel.modelReport != nil
+
+            // Codex P2 — the same ownership rule has to cover SUCCESS. Two
+            // same-year fetches overlap when a manual Refresh starts while
+            // `load()` is still running; the year guards cannot separate them,
+            // so an older result landing second rolled the dashboard and the
+            // reopen snapshot back to its payload.
+            // The fixture year must MATCH the injected "today", or
+            // `DemoData.dates(for:today:)` clamps the range to that year's 31
+            // December and both releases carry an identical `generatedAt` —
+            // the day argument would have no effect and the ordering below
+            // would be unobservable.
+            let rollbackYear = "2037"
+            let rollbackSource = ControlledTurnUsageDataSource()
+            let rollbackModel = DashboardModel(source: rollbackSource, initialYear: rollbackYear)
+            await rollbackSource.blockGraph(year: rollbackYear)
+            let rollbackLoad = Task { await rollbackModel.load() }
+            _ = await waitUntil { await rollbackSource.pendingGraphCount(year: rollbackYear) == 1 }
+            let rollbackRefresh = Task { await rollbackModel.refresh() }
+            let rollbackBothParked = await waitUntil {
+                await rollbackSource.pendingGraphCount(year: rollbackYear) == 2
+            }
+            // The later fetch commits first.
+            await rollbackSource.releaseGraph(year: rollbackYear, index: 1, day: 9)
+            _ = await waitUntil {
+                await MainActor.run { rollbackModel.committedSliceKey.contains("2037-06-19") }
+            }
+            let rollbackNewerCommitted =
+                rollbackModel.committedSliceKey.contains("2037-06-19")
+            // The earlier one lands afterwards and must not take the slice back.
+            await rollbackSource.releaseGraph(year: rollbackYear, index: 0, day: 1)
+            await rollbackLoad.value
+            await rollbackRefresh.value
+            let rollbackHeldNewer =
+                rollbackModel.committedSliceKey.contains("2037-06-19")
+
+            // Codex P2 — a superseded fetch settles nothing, so waking on it is
+            // not the same as waking on a committed slice. The waiter has to
+            // follow the chain: it captured the older task, that task returns
+            // without committing, and scanning then would put a model scan
+            // beside the newer graph fetch still running.
+            let chainYear = "2047"
+            let chainSource = ControlledTurnUsageDataSource()
+            let chainSeed = DashboardModel(
+                cachesSnapshot: true, source: chainSource, initialYear: chainYear)
+            await chainSeed.load()
+            let chainModel = DashboardModel(
+                cachesSnapshot: true, source: chainSource, initialYear: chainYear)
+            // Control: a restored payload is what lets the model request reach
+            // the gate at all — without one it returns at the slice guard and
+            // never waits, so the assertions below would pass vacuously.
+            let chainRestored = chainModel.payload != nil && chainModel.modelReport == nil
+            await chainSource.blockGraph(year: chainYear)
+            let chainLoad = Task { await chainModel.load() }
+            _ = await waitUntil { await chainSource.pendingGraphCount(year: chainYear) == 1 }
+            // Captures the OLDER task, before the refresh below supersedes it.
+            let chainLens = Task { await chainModel.ensureModelData(for: .overview) }
+            let chainRefresh = Task { await chainModel.refresh() }
+            let chainBothParked = await waitUntil {
+                await chainSource.pendingGraphCount(year: chainYear) == 2
+            }
+            // The older fetch completes and commits nothing.
+            await chainSource.releaseGraph(year: chainYear, index: 0, day: 3)
+            let chainRaced = await waitUntil { await chainSource.modelCallCount() > 0 }
+            let chainDidNotRace = !chainRaced
+            await chainSource.releaseGraph(year: chainYear, index: 0, day: 7)
+            await chainLoad.value
+            await chainRefresh.value
+            await chainLens.value
+            let chainArrived = chainModel.modelReport != nil
+            let chainNeverRacedGraph = await chainSource.modelCallsRacingGraph() == 0
+
+            // Same rule one level out: a superseded RELOAD settled nothing, so
+            // its lazy-lens re-fetch would put an hourly scan beside the graph
+            // fetch that overtook it. Blocking hourly makes the re-fetch
+            // observable as a parked request rather than needing a counter.
+            let lazyYear = "2048"
+            let lazyClients = ["codex", "claude"]
+            let lazySource = ControlledTurnUsageDataSource()
+            let lazyModel = DashboardModel(source: lazySource, initialYear: lazyYear)
+            await lazyModel.load()
+            await lazyModel.ensureData(for: .hourly, clients: lazyClients)
+            // Control: reload only re-fetches a lens it already holds, so
+            // without this the assertion below would pass on a lens that could
+            // never have been re-fetched at all.
+            let lazySeeded = await lazyModel.hourlyReport(for: lazyClients) != nil
+            await lazySource.blockGraph(year: lazyYear)
+            let lazyRefresh = Task { await lazyModel.refresh() }
+            _ = await waitUntil { await lazySource.pendingGraphCount(year: lazyYear) == 1 }
+            let lazyLoad = Task { await lazyModel.load() }
+            let lazyBothParked = await waitUntil {
+                await lazySource.pendingGraphCount(year: lazyYear) == 2
+            }
+            await lazySource.blockHourly(year: lazyYear)
+            // The refresh is now the older, overtaken fetch.
+            await lazySource.releaseGraph(year: lazyYear, index: 0, day: 3)
+            let lazyRefetched = await waitUntil {
+                await lazySource.hasPendingHourly(year: lazyYear)
+            }
+            let lazyHeldBack = !lazyRefetched
+            await lazySource.releaseGraph(year: lazyYear, index: 0, day: 7)
+            await lazySource.releaseHourly(year: lazyYear)
+            await lazyRefresh.value
+            await lazyLoad.value
+
+            // Codex P2 — the task key must change when the committed slice
+            // changes, even when two slices share a payload generation. An
+            // all-years payload and a current-year payload are both dated
+            // today, so a key built from the REQUESTED year moved at the moment
+            // of intent and then sat still when the new payload committed: the
+            // task never re-fired and no model request followed.
+            let sameGenSource = ControlledTurnUsageDataSource()
+            let sameGenModel = DashboardModel(source: sameGenSource, initialYear: nil)
+            await sameGenModel.load()
+            let allYearsKey = sameGenModel.committedSliceKey
+            let allYearsGeneration = sameGenModel.payload?.meta.generatedAt
+            let thisYear = String(Format.todayKey().prefix(4))
+            // Sample the key DURING the switch, before the new payload commits.
+            // Measured only after `setYear` returns, `year` and
+            // `acceptedPayloadYear` already agree and a key built from either
+            // one looks identical — which is exactly why the defect survived a
+            // terminal-state assertion.
+            await sameGenSource.blockGraph(year: thisYear)
+            let sameGenSwitch = Task { await sameGenModel.setYear(thisYear) }
+            _ = await waitUntil { await sameGenSource.hasPendingGraph(year: thisYear) }
+            let midSwitchKey = sameGenModel.committedSliceKey
+            await sameGenSource.releaseGraph(year: thisYear)
+            await sameGenSwitch.value
+            let thisYearKey = sameGenModel.committedSliceKey
+            let thisYearGeneration = sameGenModel.payload?.meta.generatedAt
+            // The key must not move until the payload does: moving at the
+            // moment of intent is what left it unchanged at commit time.
+            let keyHeldUntilCommit = midSwitchKey == allYearsKey
+            // Control: without this the assertion below would pass on any key,
+            // because the collision it guards against would not be present.
+            let generationsCollide =
+                allYearsGeneration != nil && allYearsGeneration == thisYearGeneration
+            let keyChangedDespiteCollision = allYearsKey != thisYearKey
+
+            // Codex P2 — a transient model failure must self-heal. Before the
+            // graph/model split the 60s poll re-fetched the report
+            // unconditionally, so a failed attempt recovered on its own;
+            // deferring the fetch removed that path and left the cards claiming
+            // "no model usage" until the user intervened.
+            let healSource = ControlledTurnUsageDataSource()
+            let healModel = DashboardModel(source: healSource, initialYear: yearA)
+            await healModel.load()
+            await healSource.failNextModel()
+            await healModel.ensureModelData(for: .overview)
+            let failedLeftEmpty = await healModel.modelReport == nil
+            // The poll is what used to heal this; drive its retry directly.
+            await healModel.retryMissingModelForTest()
+            let healedAfterRetry = await healModel.modelReport != nil
+
+            // Codex P1 — switching lens mid-scan must still publish. SwiftUI
+            // cancels the lens-keyed task on the switch, so if the cancelled
+            // task owns publication and the re-entrant one merely coalesces
+            // and returns, nobody publishes and the new lens sits empty.
+            let handoffSource = ControlledTurnUsageDataSource()
+            let handoffModel = DashboardModel(source: handoffSource, initialYear: yearA)
+            await handoffModel.load()
+            await handoffSource.blockModel()
+            let overviewTask = Task { await handoffModel.ensureModelData(for: .overview) }
+            _ = await waitUntil { await handoffSource.pendingModelCount() > 0 }
+            overviewTask.cancel()
+            let modelsTask = Task { await handoffModel.ensureModelData(for: .models) }
+            _ = await waitUntil { await handoffSource.pendingModelCount() > 0 }
+            await handoffSource.releaseModel()
+            await overviewTask.value
+            await modelsTask.value
+            let survivesLensSwitch = await handoffModel.modelReport != nil
+
+            // A year switch must drop the previous year's model report. Two
+            // sites enforce it — `setYear` calls `invalidateModel()`, and
+            // `apply()` discards a report whose `modelYear` disagrees with the
+            // committed payload — so each masks the other under single-site
+            // mutation, and neither was covered. Without both, switching year
+            // leaves the old year's models rendered in Overview and Models.
+            let yearModelSource = ControlledTurnUsageDataSource()
+            let yearModelModel = DashboardModel(source: yearModelSource, initialYear: yearA)
+            await yearModelModel.load()
+            await yearModelModel.ensureModelData(for: .overview)
+            let modelHeldForA = await yearModelModel.modelReport != nil
+            await yearModelModel.setYear(yearB)
+            let modelDroppedOnYearSwitch = await yearModelModel.modelReport == nil
+
+            // LP2A — Daily/Monthly no longer request any lazy report; their
+            // turns ride the graph payload. Blocking hourly and driving both
+            // lenses proves the request is gone rather than merely fast.
+            let noHourlySource = ControlledTurnUsageDataSource()
+            let noHourlyModel = DashboardModel(source: noHourlySource, initialYear: yearA)
+            await noHourlyModel.load()
+            await noHourlySource.blockHourly(year: yearA)
+            // Driven in Tasks and probed, not awaited: if the request came back
+            // these would park on the blocked source forever, and a hung suite
+            // is a far worse failure signal than a red assertion.
+            let dailyDrive = Task { await noHourlyModel.ensureData(for: .daily, clients: clients) }
+            let monthlyDrive = Task {
+                await noHourlyModel.ensureData(for: .monthly, clients: clients)
+            }
+            let hourlyReappeared = await waitUntil {
+                await noHourlySource.hasPendingHourly(year: yearA)
+            }
+            let emptyDidNotFetch = !hourlyReappeared
+            await noHourlySource.releaseHourly(year: yearA)
+            await dailyDrive.value
+            await monthlyDrive.value
+
+            // LP2B — the graph must not share its scan window with the model.
+            // With the graph blocked, load() is still in flight; a model request
+            // arriving now is precisely the contention that made first paint
+            // 5x slower warm and 2.5x slower cold on a real corpus.
+            let deferSource = ControlledTurnUsageDataSource()
+            let deferModel = DashboardModel(source: deferSource, initialYear: yearA)
+            await deferSource.blockGraph(year: yearA)
+            let deferLoad = Task { await deferModel.load() }
+            let deferGraphPending = await waitUntil {
+                await deferSource.hasPendingGraph(year: yearA)
+            }
+            // Drive the model-dependent lens while the graph is still blocked.
+            // Probed rather than awaited: the request no longer returns early,
+            // it waits for the base load, so awaiting it here would park until
+            // the release below and hang the suite instead of failing it.
+            let deferLens = Task { await deferModel.ensureModelData(for: .overview) }
+            let modelRaced = await waitUntil { await deferSource.modelCallCount() > 0 }
+            let noModelDuringGraph = !modelRaced
+            await deferSource.releaseGraph(year: yearA)
+            await deferLoad.value
+            // Sampled between the graph landing and the deferred request
+            // finishing: the dashboard must already be renderable on the graph
+            // alone, which is the whole point of taking the model off this path.
+            let readyWithoutModel = await deferModel.modelReport == nil
+            await deferLens.value
+            let phaseReadyBeforeModel = await {
+                if case .ready = await deferModel.phase { return true }
+                return false
+            }()
+            // Now the payload has committed, the same call fetches once.
+            await deferModel.ensureModelData(for: .overview)
+            let modelArrives = await deferModel.modelReport != nil
+            let fetchedOnce = await deferSource.modelCallCount() == 1
+            // Idempotent per committed generation: a re-render must not refetch.
+            await deferModel.ensureModelData(for: .overview)
+            let noRefetch = await deferSource.modelCallCount() == 1
+            let neverRacedGraph = await deferSource.modelCallsRacingGraph() == 0
+
+            // Daily/Monthly do not depend on the model report at all.
+            let dailySource = ControlledTurnUsageDataSource()
+            let dailyModel = DashboardModel(source: dailySource, initialYear: yearA)
+            await dailyModel.load()
+            await dailyModel.ensureModelData(for: .daily)
+            await dailyModel.ensureModelData(for: .monthly)
+            let lensesSkipModel = await dailySource.modelCallCount() == 0
+
+            // F1 regression — a graph refresh must not fan out into two
+            // concurrent model scans. The defect only appears under the real
+            // interleaving: the background refresh bumps the request token and
+            // THEN suspends, which yields the MainActor and lets PopoverView's
+            // generation-keyed task re-fire and issue a second scan. A purely
+            // sequential drive cannot reproduce it — the first request would
+            // simply publish and the second would find matching identity — so
+            // this blocks the model source and re-fires the lens while a
+            // request is genuinely in flight.
+            let refreshSource = ControlledTurnUsageDataSource()
+            await refreshSource.advanceGraphGenerationPerCall()
+            let refreshModel = DashboardModel(source: refreshSource, initialYear: nil)
+            await refreshModel.load()
+            await refreshModel.ensureModelData(for: .overview)
+            let beforeRefresh = await refreshSource.modelCallCount()
+            await refreshSource.blockModel()
+            let refreshTask = Task { await refreshModel.refresh() }
+            // Give any background model request a chance to be issued and park.
+            let sawInFlight = await waitUntil { await refreshSource.pendingModelCount() > 0 }
+            // The lens task re-fires here, exactly as the payload-generation key
+            // makes it once apply() commits the refreshed graph.
+            let refireTask = Task { await refreshModel.ensureModelData(for: .overview) }
+            _ = await waitUntil { await refreshSource.pendingModelCount() > 0 }
+            await refreshSource.releaseModel()
+            await refreshTask.value
+            await refireTask.value
+            let afterRefresh = await refreshSource.modelCallCount()
+            // EXACTLY one scan per graph commit. `<=` alone was one-sided: it
+            // stayed green when the identity gate was mutated to never refetch,
+            // which is the opposite failure and the one deleting the background
+            // refresh could plausibly have caused.
+            let oneScanPerCommit = (afterRefresh - beforeRefresh) == 1
+            _ = sawInFlight
+
+            // Re-entry during an in-flight scan must join it, not start a
+            // second. Both triggers are ordinary interaction: expanding another
+            // Daily/Monthly row, or switching Overview→Models mid-scan.
+            let reentrySource = ControlledTurnUsageDataSource()
+            let reentryModel = DashboardModel(source: reentrySource, initialYear: yearA)
+            await reentryModel.load()
+            await reentrySource.blockModel()
+            let firstEntry = Task { await reentryModel.ensureModelColors() }
+            _ = await waitUntil { await reentrySource.pendingModelCount() > 0 }
+            let secondEntry = Task { await reentryModel.ensureModelColors() }
+            let thirdEntry = Task { await reentryModel.ensureModelData(for: .models) }
+            let coalescedWhileInFlight = await reentrySource.pendingModelCount() == 1
+            await reentrySource.releaseModel()
+            await firstEntry.value
+            await secondEntry.value
+            await thirdEntry.value
+            let reentryScans = await reentrySource.modelCallCount()
+            let reentryCoalesced = coalescedWhileInFlight && reentryScans == 1
+            // The coalesced request must still publish — collapsing re-entry is
+            // only correct if the surviving scan actually lands.
+            let coalescedStillPublished = await reentryModel.modelReport != nil
+
+            // A snapshot whose model lags its payload must refetch on the first
+            // model lens; storing only the payload's generation would silently
+            // present a stale report as current.
+            let lagSource = ControlledTurnUsageDataSource()
+            await lagSource.advanceGraphGenerationPerCall()
+            let lagSeed = DashboardModel(
+                cachesSnapshot: true, source: lagSource, initialYear: nil)
+            await lagSeed.load()
+            await lagSeed.ensureModelData(for: .overview)
+            let lagSeedCalls = await lagSource.modelCallCount()
+            // Move the graph on without touching the model, exactly as a poll
+            // does while the user sits on a lens that shows no models.
+            await lagSeed.refresh()
+            let lagRestored = DashboardModel(
+                cachesSnapshot: true, source: lagSource, initialYear: nil)
+            // Control: the restore really is a lag (payload present, model
+            // absent/stale for it), so LP3's restore gate is installed and
+            // `ensureModelData` below cannot return without going through it.
+            let lagRestoredNeedsGate = lagRestored.payload != nil
+            // LP3 precondition: `ensureModelData`/`ensureModelColors` require
+            // `load()` to have been called first, or the restore gate a lag
+            // installs hangs forever. `pauseGraphAdvance()` holds this load to
+            // the SAME generation the snapshot already carries — the fixture
+            // advances on every call by default, and letting this one move
+            // the generation would make the refetch below ambiguous: caused
+            // by the model lag under test, or merely by the payload moving.
+            await lagSource.pauseGraphAdvance()
+            let lagGenerationBeforeLoad = lagRestored.payload?.meta.generatedAt
+            await lagRestored.load()
+            await lagSource.resumeGraphAdvance()
+            let lagLoadHeldGeneration =
+                lagRestored.payload?.meta.generatedAt == lagGenerationBeforeLoad
+            await lagRestored.ensureModelData(for: .overview)
+            let lagRefetched = await lagSource.modelCallCount() > lagSeedCalls
+
+            // A genuinely newer slice must supersede, not be swallowed by the
+            // coalescing guard. Without this a guard of the shape
+            // `if modelInFlight != nil { return }` would look correct.
+            let supersedeSource = ControlledTurnUsageDataSource()
+            await supersedeSource.advanceGraphGenerationPerCall()
+            // A concrete year, not nil: `lastSnapshot` is process-static and an
+            // earlier check in this same function seeds it for the all-time
+            // slice, which this model would otherwise restore — masking the
+            // first request entirely. The advancing fixture days live in 2037,
+            // so a 2037 filter still moves `generatedAt` per graph call.
+            let supersedeModel = DashboardModel(source: supersedeSource, initialYear: yearA)
+            await supersedeModel.load()
+            await supersedeSource.blockModel()
+            let staleScan = Task { await supersedeModel.ensureModelData(for: .overview) }
+            _ = await waitUntil { await supersedeSource.pendingModelCount() > 0 }
+            // Move the graph on, then request again: a different generation, so
+            // this must start its own scan rather than join the parked one.
+            await supersedeModel.refresh()
+            let newerScan = Task { await supersedeModel.ensureModelData(for: .overview) }
+            let bothInFlight = await waitUntil { await supersedeSource.pendingModelCount() >= 2 }
+            // Retire only the superseded scan. Its completion must not clear
+            // the loading flag, which still belongs to the scan replacing it —
+            // otherwise the cards fall to the empty copy while work continues.
+            await supersedeSource.releaseOneModel()
+            await staleScan.value
+            let loadingHeldBySuccessor = supersedeModel.modelLoading
+            await supersedeSource.releaseModel()
+            await newerScan.value
+            let newerSliceSupersedes = bothInFlight
+
+            // ABA — the in-flight slot must be released by the scan that owns
+            // it, not by any scan carrying an equal identity value. A year
+            // round-trip during a scan reproduces the equal-value collision
+            // because tb_graph's 30s cache returns the same payload, so the
+            // generation is unchanged.
+            let abaSource = ControlledTurnUsageDataSource()
+            let abaModel = DashboardModel(source: abaSource, initialYear: yearA)
+            await abaModel.load()
+            await abaSource.blockModel()
+            let abaFirst = Task { await abaModel.ensureModelColors() }
+            _ = await waitUntil { await abaSource.pendingModelCount() > 0 }
+            await abaModel.setYear(yearB)
+            await abaModel.setYear(yearA)
+            let abaSecond = Task { await abaModel.ensureModelColors() }
+            _ = await waitUntil { await abaSource.pendingModelCount() >= 2 }
+            // Retire only the stale scan and let it finish unwinding. If it
+            // releases the live scan's slot, the next ordinary re-entry starts a
+            // third concurrent scan.
+            await abaSource.releaseOneModel()
+            await abaFirst.value
+            let abaThird = Task { await abaModel.ensureModelColors() }
+            // Wait for the outcome instead of sampling immediately: the third
+            // task had not been scheduled yet when this read the counter, so
+            // the assertion passed even with the defect restored.
+            let abaThirdStarted = await waitUntil { await abaSource.modelCallCount() >= 3 }
+            let abaNoThirdScan = !abaThirdStarted
+            await abaSource.releaseModel()
+            await abaSecond.value
+            await abaThird.value
+
+            // modelLoading is the only thing keeping the model cards from
+            // reading "No model usage in this range" mid-scan, and nothing
+            // asserted it until now.
+            let loadingSource = ControlledTurnUsageDataSource()
+            let loadingModel = DashboardModel(source: loadingSource, initialYear: yearA)
+            await loadingModel.load()
+            await loadingSource.blockModel()
+            let loadingTask = Task { await loadingModel.ensureModelData(for: .models) }
+            _ = await waitUntil { await loadingSource.pendingModelCount() > 0 }
+            let loadingTrueInFlight = await loadingModel.modelLoading
+            await loadingSource.releaseModel()
+            await loadingTask.value
+            let loadingFalseAfter = await loadingModel.modelLoading == false
+
+            // F2 regression — Daily/Monthly render a per-model drill-down whose
+            // dots are tinted from the model report. Expanding a row must be
+            // able to populate the colour map, or every model of one provider
+            // collapses onto the same rank-0 shade.
+            let colorSource = ControlledTurnUsageDataSource()
+            let colorModel = DashboardModel(source: colorSource, initialYear: yearA)
+            await colorModel.load()
+            await colorModel.ensureModelData(for: .daily)
+            let entriesForColor = DemoData.modelReport(for: yearA).entries
+                .sorted { $0.cost > $1.cost }
+            let colorProbe: (String, String) -> String = { provider, name in
+                colorModel.colors.color(provider, name)
+            }
+            let flatBeforeExpand: Bool = {
+                guard entriesForColor.count >= 2 else { return true }
+                let a = colorProbe(entriesForColor[0].provider, entriesForColor[0].model)
+                let b = colorProbe(entriesForColor[1].provider, entriesForColor[1].model)
+                return a == b
+            }()
+            await colorModel.ensureModelColors()
+            let gradedAfterExpand: Bool = {
+                guard entriesForColor.count >= 2 else { return true }
+                let sameProvider = entriesForColor.first { entry in
+                    entry.provider == entriesForColor[0].provider
+                        && entry.model != entriesForColor[0].model
+                }
+                guard let sameProvider else { return true }
+                let a = colorProbe(entriesForColor[0].provider, entriesForColor[0].model)
+                let b = colorProbe(sameProvider.provider, sameProvider.model)
+                return a != b
+            }()
 
             return [
+                "deferGraphPending": deferGraphPending,
+                "noModelDuringGraph": noModelDuringGraph,
+                "readyWithoutModel": readyWithoutModel,
+                "phaseReadyBeforeModel": phaseReadyBeforeModel,
+                "modelArrives": modelArrives,
+                "fetchedOnce": fetchedOnce,
+                "noRefetch": noRefetch,
+                "neverRacedGraph": neverRacedGraph,
+                "lensesSkipModel": lensesSkipModel,
+                "modelHeldForA": modelHeldForA,
+                "survivesLensSwitch": survivesLensSwitch,
+                "failedLeftEmpty": failedLeftEmpty,
+                "generationsCollide": generationsCollide,
+                "seededWithoutModel": seededWithoutModel,
+                "reopenRestored": reopenRestored,
+                "reopenDidNotRace": reopenDidNotRace,
+                "reopenLoadingWhileDeferred": reopenLoadingWhileDeferred,
+                "reopenModelArrived": reopenModelArrived,
+                "refreshGateNeedsModel": refreshGateNeedsModel,
+                "refreshGateDeferred": refreshGateDeferred,
+                "refreshGateModelArrived": refreshGateModelArrived,
+                "staleGenSeeded": staleGenSeeded,
+                "staleGenKeptLastGood": staleGenKeptLastGood,
+                "staleGenRetried": staleGenRetried,
+                "commitGenRestoredStale": commitGenRestoredStale,
+                "commitGenAdvanced": commitGenAdvanced,
+                "commitGenScannedOnce": commitGenScannedOnce,
+                "failGraphRestored": failGraphRestored,
+                "failGraphIssuedNoScan": failGraphIssuedNoScan,
+                "failGraphReadsAsLoading": failGraphReadsAsLoading,
+                "failGraphHealed": failGraphHealed,
+                "overtakeBCommitted": overtakeBCommitted,
+                "overtakeServedB": overtakeServedB,
+                "rollbackBothParked": rollbackBothParked,
+                "rollbackNewerCommitted": rollbackNewerCommitted,
+                "rollbackHeldNewer": rollbackHeldNewer,
+                "chainRestored": chainRestored,
+                "chainBothParked": chainBothParked,
+                "chainDidNotRace": chainDidNotRace,
+                "chainArrived": chainArrived,
+                "chainNeverRacedGraph": chainNeverRacedGraph,
+                "lazySeeded": lazySeeded,
+                "lazyBothParked": lazyBothParked,
+                "lazyHeldBack": lazyHeldBack,
+                "keyHeldUntilCommit": keyHeldUntilCommit,
+                "keyChangedDespiteCollision": keyChangedDespiteCollision,
+                "healedAfterRetry": healedAfterRetry,
+                "phantomIssuedNoScan": phantomIssuedNoScan,
+                "phantomReadsAsLoading": phantomReadsAsLoading,
+                "modelDroppedOnYearSwitch": modelDroppedOnYearSwitch,
+                "oneScanPerCommit": oneScanPerCommit,
+                "flatBeforeExpand": flatBeforeExpand,
+                "gradedAfterExpand": gradedAfterExpand,
+                "reentryCoalesced": reentryCoalesced,
+                "coalescedStillPublished": coalescedStillPublished,
+                "lagRestoredNeedsGate": lagRestoredNeedsGate,
+                "lagLoadHeldGeneration": lagLoadHeldGeneration,
+                "lagRefetched": lagRefetched,
+                "newerSliceSupersedes": newerSliceSupersedes,
+                "loadingHeldBySuccessor": loadingHeldBySuccessor,
+                "abaNoThirdScan": abaNoThirdScan,
+                "loadingTrueInFlight": loadingTrueInFlight,
+                "loadingFalseAfter": loadingFalseAfter,
                 "stalePending": stalePending,
                 "staleSuppressed": staleSuppressed,
                 "matchingBAfterStale": matchingBAfterStale,
                 "initialAVisible": initialAVisible,
                 "graphBPending": graphBPending,
                 "oldReportSuppressed": oldReportSuppressed,
-                "newReportBeforePayloadSuppressed": newReportBeforePayloadSuppressed,
                 "matchingBVisible": matchingBVisible,
                 "emptyDidNotFetch": emptyDidNotFetch,
             ]
         }
-        if let savedDashboardYear {
-            UserDefaults.standard.set(savedDashboardYear, forKey: dashboardYearDefaultsKey)
+        if let savedAttributionDashboardYear {
+            UserDefaults.standard.set(savedAttributionDashboardYear, forKey: dashboardYearDefaultsKey)
         } else {
             UserDefaults.standard.removeObject(forKey: dashboardYearDefaultsKey)
         }
@@ -2332,12 +5455,252 @@ enum SelfTest {
             turnTransitionChecks?["initialAVisible"] == true
                 && turnTransitionChecks?["graphBPending"] == true
                 && turnTransitionChecks?["oldReportSuppressed"] == true
-                && turnTransitionChecks?["newReportBeforePayloadSuppressed"] == true
                 && turnTransitionChecks?["matchingBVisible"] == true,
-            "turns render only when payload and hourly year identities match")
+            "the Hourly lens shows a report only for the year it was fetched for")
+        expect(
+            turnTransitionChecks?["deferGraphPending"] == true
+                && turnTransitionChecks?["noModelDuringGraph"] == true
+                && turnTransitionChecks?["neverRacedGraph"] == true,
+            "the model report is never requested while the graph scan is in flight")
+        expect(
+            turnTransitionChecks?["readyWithoutModel"] == true
+                && turnTransitionChecks?["phaseReadyBeforeModel"] == true,
+            "the dashboard reaches .ready on the graph alone, without the model")
+        expect(
+            turnTransitionChecks?["modelArrives"] == true
+                && turnTransitionChecks?["fetchedOnce"] == true
+                && turnTransitionChecks?["noRefetch"] == true,
+            "a committed payload fetches the model exactly once per generation")
+        expect(
+            turnTransitionChecks?["modelHeldForA"] == true
+                && turnTransitionChecks?["modelDroppedOnYearSwitch"] == true,
+            "a year switch drops the previous year's model report instead of leaving it "
+                + "rendered beside the new year's graph")
+        expect(
+            turnTransitionChecks?["seededWithoutModel"] == true
+                && turnTransitionChecks?["reopenRestored"] == true,
+            "the reopen fixture really restores a payload without a model report — without "
+                + "this the race assertion below would pass on a snapshot that never raced")
+        expect(
+            turnTransitionChecks?["reopenDidNotRace"] == true
+                && turnTransitionChecks?["reopenModelArrived"] == true,
+            "reopening onto a model lens waits for the base load instead of scanning beside "
+                + "it, and still receives its report")
+        expect(
+            turnTransitionChecks?["reopenLoadingWhileDeferred"] == true,
+            "a deferred model request reads as loading, not as \"no model usage\" — the "
+                + "restored dashboard is already showing those cards while it waits")
+        expect(
+            turnTransitionChecks?["refreshGateNeedsModel"] == true,
+            "the refresh fixture really starts without a model report — without this the "
+                + "gate assertion below would pass on a request that was never issued")
+        expect(
+            turnTransitionChecks?["refreshGateDeferred"] == true
+                && turnTransitionChecks?["refreshGateModelArrived"] == true,
+            "a lens opened during a manual refresh waits for that refresh's graph fetch "
+                + "instead of scanning beside it, and still receives its report")
+        expect(
+            turnTransitionChecks?["staleGenSeeded"] == true
+                && turnTransitionChecks?["staleGenKeptLastGood"] == true,
+            "the stale-model fixture really leaves a last-good report standing — without "
+                + "this the retry assertion below would pass on an absent report, which the "
+                + "old condition retried anyway")
+        expect(
+            turnTransitionChecks?["staleGenRetried"] == true,
+            "the poll retries a model report that lags the committed generation, not only "
+                + "one that is missing — a failure behind a last-good report used to freeze "
+                + "the cards on the previous generation beside an advancing chart")
+        expect(
+            turnTransitionChecks?["commitGenRestoredStale"] == true
+                && turnTransitionChecks?["commitGenAdvanced"] == true,
+            "the commit-order fixture really reopens on a stale generation and then moves "
+                + "it — without this the single-scan guard below would pass on a slice that "
+                + "never changed")
+        expect(
+            turnTransitionChecks?["commitGenScannedOnce"] == true,
+            "a reopen whose graph commits a new generation scans the model exactly once "
+                + "(a double-scan guard — it does not discriminate where the gate opens; "
+                + "see the comment at the fixture)")
+        expect(
+            turnTransitionChecks?["failGraphRestored"] == true,
+            "the failed-graph fixture really reopens on a renderable restored payload — "
+                + "without this the assertion below would pass on an empty dashboard")
+        expect(
+            turnTransitionChecks?["failGraphIssuedNoScan"] == true
+                && turnTransitionChecks?["failGraphReadsAsLoading"] == true,
+            "a model request issues no scan against a restored payload whose refresh "
+                + "failed, and reads as loading rather than as no model usage")
+        expect(
+            turnTransitionChecks?["failGraphHealed"] == true,
+            "the next successful commit releases that deferral — the guard defers the "
+                + "model scan, it does not abandon it")
+        expect(
+            turnTransitionChecks?["overtakeBCommitted"] == true,
+            "the overtake fixture really commits the newer slice before the older fetch "
+                + "settles — without this the assertion below would pass on a slice that "
+                + "was never displaced")
+        expect(
+            turnTransitionChecks?["overtakeServedB"] == true,
+            "a stale graph fetch that fails after a newer slice committed does not mark "
+                + "that newer slice failed — its model request still runs")
+        expect(
+            turnTransitionChecks?["rollbackBothParked"] == true
+                && turnTransitionChecks?["rollbackNewerCommitted"] == true,
+            "the rollback fixture really parks two same-year fetches and commits the later "
+                + "one first — without this the assertion below would pass on an ordering "
+                + "that never happened")
+        expect(
+            turnTransitionChecks?["rollbackHeldNewer"] == true,
+            "an overtaken graph fetch that succeeds does not commit — the dashboard and "
+                + "the reopen snapshot keep the newer slice instead of rolling back")
+        expect(
+            turnTransitionChecks?["chainRestored"] == true
+                && turnTransitionChecks?["chainBothParked"] == true,
+            "the chain fixture really restores a payload and parks two fetches — without "
+                + "this the model request would return at the slice guard and the "
+                + "assertions below would pass without ever reaching the gate")
+        expect(
+            turnTransitionChecks?["chainDidNotRace"] == true
+                && turnTransitionChecks?["chainNeverRacedGraph"] == true,
+            "a model waiter woken by a SUPERSEDED fetch keeps waiting for the one that "
+                + "overtook it instead of scanning beside a graph fetch still running")
+        expect(
+            turnTransitionChecks?["chainArrived"] == true,
+            "following that chain still delivers the report once the newer fetch commits")
+        expect(
+            turnTransitionChecks?["lazySeeded"] == true
+                && turnTransitionChecks?["lazyBothParked"] == true,
+            "the lazy fixture really holds an hourly report and parks two fetches — reload "
+                + "only re-fetches a lens it already has, so without this the assertion "
+                + "below would pass on a lens that could never be re-fetched")
+        expect(
+            turnTransitionChecks?["lazyHeldBack"] == true,
+            "a superseded reload does not re-fetch its lazy lenses — the fetch that "
+                + "overtook it owns the slice and refreshes them itself")
+        expect(
+            turnTransitionChecks?["generationsCollide"] == true,
+            "the fixture really does give two slices the same payload generation — without "
+                + "this the key assertion below would pass on a collision that never happens")
+        expect(
+            turnTransitionChecks?["keyChangedDespiteCollision"] == true,
+            "the model task key still changes when the committed slice changes under a "
+                + "shared generation, so the new slice actually requests its report")
+        expect(
+            turnTransitionChecks?["keyHeldUntilCommit"] == true,
+            "the key does not move on the requested year alone — moving at the moment of "
+                + "intent is what left it unchanged when the payload finally committed")
+        expect(
+            turnTransitionChecks?["failedLeftEmpty"] == true
+                && turnTransitionChecks?["healedAfterRetry"] == true,
+            "a transient model failure is retried rather than left showing an empty result")
+        expect(
+            turnTransitionChecks?["survivesLensSwitch"] == true,
+            "a lens switch during a model scan still publishes — the cancelled task must "
+                + "not take the only publication path with it")
+        expect(
+            turnTransitionChecks?["phantomIssuedNoScan"] == true,
+            "no model scan is issued for a phantom slice — a new year paired with the "
+                + "payload it has not replaced yet")
+        expect(
+            turnTransitionChecks?["phantomReadsAsLoading"] == true,
+            "during a year switch the model reads as loading, never as an empty result — "
+                + "the cards would otherwise claim the new year has no model usage")
+        expect(
+            turnTransitionChecks?["lensesSkipModel"] == true,
+            "Daily/Monthly never request the model report on activation")
+        expect(
+            turnTransitionChecks?["oneScanPerCommit"] == true,
+            "a graph refresh issues exactly one model scan — never two racing ones, "
+                + "and never zero (a moved generation must refetch)")
+        expect(
+            turnTransitionChecks?["reentryCoalesced"] == true
+                && turnTransitionChecks?["coalescedStillPublished"] == true,
+            "re-entry during an in-flight model scan joins it instead of starting a second")
+        expect(
+            turnTransitionChecks?["lagRestoredNeedsGate"] == true
+                && turnTransitionChecks?["lagLoadHeldGeneration"] == true,
+            "the lag fixture really restores a payload and the restored model's load() "
+                + "holds the SAME generation the snapshot carries — without both the "
+                + "refetch below could not discriminate a lagging model from a moved payload")
+        expect(
+            turnTransitionChecks?["lagRefetched"] == true,
+            "a restored snapshot whose model lags its payload refetches instead of "
+                + "presenting the stale report as current")
+        expect(
+            turnTransitionChecks?["newerSliceSupersedes"] == true,
+            "coalescing joins only the identical slice — a moved generation still "
+                + "starts its own scan instead of being swallowed by the guard")
+        expect(
+            turnTransitionChecks?["abaNoThirdScan"] == true,
+            "a stale scan cannot release a live scan's in-flight slot — the year "
+                + "round-trip that gives both the same identity value must not open a third scan")
+        expect(
+            turnTransitionChecks?["loadingTrueInFlight"] == true
+                && turnTransitionChecks?["loadingFalseAfter"] == true
+                && turnTransitionChecks?["loadingHeldBySuccessor"] == true,
+            "modelLoading is true for the duration of a scan and clears when it lands — "
+                + "it is the only thing keeping the cards off the empty copy mid-fetch")
+
+        // The chain that actually gets a deferred model onto the screen is view
+        // wiring, and a UI-free test cannot press a SwiftUI Button. Deleting any
+        // link left every runtime assertion above green, so the tree this binary
+        // was built from is read directly — the same technique the Discord
+        // section uses for "declared in exactly one place".
+        func lp2bSource(_ name: String) -> String {
+            let root = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()  // Sources/TokenBar
+            for sub in ["", "Views/"] {
+                let url = root.appendingPathComponent(sub + name)
+                if let text = try? String(contentsOf: url, encoding: .utf8) { return text }
+            }
+            return ""
+        }
+        let lp2bDaily = lp2bSource("DailyView.swift")
+        let lp2bMonthly = lp2bSource("MonthlyView.swift")
+        let lp2bPopover = lp2bSource("PopoverView.swift")
+        expect(
+            !lp2bDaily.isEmpty && !lp2bMonthly.isEmpty && !lp2bPopover.isEmpty,
+            "the LP2B source scan found its three files (without this every wiring "
+                + "assertion below would pass on empty strings)")
+        expect(
+            lp2bDaily.contains("if !isOpen { onExpand?() }")
+                && lp2bMonthly.contains("if !isOpen { onExpand?() }"),
+            "Daily and Monthly request the model colour map when a row opens")
+        expect(
+            lp2bPopover.components(separatedBy: "onExpand: { Task { await model.ensureModelColors() } }")
+                .count - 1 == 2,
+            "PopoverView wires that callback for both lenses, not just one")
+        // Pin the model task by its id components AND its body, but tolerate
+        // reformatting: an earlier version matched the whole multi-line literal
+        // including indentation, so a purely cosmetic rewrap turned it red.
+        // Matching a substring alone is the opposite failure — the sibling
+        // hidden-client task on the next line carries the same generation
+        // interpolation, which let the id lose its generation unnoticed. So
+        // strip whitespace entirely, then require the exact id triple next to
+        // the call it guards — that survives any rewrap while still pinning
+        // every component of the key.
+        let lp2bFlat = lp2bPopover.filter { !$0.isWhitespace }
+        let lp2bModelTask = #".task(id:"\(activeViewRaw)|\(model.committedSliceKey)"){"#
+            + "awaitmodel.ensureModelData(for:activeView.wrappedValue)}"
+        expect(
+            lp2bFlat.contains(lp2bModelTask),
+            "the model task is keyed on the COMMITTED slice, not the requested year — "
+                + "the requested year changes before the payload does, so a slice sharing "
+                + "the previous generation would never re-fire")
+        expect(
+            turnTransitionChecks?["flatBeforeExpand"] == true
+                && turnTransitionChecks?["gradedAfterExpand"] == true,
+            "expanding a Daily/Monthly row populates the model colour map")
+        // The old Daily/Monthly contract — "suppress turns until the payload and
+        // the hourly report agree on the year" — has no successor assertion on
+        // purpose. Turns now come from the very contribution the row is built
+        // from, so a row's messages and its turns cannot describe different
+        // years; the failure mode is removed by construction rather than
+        // guarded at runtime. What remains testable is that the request is gone.
         expect(
             turnTransitionChecks?["emptyDidNotFetch"] == true,
-            "an empty supported turn slice does not invoke the all-client hourly API")
+            "Daily and Monthly request no hourly report at all — their turns come "
+                + "from the graph payload")
 
         let hourlyCacheChecks = awaitMainActorValue { () async -> [String: Bool] in
             let year = "2047"
@@ -2400,8 +5763,8 @@ enum SelfTest {
             let seedModel = DashboardModel(
                 cachesSnapshot: true, source: seedSource, initialYear: year)
             await seedModel.load()
-            await seedModel.ensureData(for: .monthly, clients: turnClients)
-            let seededA = fingerprint(seedModel.turnsReport(for: turnClients))
+            await seedModel.ensureData(for: .hourly, clients: turnClients)
+            let seededA = fingerprint(seedModel.hourlyReport(for: turnClients))
                 == fingerprint(originalA)
             await seedModel.ensureData(for: .hourly, clients: hourlyClients)
             let seededB = fingerprint(seedModel.hourlyReport(for: hourlyClients))
@@ -2413,22 +5776,22 @@ enum SelfTest {
                 Set(turnClients): refreshedA,
             ])
             let (refreshModel, refreshTask, refreshPending) = await blockedModel(
-                source: refreshSource, view: .monthly, clients: turnClients)
+                source: refreshSource, view: .hourly, clients: turnClients)
             let restoredABeforeRefresh =
-                fingerprint(refreshModel.turnsReport(for: turnClients)) == fingerprint(originalA)
+                fingerprint(refreshModel.hourlyReport(for: turnClients)) == fingerprint(originalA)
             await refreshSource.releaseHourly(year: year)
             await refreshTask.value
             let acceptedRefreshVisible =
-                fingerprint(refreshModel.turnsReport(for: turnClients)) == fingerprint(refreshedA)
+                fingerprint(refreshModel.hourlyReport(for: turnClients)) == fingerprint(refreshedA)
 
             // Fresh owners prove A's replacement did not overwrite sibling B.
             let verifyASource = ControlledTurnUsageDataSource(hourlyResponses: [
                 Set(turnClients): refreshedA,
             ])
             let (verifyAModel, verifyATask, verifyAPending) = await blockedModel(
-                source: verifyASource, view: .monthly, clients: turnClients)
+                source: verifyASource, view: .hourly, clients: turnClients)
             let refreshedARestored =
-                fingerprint(verifyAModel.turnsReport(for: turnClients)) == fingerprint(refreshedA)
+                fingerprint(verifyAModel.hourlyReport(for: turnClients)) == fingerprint(refreshedA)
             await verifyASource.releaseHourly(year: year)
             await verifyATask.value
 
@@ -2459,20 +5822,20 @@ enum SelfTest {
             ])
             let (nonOwnerModel, nonOwnerTask, nonOwnerPending) = await blockedModel(
                 source: nonOwnerSource, cachesSnapshot: false,
-                view: .monthly, clients: turnClients)
-            let nonOwnerDidNotRead = nonOwnerModel.turnsReport(for: turnClients) == nil
+                view: .hourly, clients: turnClients)
+            let nonOwnerDidNotRead = nonOwnerModel.hourlyReport(for: turnClients) == nil
             await nonOwnerSource.releaseHourly(year: year)
             await nonOwnerTask.value
             let nonOwnerReceivedLocalB =
-                fingerprint(nonOwnerModel.turnsReport(for: turnClients)) == fingerprint(nonOwnerB)
+                fingerprint(nonOwnerModel.hourlyReport(for: turnClients)) == fingerprint(nonOwnerB)
 
             let ownerAfterSource = ControlledTurnUsageDataSource(hourlyResponses: [
                 Set(turnClients): refreshedA,
             ])
             let (ownerAfterModel, ownerAfterTask, ownerAfterPending) = await blockedModel(
-                source: ownerAfterSource, view: .monthly, clients: turnClients)
+                source: ownerAfterSource, view: .hourly, clients: turnClients)
             let nonOwnerDidNotWrite =
-                fingerprint(ownerAfterModel.turnsReport(for: turnClients)) == fingerprint(refreshedA)
+                fingerprint(ownerAfterModel.hourlyReport(for: turnClients)) == fingerprint(refreshedA)
             await ownerAfterSource.releaseHourly(year: year)
             await ownerAfterTask.value
 
@@ -2483,7 +5846,7 @@ enum SelfTest {
                 let extraModel = DashboardModel(
                     cachesSnapshot: true, source: seedSource, initialYear: extraYear)
                 await extraModel.load()
-                await extraModel.ensureData(for: .monthly, clients: turnClients)
+                await extraModel.ensureData(for: .hourly, clients: turnClients)
             }
             let evictionSource = ControlledTurnUsageDataSource(hourlyResponses: [
                 Set(turnClients): refreshedA,
@@ -2493,12 +5856,12 @@ enum SelfTest {
                 cachesSnapshot: true, source: evictionSource, initialYear: year)
             await evictionModel.load()
             let evictionTask = Task {
-                await evictionModel.ensureData(for: .monthly, clients: turnClients)
+                await evictionModel.ensureData(for: .hourly, clients: turnClients)
             }
             let evictionPending = await waitUntil {
                 await evictionSource.hasPendingHourly(year: year)
             }
-            let oldestEvicted = evictionModel.turnsReport(for: turnClients) == nil
+            let oldestEvicted = evictionModel.hourlyReport(for: turnClients) == nil
             await evictionSource.releaseHourly(year: year)
             await evictionTask.value
 
@@ -2822,7 +6185,7 @@ enum SelfTest {
         expect(
             demoLearningEstimate?.basis == .linear
                 && demoLearningEstimate?.isHistoricalDeficit == false,
-            "demo learning-history estimate cannot trigger historical warning color")
+            "demo learning-history estimate stays a Linear basis in the parity contract")
         expect(
             demoHistoricalAhead?.basis == .historical
                 && demoHistoricalAhead?.stage.isDeficit == true
@@ -3001,6 +6364,33 @@ enum SelfTest {
         // FFI envelope/error contract (hermetic; no FFI allocation or live data).
         for (label, passed) in TBCore.envelopeContractChecks() {
             expect(passed, "envelope: \(label)")
+        }
+        // The one live FFI call this suite makes, and deliberately so: it is the
+        // only way to prove `tb_quota_curve` links, matches its header signature,
+        // and returns the documented error rather than a curve for a series this
+        // process never bound. It reaches no credential, network, or history I/O
+        // — the binding lookup fails first — so it stays hermetic. The smoke gate
+        // asserts the same contract against the shipping binary.
+        // Generation 0 reaches the binding lookup only because this process has
+        // published nothing, which leaves the table's generation at 0 and skips
+        // the expiry check. If a case above ever calls `agentUsage()` first, pass
+        // its `publicationGeneration` here instead — otherwise this silently
+        // starts testing the expiry branch. The exact message is what makes that
+        // substitution visible rather than silent.
+        do {
+            let curve = try TBCore.quotaCurve(
+                clientId: "__selftest__", windowKey: "__selftest__", generation: 0)
+            expect(false, "unbound quota curve fails closed (got \(curve == nil ? "null" : "a curve"))")
+        } catch let TBCoreError.bridge(message) {
+            expect(
+                message == "quota curve binding is unavailable",
+                "unbound quota curve fails closed (got \"\(message)\")")
+        } catch {
+            expect(false, "unbound quota curve fails closed (got \(error))")
+        }
+
+        for (label, passed) in TBCore.quotaCurveContractChecks() {
+            expect(passed, "quota curve: \(label)")
         }
         for (label, passed) in TBCore.filterParityContractChecks() {
             expect(passed, "filter parity: \(label)")
@@ -3516,10 +6906,9 @@ enum SelfTest {
 
         // MARK: - Discord Rich Presence payload (DISCORD-PRESENCE M1)
         //
-        // This payload is published to a third party and shown on a public
-        // profile, so these are privacy regression guards, not display tests.
-        // Every assertion goes through `DiscordPresence.payload(...)` — the
-        // published bytes — not through the core fold alone.
+        // Published to a third party on a public profile: privacy regression
+        // guards, not display tests. Every assertion goes through
+        // `DiscordPresence.payload(...)` — the published bytes.
         func dpGraph(_ json: String) -> UsagePayload {
             try! JSONDecoder().decode(UsagePayload.self, from: Data(json.utf8))
         }
@@ -3552,179 +6941,600 @@ enum SelfTest {
             """
         }
         let dpToday = "2026-08-04"
+        /// The default composition, which reproduces exactly what was published
+        /// before composition existed — so every assertion written against the
+        /// old single shape keeps testing the same bytes.
+        let dpAllComponents = DiscordPresence.defaultComponents
 
-        // A3a — the hidden set reaches the published payload. The day-level
-        // `totals` here (1.2M) deliberately differs from the visible-only sum
-        // (200K): a builder that read `Contribution.totals`/`tokenBreakdown`
-        // instead of the surviving stripes cannot subtract a client and would
-        // publish "1.2M".
+        // Hidden clients are excluded from the published totals. The day-level
+        // `totals` (1.2M) differs from the visible-only sum (200K) on purpose: a
+        // builder reading `totals`/`tokenBreakdown` cannot subtract a client.
         let dpHiddenGraph = dpGraph(dpPayload(dpDay(
             dpToday, 1_200_000, 6.0,
             dpStripe("claude", 1_000_000, 5.0) + "," + dpStripe("codex", 200_000, 1.0))))
         let dpHidden = DiscordPresence.payload(
-            graph: dpHiddenGraph, hidden: ["claude"], today: dpToday)
-        expect(dpHidden?.details == "200K tokens today",
-            "discord payload tokens exclude the hidden client (mutation: reading the day-level "
-                + "totals publishes 1.2M)")
-        expect(dpHidden.map { !$0.fields.values.joined().contains("1.2M") } == true,
-            "discord payload never carries the mixed day-level total")
-        expect(dpHidden?.state.contains("Codex CLI") == true
+            graph: dpHiddenGraph, hidden: ["claude"], today: dpToday, costStyle: .banded, components: dpAllComponents)
+        expect(
+            dpHidden?.details == "200K tokens today"
+                && dpHidden.map { !$0.fields.values.joined().contains("1.2M") } == true,
+            "published tokens are the visible-only sum, and the mixed day-level total reaches "
+                + "no field (mutation: reading the day-level totals publishes 1.2M)")
+        expect(dpHidden?.state.contains("Codex") == true
             && dpHidden?.state.contains("Claude Code") == false,
-            "discord top client skips the hidden client (mutation: dropping the hidden filter "
-                + "from the fold publishes Claude Code)")
+            "the top client skips the hidden client (mutation: dropping the hidden filter from "
+                + "the fold publishes Claude Code)")
 
-        // A4 — outbound label allowlist. The busiest visible client is an
-        // UNREGISTERED id whose suffix comes from a user's local config file;
-        // a second, hidden client carries a sentinel too. Nothing may escape.
+        // Outbound allowlist, at the PRODUCER. The busiest stripe by far is an
+        // UNREGISTERED id whose suffix comes from a local config file; a
+        // registered client sits underneath it with a fifth of the tokens, and
+        // a second unregistered id is hidden as well. Under a positive filter
+        // the secret contributes nothing at all — not a neutral label, not a
+        // token, not a cent — so the registered client is what publishes.
+        //
+        // This is the fixture the complement design fails: `hidden ∪ (allIds −
+        // {selected})` cannot subtract an id it has never heard of, so
+        // `cc-mirror/SECRET_VARIANT` would survive and, being the largest,
+        // would take the label.
         let dpSecretGraph = dpGraph(dpPayload(dpDay(
             dpToday, 1_400_000, 12.0,
-            dpStripe("cc-mirror/SECRET_VARIANT", 500_000, 3.0,
+            dpStripe("cc-mirror/SECRET_VARIANT", 900_000, 9.0,
                 model: "SECRET_MODEL", provider: "SECRET_PROVIDER")
-                + "," + dpStripe("SECRET_HIDDEN", 900_000, 9.0,
+                + "," + dpStripe("claude", 200_000, 1.0)
+                + "," + dpStripe("SECRET_HIDDEN", 300_000, 2.0,
                     model: "SECRET_MODEL2", provider: "SECRET_PROVIDER2"))))
         let dpSecret = DiscordPresence.payload(
-            graph: dpSecretGraph, hidden: ["SECRET_HIDDEN"], today: dpToday)
-        let dpSecretText = (dpSecret?.fields.values ?? [:].values).joined(separator: "|")
-        expect(dpSecret != nil && !dpSecretText.contains("SECRET_"),
-            "discord payload redacts an unregistered client id (mutation: using "
-                + "ClientRegistry.style().displayName without the allowlist gate leaks it)")
-        // Literal, not `DiscordPresence.neutralClientLabel`: an assertion whose
-        // expected value is read out of the constant it guards passes no matter
-        // what that constant becomes.
-        expect(dpSecret?.state.contains("an AI tool") == true,
-            "an unregistered top client publishes the neutral label")
-        // A5 — forbidden fields. modelId/providerId values are covered by the
-        // SECRET_ assertion above; these cover shapes rather than values.
+            graph: dpSecretGraph, hidden: ["SECRET_HIDDEN"], today: dpToday, costStyle: .banded, components: dpAllComponents)
+        let dpSecretText = dpSecret.map { Array($0.fields.values).joined(separator: "|") } ?? ""
+        expect(
+            dpSecret?.details == "200K tokens today"
+                && dpSecret?.state.hasPrefix("Claude Code") == true
+                && !dpSecretText.contains("SECRET_"),
+            "an unregistered id reaches neither the figures nor the label — the registered "
+                + "client publishes its own 200K, not the 1.1M the day holds "
+                + "(mutation: a complement filter cannot subtract an id it has never heard of, "
+                + "so cc-mirror/SECRET_VARIANT survives and takes the label)")
         expect(!dpSecretText.contains("/"),
-            "discord payload carries no path-like segment (mutation: adding any raw-id or path "
-                + "field to Payload.fields fails here)")
-        // Pinned by KEY on the published surface itself. `fields` is what the
-        // transport serializes, so this covers exactly what leaves the machine:
-        // a new outbound field must add a key here and fails, while a property
-        // that is not in `fields` publishes nothing and correctly does not.
-        // Asserting over anything else — a parallel list of values, or
-        // reflection over the stored properties — reintroduces the gap between
-        // the published surface and the asserted one that let a computed
+            "no path-like segment is published (mutation: adding any raw-id or path field to "
+                + "Payload.fields fails here)")
+        // Pinned by KEY on `fields`, which is what the transport serializes.
+        // Asserting over anything else reopens the gap that let a computed
         // `startTimestamp` through.
         expect(dpSecret.map { Set($0.fields.keys) } == ["details", "state", "largeImageKey"],
-            "the discord payload publishes exactly three named fields "
-                + "(mutation: adding a key to Payload.fields, or dropping one, fails here)")
+            "exactly three named fields are published (mutation: adding a key to Payload.fields, "
+                + "or dropping one, fails here)")
+        // The neutral label is now unreachable from `payload()` — kept in
+        // `safeClientLabel` as defence, asserted here as dead. A graph of only
+        // unregistered ids publishes nothing rather than "an AI tool".
+        expect(
+            DiscordPresence.payload(
+                graph: dpGraph(dpPayload(dpDay(
+                    dpToday, 500_000, 5.0,
+                    dpStripe("cc-mirror/one", 300_000, 3.0) + ","
+                        + dpStripe("brand-new-agent", 200_000, 2.0)))),
+                hidden: [], today: dpToday, costStyle: .banded,
+                components: dpAllComponents) == nil,
+            "a graph holding only unregistered ids publishes nothing at all, so the neutral "
+                + "label cannot reach the wire (mutation: filtering only at the label leaves "
+                + "their tokens and cost in the figures under `an AI tool`)")
 
-        // A11 — published granularity. Exact figures must not survive: neither
-        // the raw token count nor cent-precision cost.
+        // Published granularity: neither the raw token count nor cent-precision
+        // cost may survive.
         let dpGrainGraph = dpGraph(dpPayload(dpDay(
             dpToday, 1_234_567, 7.89, dpStripe("claude", 1_234_567, 7.89))))
-        let dpGrain = DiscordPresence.payload(graph: dpGrainGraph, hidden: [], today: dpToday)
-        let dpGrainText = (dpGrain?.fields.values ?? [:].values).joined(separator: "|")
-        expect(dpGrain?.details == "1.2M tokens today",
-            "discord tokens publish as a compact string (mutation: String(todayTokens) fails here)")
-        expect(dpGrain != nil && !dpGrainText.contains("1234567"),
-            "discord payload never carries the raw token count")
-        expect(dpGrain != nil && !dpGrainText.contains("7.89"),
-            "discord payload never carries cent-precision cost (mutation: Format.usd fails here)")
-        expect(dpGrain?.state.hasSuffix("$5-10") == true, "cost publishes as a coarse band")
-        // A11 (cont.) — the two inputs where the SHARED tray formatter would
-        // publish an exact figure. `Format.compactTokens` returns `String(count)`
-        // below 1000 and for every negative value, which is right for the menu
-        // bar and wrong on a public profile.
+        let dpGrain = DiscordPresence.payload(
+            graph: dpGrainGraph, hidden: [], today: dpToday, costStyle: .banded, components: dpAllComponents)
+        let dpGrainText = dpGrain.map { Array($0.fields.values).joined(separator: "|") } ?? ""
+        expect(dpGrain?.details == "1.2M tokens today" && !dpGrainText.contains("1234567"),
+            "tokens publish as a compact string and the raw count reaches no field "
+                + "(mutation: String(todayTokens) fails here)")
+        expect(dpGrain?.state.hasSuffix("<$10") == true && !dpGrainText.contains("7.89"),
+            "cost publishes as a coarse band and cents reach no field "
+                + "(mutation: Format.usd fails here)")
+
+        // Equality on every boundary, non-finite included: those must land in
+        // the LOWEST band. "Returns a finite band" passes on an implementation
+        // that hands a zero-cost day to the top one.
+        let dpBands: [(Double, String)] = [
+            (.nan, "<$10"), (.infinity, "<$10"), (-.infinity, "<$10"),
+            (-1, "<$10"), (0, "<$10"), (9.99, "<$10"),
+            (10, "$10-50"), (49.99, "$10-50"),
+            (50, "$50-100"), (99.99, "$50-100"),
+            (100, "$100-250"), (249.99, "$100-250"),
+            (250, "$250-500"), (499.99, "$250-500"),
+            (500, "$500-1000"), (999.99, "$500-1000"),
+            (1000, "$1000+"), (1e6, "$1000+"),
+        ]
+        for (cost, band) in dpBands {
+            expect(DiscordPresence.costBucket(cost) == band,
+                "cost \(cost) bands as \(band) "
+                    + "(mutation: shifting a bound, flipping one to exclusive, or dropping the "
+                    + "isFinite guard, fails here)")
+        }
+
+        // Whole-dollar mode is a total function. `Int(.infinity)` and
+        // `Int(1e308)` trap rather than fail, and a trap reaches no verdict at
+        // all, so the assertion must be reachable past the conversion.
+        let dpDollars: [(Double, String)] = [
+            (.nan, "$0"), (.infinity, "$0"), (-.infinity, "$0"),
+            (-5, "$0"), (0, "$0"), (0.4, "$0"), (0.5, "$1"),
+            (7.89, "$8"), (1500.2, "$1500"),
+            (999_999.4, "$999999"),
+            // The boundary the cap is judged at. Before the rounding moved
+            // ahead of the comparison these rendered a bare `$1000000`.
+            (999_999.5, "$1000000+"), (1e6.nextDown, "$1000000+"),
+            (1e6, "$1000000+"), (1e308, "$1000000+"),
+        ]
+        for (cost, text) in dpDollars {
+            expect(DiscordPresence.wholeDollars(cost) == text,
+                "cost \(cost) renders as \(text) "
+                    + "(mutation: `\"$\" + Int(max(0, cost).rounded())` traps here rather than "
+                    + "failing, because max() folds only NaN and -infinity)")
+        }
+
+        // The two cost modes must DISAGREE on one fixture, asserted as equality
+        // on both: "banded has no 7.89" and "dollars has no '.'" are true of
+        // BOTH modes, so a build ignoring the parameter passed them.
+        let dpModeGraph = dpGraph(dpPayload(dpDay(
+            dpToday, 12_000, 7.89, dpStripe("claude", 12_000, 7.89))))
+        let dpBanded = DiscordPresence.payload(
+            graph: dpModeGraph, hidden: [], today: dpToday, costStyle: .banded, components: dpAllComponents)
+        let dpExact = DiscordPresence.payload(
+            graph: dpModeGraph, hidden: [], today: dpToday, costStyle: .wholeDollars, components: dpAllComponents)
+        expect(
+            dpBanded?.state == "Claude Code · <$10" && dpExact?.state == "Claude Code · $8"
+                && dpBanded.map { !$0.fields.values.joined().contains("7.89") } == true
+                && dpExact.map { !$0.fields.values.joined().contains("7.89") } == true,
+            "the two cost modes render the same fixture differently and neither publishes cents "
+                + "(mutation: ignoring costStyle and always rendering one of them fails here)")
+
+        // Which cost-mode change retires earlier work. Coarsening the figure
+        // makes anything computed before it stale — writing one of those after
+        // the change puts the precise figure back on the profile. Adding
+        // precision invalidates nothing.
+        expect(AppDelegate.costStyleChange(previous: .wholeDollars, current: .banded) == .reducing,
+            "turning the figure back into a range retires work computed before it "
+                + "(mutation: returning .none lets the precise figure be written afterwards)")
+        expect(AppDelegate.costStyleChange(previous: .banded, current: .wholeDollars)
+            == .increasing,
+            "adding precision invalidates nothing computed before it")
+        expect(AppDelegate.costStyleChange(previous: .banded, current: .banded) == .none,
+            "no cost-mode change is neither")
+        expect(DiscordIPC.VisibilityChange.increasing.combined(with: .reducing) == .reducing
+            && DiscordIPC.VisibilityChange.reducing.combined(with: .increasing) == .reducing
+            && DiscordIPC.VisibilityChange.none.combined(with: .increasing) == .increasing
+            && DiscordIPC.VisibilityChange.none.combined(with: .none) == .none,
+            "a turn that both hides and adds precision is a reduction, order-independently, and "
+                + "combining invents no change neither side reported")
+
+        // The two inputs where the SHARED tray formatter publishes an exact
+        // figure: `Format.compactTokens` returns `String(count)` below 1000 and
+        // for negatives. Negative totals are reachable — the aggregator clamps
+        // per lane, so the re-summed slow path can go negative.
         let dpSmall = DiscordPresence.payload(
             graph: dpGraph(dpPayload(dpDay(dpToday, 850, 0.4, dpStripe("claude", 850, 0.4)))),
-            hidden: [], today: dpToday)
-        expect(dpSmall?.details == "<1K tokens today",
-            "a light day publishes a band, not the exact count (mutation: calling "
-                + "Format.compactTokens directly publishes \"850\")")
-        // Negative day totals are reachable: the aggregator clamps per lane, so
-        // the re-summed slow path can go negative (trayTotals' doc comment).
-        // Hiding a non-existent id forces that slow path.
+            hidden: [], today: dpToday, costStyle: .banded, components: dpAllComponents)
         let dpNegative = DiscordPresence.payload(
             graph: dpGraph(dpPayload(dpDay(
                 dpToday, 0, 1.0,
                 dpStripe("claude", -1_234_567, 0.0) + "," + dpStripe("codex", 1_000, 1.0)))),
-            hidden: ["nobody"], today: dpToday)
-        expect(dpNegative.map { !$0.fields.values.joined().contains("1233567") } ?? true,
-            "a negative day total never publishes its signed digits")
+            hidden: ["nobody"], today: dpToday, costStyle: .banded, components: dpAllComponents)
+        expect(
+            dpSmall?.details == "<1K tokens today"
+                && dpNegative.map { !$0.fields.values.joined().contains("1233567") } ?? true,
+            "a light day publishes a band and a negative total publishes no signed digits "
+                + "(mutation: calling Format.compactTokens directly publishes \"850\")")
 
-        // A12 — zero usage publishes nothing (no "machine is on" beacon), and a
-        // day absent from the graph publishes nothing either.
-        let dpZeroGraph = dpGraph(dpPayload(dpDay(dpToday, 0, 0, dpStripe("claude", 0, 0))))
-        expect(DiscordPresence.payload(graph: dpZeroGraph, hidden: [], today: dpToday) == nil,
-            "zero usage publishes nothing (mutation: dropping the guard publishes an idle beacon)")
-        expect(DiscordPresence.payload(graph: dpGrainGraph, hidden: [], today: "2099-01-01") == nil,
-            "a day with no contribution publishes nothing")
-        // The isFinite guard, made reachable. JSON cannot express NaN, but the
-        // slow path sums Double costs, so two finite stripes overflow to +inf —
-        // which costBucket would happily publish as "$100+".
-        let dpInfinite = DiscordPresence.payload(
-            graph: dpGraph(dpPayload(dpDay(
-                dpToday, 10, 1e308,
-                dpStripe("claude", 10, 1e308) + "," + dpStripe("codex", 10, 1e308)))),
-            hidden: ["nobody"], today: dpToday)
-        expect(dpInfinite == nil,
-            "an overflowed cost publishes nothing (mutation: dropping the isFinite guard "
-                + "publishes $100+)")
+        // Three inputs that publish nothing: an idle day (no "machine is on"
+        // beacon), a day absent from the graph, and an overflowed cost — JSON
+        // cannot express NaN, but two finite stripes sum to +inf.
+        let dpSilent: [(String, DiscordPresence.Payload?)] = [
+            ("zero usage", DiscordPresence.payload(
+                graph: dpGraph(dpPayload(dpDay(dpToday, 0, 0, dpStripe("claude", 0, 0)))),
+                hidden: [], today: dpToday, costStyle: .banded, components: dpAllComponents)),
+            ("a day with no contribution", DiscordPresence.payload(
+                graph: dpGrainGraph, hidden: [], today: "2099-01-01", costStyle: .banded, components: dpAllComponents)),
+            ("an overflowed cost", DiscordPresence.payload(
+                graph: dpGraph(dpPayload(dpDay(
+                    dpToday, 10, 1e308,
+                    dpStripe("claude", 10, 1e308) + "," + dpStripe("codex", 10, 1e308)))),
+                hidden: ["nobody"], today: dpToday, costStyle: .banded, components: dpAllComponents)),
+        ]
+        for (label, payload) in dpSilent {
+            expect(payload == nil,
+                "\(label) publishes nothing (mutation: dropping the zero guard publishes an idle "
+                    + "beacon; dropping the isFinite guard publishes a band for a meaningless "
+                    + "value)")
+        }
 
-        // A14 — the top client is the busiest CLIENT, not the biggest single
-        // stripe. `Contribution.clients` holds per client×model×provider
-        // stripes, so claude's 30+30 must beat codex's single 50.
+        // The top client is the busiest CLIENT, not the biggest stripe:
+        // `clients` holds per client×model×provider stripes, so claude's 30+30
+        // must beat codex's single 50.
         let dpFoldGraph = dpGraph(dpPayload(dpDay(
             dpToday, 110, 1.1,
             dpStripe("claude", 30, 0.3, model: "m1") + ","
                 + dpStripe("claude", 30, 0.3, model: "m2") + ","
                 + dpStripe("codex", 50, 0.5, model: "m1"))))
-        let dpFold = DiscordPresence.payload(graph: dpFoldGraph, hidden: [], today: dpToday)
+        let dpFold = DiscordPresence.payload(
+            graph: dpFoldGraph, hidden: [], today: dpToday, costStyle: .banded, components: dpAllComponents)
         expect(dpFold?.state.hasPrefix("Claude Code") == true,
-            "top client folds stripes per client first (mutation: max over raw stripes picks "
-                + "Codex CLI's single 50 over Claude Code's 30+30)")
-        let dpFoldHidden = DiscordPresence.payload(
-            graph: dpFoldGraph, hidden: ["claude"], today: dpToday)
-        expect(dpFoldHidden?.state.hasPrefix("Codex CLI") == true,
-            "hiding the busiest client promotes the next visible one")
+            "the top client folds stripes per client first (mutation: max over raw stripes picks "
+                + "Codex's single 50 over Claude Code's 30+30)")
 
-        // A15 — deterministic tie-break: tokens, then higher cost, then the
-        // lexicographically smallest id. A wobbling label would flip between
-        // publishes.
-        let dpTieCost = dpGraph(dpPayload(dpDay(
-            dpToday, 200, 3.0, dpStripe("amp", 100, 1.0) + "," + dpStripe("zed", 100, 2.0))))
-        expect(DiscordPresence.payload(graph: dpTieCost, hidden: [], today: dpToday)?.state
-            == "Zed · $1-5",
-            "equal tokens break to the higher cost")
-        // Six-way tie on purpose, and the fixture lists the ids in REVERSE
-        // order so input order cannot supply the answer.
-        //
-        // Two mutations threaten this, and they are not equally provable:
-        //   `>=` in the fold comparison        → picks Zed, fails every run.
-        //   `keys.sorted()` → `keys`           → PROBABILISTIC. Swift seeds
-        //     Dictionary hashing per process, so an unsorted walk lands on the
-        //     right id by luck roughly 1 run in 6. The pair of assertions below
-        //     feed the SAME six clients in opposite orders — a different
-        //     insertion sequence is a different iteration order — so the
-        //     mutation has to get lucky twice to survive. It is still not a
-        //     hard proof, and no in-process check can make it one: repeatedly
-        //     calling the fold inside one run cannot see the wobble, because
-        //     the seed does not change until the process does.
+        // Deterministic tie-break: tokens, then higher cost, then the smallest
+        // id. The six-way tie is fed in both orders because an unsorted key walk
+        // is only probabilistically wrong — Swift seeds Dictionary hashing per
+        // process, so it must get lucky twice.
         let dpTieIds = ["zed", "warp", "goose", "droid", "codex", "amp"]
-        let dpTieId = dpGraph(dpPayload(dpDay(
-            dpToday, 600, 6.0, dpTieIds.map { dpStripe($0, 100, 1.0) }.joined(separator: ","))))
+        let dpTies: [(String, String, String)] = [
+            ("equal tokens break to the higher cost",
+             dpStripe("amp", 100, 1.0) + "," + dpStripe("zed", 100, 2.0), "Zed · <$10"),
+            ("a full tie breaks to the lexicographically smallest id",
+             dpTieIds.map { dpStripe($0, 100, 1.0) }.joined(separator: ","), "Amp · <$10"),
+            ("the tie-break ignores the order the stripes arrive in",
+             dpTieIds.reversed().map { dpStripe($0, 100, 1.0) }.joined(separator: ","),
+             "Amp · <$10"),
+        ]
+        for (label, stripes, expected) in dpTies {
+            expect(
+                DiscordPresence.payload(
+                    graph: dpGraph(dpPayload(dpDay(dpToday, 600, 6.0, stripes))),
+                    hidden: [], today: dpToday, costStyle: .banded, components: dpAllComponents)?.state == expected,
+                "\(label) (mutation: `>=` in the fold comparison, or an unsorted key walk)")
+        }
+
+        // Composition. The hostile fixture runs with the client component
+        // selected and NOTHING else, which is the whole point: every privacy
+        // value-scan above runs against whichever shape its fixture picked, so
+        // a selection of tokens + cost would satisfy "a `cc-mirror/SECRET` id
+        // cannot escape" without ever executing the allowlist path that
+        // assertion exists to guard. The client label is the only component
+        // built from a user-controlled string, so this is the case that closes
+        // it — not sixteen fixtures, one per subset.
+        let dpClientOnly = DiscordPresence.payload(
+            graph: dpSecretGraph, hidden: ["SECRET_HIDDEN"], today: dpToday,
+            costStyle: .banded, components: [.client])
         expect(
-            DiscordPresence.payload(graph: dpTieId, hidden: [], today: dpToday)?.state
-                == "Amp · $5-10",
-            "a full tie breaks to the lexicographically smallest id")
-        let dpTieIdReversed = dpGraph(dpPayload(dpDay(
-            dpToday, 600, 6.0,
-            dpTieIds.reversed().map { dpStripe($0, 100, 1.0) }.joined(separator: ","))))
+            dpClientOnly?.details == "Claude Code"
+                && dpClientOnly.map { Array($0.fields.values).joined().contains("SECRET_") } == false
+                && dpClientOnly?.fields.keys.sorted() == ["details", "largeImageKey"],
+            "one selected component becomes `details`, an unregistered id reaches no field, and "
+                + "no empty `state` key reaches the wire "
+                + "(mutation: composing without the allowlist gate leaks the id; publishing "
+                + "`state` unconditionally adds a blank field)")
+        // The composition is a user-controlled string flowing toward a public
+        // profile — the same shape as the `cc-mirror/<name>` id. Unknown tokens
+        // must produce nothing and never echo themselves, and the canonical
+        // write-back is what keeps a reordering from reaching the value gate as
+        // a change.
+        let dpMixedComponents = DiscordPresence.parseComponents("tokens, SECRET_COMPONENT ,cost")
         expect(
-            DiscordPresence.payload(graph: dpTieIdReversed, hidden: [], today: dpToday)?.state
-                == "Amp · $5-10",
-            "the tie-break does not depend on the order the stripes arrive in")
+            dpMixedComponents == [.tokens, .cost]
+                && DiscordPresence.rawComponents([.cost, .tokens]) == "tokens,cost"
+                && DiscordPresence.payload(
+                    graph: dpSecretGraph, hidden: [], today: dpToday, costStyle: .banded,
+                    components: dpMixedComponents)
+                    .map { Array($0.fields.values).joined().contains("SECRET_COMPONENT") } == false,
+            "an unknown component token is dropped rather than echoed, and the canonical form is "
+                + "written in a fixed order (mutation: a fallback branch passing the raw token "
+                + "through publishes it)")
+        expect(
+            DiscordPresence.payload(
+                graph: dpGrainGraph, hidden: [], today: dpToday, costStyle: .banded,
+                components: []) == nil
+                && DiscordPresence.parseComponents("SECRET_COMPONENT").isEmpty,
+            "an empty composition publishes nothing at all, and a preference of only unknown "
+                + "tokens is empty (mutation: an activity with no components still carries the "
+                + "app name, image and button, and still refreshes — a working-hours beacon "
+                + "with no usage content to justify it)")
+        // Unticking a component takes something off the profile, so it must not
+        // wait out the publish floor. Same subset rule as the hidden set with
+        // the arguments swapped, including the swap case a size test gets wrong.
+        expect(
+            AppDelegate.componentsChange(previous: [.tokens, .cost], current: [.tokens])
+                == .reducing
+                && AppDelegate.componentsChange(previous: [.tokens], current: [.tokens, .cost])
+                    == .increasing
+                && AppDelegate.componentsChange(previous: [.tokens], current: [.cost]) == .reducing
+                && AppDelegate.componentsChange(previous: [.tokens], current: [.tokens]) == .none,
+            "unticking a component is a reduction, ticking one is throttled, and swapping one for "
+                + "another is a reduction (mutation: a size test calls the swap no change and "
+                + "leaves the unticked component on the profile for the rest of the floor)")
+        // A cost-style change cannot alter a byte when cost is not published,
+        // and classifying it anyway is not just noise: `.reducing` carries a
+        // stale, so calling it a change would retire work that is still valid.
+        expect(
+            AppDelegate.costStyleChange(
+                previous: .wholeDollars, current: .banded, publishedInBoth: false) == .none
+                && AppDelegate.costStyleChange(
+                    previous: .banded, current: .wholeDollars, publishedInBoth: false) == .none
+                && AppDelegate.costStyleChange(
+                    previous: .wholeDollars, current: .banded, publishedInBoth: true) == .reducing,
+            "a cost-style change is classified only when cost is published on both sides of it "
+                + "(mutation: classifying it unconditionally retires work that is still valid)")
+        // Absent and malformed are different answers. An absent key is an
+        // upgrade and keeps every component; a present non-string is a
+        // malformed write and gets what a string of only unknown tokens gets.
+        let dpCompSuite = "TokenBar.SelfTest.DiscordComponents"
+        if let dpCompDefaults = UserDefaults(suiteName: dpCompSuite) {
+            defer { UserDefaults.standard.removePersistentDomain(forName: dpCompSuite) }
+            let dpAbsent = DiscordPresence.components(defaults: dpCompDefaults)
+            dpCompDefaults.set(1, forKey: DiscordPresence.componentsKey)
+            let dpWrongType = DiscordPresence.components(defaults: dpCompDefaults)
+            dpCompDefaults.set("client", forKey: DiscordPresence.componentsKey)
+            let dpGoodString = DiscordPresence.components(defaults: dpCompDefaults)
+            expect(
+                dpAbsent == DiscordPresence.defaultComponents && dpWrongType.isEmpty
+                    && dpGoodString == [.client],
+                "an absent composition key keeps every component while a present non-string "
+                    + "publishes nothing (mutation: one `as? String` cast for both makes a "
+                    + "malformed `defaults write` publish all three the user never selected)")
+        } else {
+            expect(false, "the isolated composition suite could not be created")
+        }
+        // The cost validity check belongs to the cost component. `costBucket`
+        // maps a non-finite value to the LOWEST band, so publishing one would
+        // assert something false — but a tokens-only selection loses its whole
+        // presence to an overflow that was never going to reach the wire.
+        let dpOverflowGraph = dpGraph(dpPayload(dpDay(
+            dpToday, 10, 1e308,
+            dpStripe("claude", 10, 1e308) + "," + dpStripe("codex", 10, 1e308))))
+        expect(
+            DiscordPresence.payload(
+                graph: dpOverflowGraph, hidden: ["nobody"], today: dpToday,
+                costStyle: .banded, components: [.tokens])?.details == "<1K tokens today"
+                && DiscordPresence.payload(
+                    graph: dpOverflowGraph, hidden: ["nobody"], today: dpToday,
+                    costStyle: .banded, components: [.tokens, .cost]) == nil,
+            "an overflowed cost blocks only a composition that publishes cost "
+                + "(mutation: guarding before the composition is read silently blanks the "
+                + "presence of a tokens-only selection)")
+
+        // Agent selection. Survival is `id ∈ only && id ∉ hidden`, and BOTH
+        // conditions holding is what makes "a selection cannot defeat hiding"
+        // structural rather than a guard someone has to remember.
+        expect(
+            DiscordPresence.payload(
+                graph: dpSecretGraph, hidden: ["claude"], today: dpToday, costStyle: .banded,
+                components: dpAllComponents, selection: .only("claude")) == nil,
+            "selecting a client that is also hidden publishes nothing (mutation: applying the "
+                + "selection instead of intersecting it lets a selection override a hide)")
+        // The same hostile graph with a REGISTERED client selected. The secret
+        // is larger than the selection, so a filter that lets it through would
+        // be visible in the figures as well as the label.
+        let dpSelected = DiscordPresence.payload(
+            graph: dpSecretGraph, hidden: [], today: dpToday, costStyle: .banded,
+            components: dpAllComponents, selection: .only("claude"))
+        expect(
+            dpSelected?.details == "200K tokens today"
+                && dpSelected?.state.hasPrefix("Claude Code") == true
+                && dpSelected.map { Array($0.fields.values).joined().contains("SECRET") } == false,
+            "a selected client publishes only its own figures, with an unregistered stripe "
+                + "excluded from the totals (mutation: a complement filter cannot subtract "
+                + "cc-mirror/SECRET_VARIANT, so it is aggregated in and its 900K is published)")
+        expect(
+            DiscordPresence.payload(
+                graph: dpSecretGraph, hidden: [], today: dpToday, costStyle: .banded,
+                components: dpAllComponents, selection: .only("renamed-since-release")) == nil,
+            "a selection the registry does not know publishes nothing (mutation: falling back to "
+                + "most-used silently widens `one agent` to `all of them` on a rename)")
+        // The re-summed slow path can go negative, and it is reachable here
+        // because a positive filter never takes the fast path.
+        expect(
+            DiscordPresence.payload(
+                graph: dpGraph(dpPayload(dpDay(
+                    dpToday, 0, 1.0,
+                    dpStripe("claude", -1_234_567, 0.0) + "," + dpStripe("codex", 1_000, 1.0)))),
+                hidden: [], today: dpToday, costStyle: .banded,
+                components: dpAllComponents, selection: .only("codex"))?.state
+                .hasSuffix("<$10") == true,
+            "a negative stripe elsewhere still leaves the selected client a finite band")
+        // A selection change replaces what is published, so anything computed
+        // for the previous selection is stale.
+        expect(
+            AppDelegate.selectionChange(
+                previous: .mostUsed, current: .only("claude"), hidden: []) == .retiring
+                && AppDelegate.selectionChange(
+                    previous: .only("claude"), current: .only("codex"), hidden: []) == .retiring
+                && AppDelegate.selectionChange(
+                    previous: .only("claude"), current: .only("claude"), hidden: []) == .none
+                && AppDelegate.selectionChange(
+                    previous: .only("claude"), current: .only("codex"),
+                    hidden: ["claude", "codex"]) == .none,
+            "a selection change is `.retiring`, and switching between two clients that are both "
+                + "hidden is no change at all (mutation: classifying it `.reducing` grants an "
+                + "work computed for a selection that is still current; comparing raw "
+                + "selections republishes when nothing published actually moved)")
+        // A hidden-set change is judged against the clients published at EITHER
+        // endpoint. With one agent named, hiding an unrelated client cannot
+        // move a published byte; hiding the selected one is still a reduction;
+        // and a turn that BOTH switches selection and hides the outgoing client
+        // is a reduction too — that one is only visible if the previous
+        // selection is consulted, and it is the case coalescing produces.
+        func dpVis(
+            _ previousHidden: String, _ hidden: String,
+            _ previousSelection: DiscordPresence.ClientSelection = .mostUsed,
+            _ selection: DiscordPresence.ClientSelection = .mostUsed
+        ) -> DiscordIPC.VisibilityChange {
+            AppDelegate.visibilityChange(
+                previousHiddenRaw: previousHidden, hiddenRaw: hidden,
+                previousSelection: previousSelection, selection: selection)
+        }
+        expect(
+            dpVis("", "amp", .only("claude"), .only("claude")) == .none
+                && dpVis("amp", "", .only("claude"), .only("claude")) == .none
+                && dpVis("", "claude", .only("claude"), .only("claude")) == .reducing
+                && dpVis("", "amp") == .reducing
+                && dpVis("amp", "") == .increasing
+                && dpVis("", "claude", .only("claude"), .only("codex")) == .reducing,
+            "hiding a client the selection does not publish is no change, hiding the selected one "
+                + "is a reduction, and switching selection while hiding the outgoing client is "
+                + "still a reduction (mutation: judging the hidden delta under the CURRENT "
+                + "selection alone reports no change and leaves the just-hidden client on the "
+                + "profile for the rest of the floor)")
+
+        // `.mostUsed` is not "every registered client" — it is whichever of
+        // them actually has usage today. Hiding a registered client with no
+        // stripe removes nothing from the profile, and while Discord is offline
+        // that grant cannot be spent, so a later payload carrying genuinely new
+        // activity would inherit it and go out inside the floor.
+        expect(
+            AppDelegate.visibilityChange(
+                previousHiddenRaw: "", hiddenRaw: "amp",
+                contributors: ["claude", "codex"]) == .none
+                && AppDelegate.visibilityChange(
+                    previousHiddenRaw: "", hiddenRaw: "claude",
+                    contributors: ["claude", "codex"]) == .reducing
+                && AppDelegate.effectivePublished(
+                    selection: .mostUsed, hidden: [], contributors: ["claude"]) == ["claude"],
+            "hiding a registered client with no usage today is no change, while hiding one that "
+                + "contributed is a reduction (mutation: expanding `.mostUsed` to the whole "
+                + "registry retires work for a hide that removed nothing published)")
+
+        // Absent, malformed and named are three answers. One `as? String` cast
+        // would send a key holding a number down the ABSENT branch and widen a
+        // one-client selection to every registered client.
+        let dpSelSuite = "TokenBar.SelfTest.DiscordSelection"
+        if let dpSelDefaults = UserDefaults(suiteName: dpSelSuite) {
+            defer { UserDefaults.standard.removePersistentDomain(forName: dpSelSuite) }
+            let dpSelAbsent = DiscordPresence.selection(defaults: dpSelDefaults)
+            dpSelDefaults.set(1, forKey: DiscordPresence.selectionKey)
+            let dpSelWrong = DiscordPresence.selection(defaults: dpSelDefaults)
+            dpSelDefaults.set("claude", forKey: DiscordPresence.selectionKey)
+            let dpSelNamed = DiscordPresence.selection(defaults: dpSelDefaults)
+            expect(
+                dpSelAbsent == .mostUsed && dpSelWrong == .malformed && dpSelNamed == .only("claude")
+                    && DiscordPresence.payload(
+                        graph: dpSecretGraph, hidden: [], today: dpToday, costStyle: .banded,
+                        components: dpAllComponents, selection: .malformed) == nil,
+                "an absent selection key is most-used, a present non-string publishes nothing, and "
+                    + "a named one selects (mutation: one `as? String` cast for both widens a "
+                    + "malformed one-client selection to every registered client)")
+        } else {
+            expect(false, "the isolated selection suite could not be created")
+        }
+        // The picker's universe is derived from what `payload` will publish, not
+        // from the registry. Every row it offers that the payload path rejects
+        // is a choice the user makes and nothing happens — the same silent
+        // nothing the zero-usage and empty-component guards exist to prevent,
+        // arriving through Settings instead of through the wire.
+        let dpPickVisible = DiscordPresence.selectableClients(
+            present: ["claude", "codex", "cc-mirror/foo"], hiddenRaw: "codex", orderRaw: "",
+            selection: .mostUsed)
+        let dpPickUnloaded = DiscordPresence.selectableClients(
+            present: nil, hiddenRaw: "claude", orderRaw: "", selection: .mostUsed)
+        // A scan that finished and found nothing is a real answer, not a
+        // not-loaded one: the honest picker offers only "whichever you used
+        // most". Collapsing it into the unloaded branch hands a user with no
+        // usage the whole registry back.
+        let dpPickNoUsage = DiscordPresence.selectableClients(
+            present: [], hiddenRaw: "", orderRaw: "", selection: .mostUsed)
+        // An id the registry no longer knows is one `payload` rejects outright,
+        // so listing it would tick a row that can never publish.
+        let dpPickUnknown = DiscordPresence.selectableClients(
+            present: ["claude"], hiddenRaw: "", orderRaw: "",
+            selection: .only("not-a-registered-client"))
+        let dpPickStale = DiscordPresence.selectableClients(
+            present: ["claude"], hiddenRaw: "codex", orderRaw: "", selection: .only("codex"))
+        // Every other fixture passes an empty order, which leaves "in the user's
+        // saved tab order" unfalsifiable — the picker could ignore `orderRaw`
+        // entirely and still pass them.
+        let dpPickOrdered = DiscordPresence.selectableClients(
+            present: ["claude", "codex"], hiddenRaw: "", orderRaw: "codex,claude",
+            selection: .mostUsed)
+        expect(
+            dpPickVisible == ["claude"]
+                && dpPickUnloaded.count > 1 && !dpPickUnloaded.contains("claude")
+                && dpPickNoUsage.isEmpty
+                && dpPickStale.contains("codex") && dpPickStale.contains("claude")
+                && dpPickUnknown == ["claude"]
+                && dpPickOrdered == ["codex", "claude"],
+            "the agent picker offers only registered, unhidden clients with usage, falls back to "
+                + "the registry before the first scan lands, and keeps a stored selection listed "
+                + "after it stops qualifying (mutation: dropping the registry filter offers "
+                + "`cc-mirror/foo`, which `payload` rejects; dropping the hidden filter offers a "
+                + "client `trayTotals` subtracts; dropping the fallback empties the picker while "
+                + "the dashboard is still loading; treating a finished empty scan as unloaded "
+                + "hands the whole registry to a user with no usage; dropping the stale append "
+                + "ticks nothing while the preference still names that agent; appending an "
+                + "unregistered stale id ticks a row `payload` rejects; ignoring `orderRaw` lists "
+                + "the agents in registry order instead of the one the user dragged)")
+        // Combining is the union of the retire. Losing one would let a payload
+        // built against a state that no longer holds reach the socket.
+        expect(
+            DiscordIPC.VisibilityChange.retiring.combined(with: .increasing).retires
+                && DiscordIPC.VisibilityChange.reducing.combined(with: .increasing).retires
+                && !DiscordIPC.VisibilityChange.increasing.combined(with: .none).retires,
+            "a turn that both replaces content and adds some still retires the old payload, "
+                + "while a turn that only adds does not (mutation: an AND instead of an OR lets "
+                + "a payload built for the previous selection reach the socket)")
+        // The intro card. One contract, behavioural: nothing it does turns the
+        // feature on. A source scan counting writes to the key name is exactly
+        // the shape #148 removed and #147 showed gets relocated around.
+        let dpIntroSuite = "TokenBar.SelfTest.DiscordIntro"
+        if let dpIntroDefaults = UserDefaults(suiteName: dpIntroSuite) {
+            defer { UserDefaults.standard.removePersistentDomain(forName: dpIntroSuite) }
+            // Deciding CONSUMES the flag: presentation is what marks it, not
+            // the choice, so a card that returns until the user picks the
+            // preferred action is impossible.
+            let dpIntroFirst = DiscordIntro.consume(defaults: dpIntroDefaults)
+            let dpIntroAgain = DiscordIntro.consume(defaults: dpIntroDefaults)
+            var dpIntroOpened = 0
+            // Read, never written: the process's own domain is where a card
+            // that enabled the feature would actually write, and an assertion
+            // confined to the isolated suite cannot see that. Measured — a
+            // mutation adding `UserDefaults.standard.set(true, forKey:)` to the
+            // openSettings branch passed the suite-only form of this check.
+            //
+            // Known limit, stated rather than papered over: this detects a
+            // CHANGE, so it cannot see a write of `true` over an existing
+            // `true`. Under `swift run` that domain starts empty, so the case
+            // only arises from a previous mutation run leaving the key behind —
+            // which happened while writing this, and silently disabled the
+            // check. Asserting the key is absent beforehand would be the
+            // stronger form, but it would fail on a bundled run for
+            // any user who has the feature switched on.
+            let dpIntroStandardBefore =
+                UserDefaults.standard.object(forKey: DiscordPresence.enabledKey) as? Bool
+            DiscordIntro.perform(.openSettings) { dpIntroOpened += 1 }
+            DiscordIntro.perform(.notNow) { dpIntroOpened += 1 }
+            let dpIntroStandardAfter =
+                UserDefaults.standard.object(forKey: DiscordPresence.enabledKey) as? Bool
+            expect(
+                dpIntroFirst && !dpIntroAgain && dpIntroOpened == 1
+                    && !DiscordPresence.enabled(defaults: dpIntroDefaults)
+                    && dpIntroStandardBefore == dpIntroStandardAfter,
+                "the intro card is shown once, marked by being presented rather than acted on, "
+                    + "and NEITHER action turns the feature on (mutation: an enable button, or "
+                    + "marking it shown only on the preferred choice, fails here)")
+            // Already using it: nothing to introduce, and interrupting would be
+            // noise. Asserted on a second suite so the flag above cannot be
+            // what makes this pass.
+            let dpIntroOnSuite = "TokenBar.SelfTest.DiscordIntroOn"
+            if let dpIntroOn = UserDefaults(suiteName: dpIntroOnSuite) {
+                defer { UserDefaults.standard.removePersistentDomain(forName: dpIntroOnSuite) }
+                dpIntroOn.set(true, forKey: DiscordPresence.enabledKey)
+                let dpIntroSkipped = DiscordIntro.consume(defaults: dpIntroOn)
+                // The upgrade path: they had it on before this card existed, so
+                // they never see it — and must not see it later if they switch
+                // off. Skipping has to consume the flag, not defer it.
+                dpIntroOn.set(false, forKey: DiscordPresence.enabledKey)
+                expect(!dpIntroSkipped && !DiscordIntro.consume(defaults: dpIntroOn),
+                    "someone already using the feature is not introduced to it, and switching it "
+                        + "off later does not introduce them either (mutation: skipping without "
+                        + "consuming the flag shows the card to a user who deliberately turned "
+                        + "the feature off)")
+            }
+        } else {
+            expect(false, "the isolated intro suite could not be created")
+        }
 
         // MARK: - Discord Rich Presence transport (DISCORD-PRESENCE M2a)
         //
-        // Nothing in the app calls this transport yet. These are the framing,
-        // lifecycle and privacy guards for the code that will carry the payload
-        // off the machine, and they run against real syscalls: the client's
-        // connect factory is handed one end of a `socketpair(AF_UNIX,
-        // SOCK_STREAM)`, so the framing, the fd lifetime and the SIGPIPE
-        // behaviour are the production ones, not a mock's.
+        // Nothing in the app calls this transport yet. These run against real
+        // syscalls — a `socketpair(AF_UNIX, SOCK_STREAM)` end, not a mock — so
+        // framing, fd lifetime and SIGPIPE behaviour are the production ones.
+        // Contracts: C3 wire framing, C1 payload/privacy on the wire, C4
+        // lifecycle, C5 privacy-sensitive ordering (throttle vs. consent).
 
         /// Frames built independently of `DiscordIPC.encode`, so the decoder is
         /// never checked against its own mirror image.
@@ -3739,13 +7549,21 @@ enum SelfTest {
             let body = Data(text.utf8)
             return dpRaw(op, UInt32(body.count), body)
         }
+        /// Incomplete frame prefixes carried between `dpFrames` polls, per
+        /// descriptor. Declared here because `dpSocketPair` clears it: see
+        /// there for why clearing happens at birth rather than at close.
+        var dpPartial: [Int32: Data] = [:]
         func dpSocketPair() -> (Int32, Int32) {
             var fds: [Int32] = [-1, -1]
             _ = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
-            // The peer end is only ever read by the test; the timeout keeps a
-            // missing frame a FAIL rather than a hung selftest, and
-            // SO_NOSIGPIPE keeps a write after the client closes from killing
-            // the harness itself.
+            // Descriptor numbers are recycled the moment a fixture closes one,
+            // and a one-shot `dpFrames` that lands between fragments of a frame
+            // leaves a non-empty entry behind. Clearing at birth covers every
+            // teardown path — `dpFinish`, `dpScenario`, and the scenarios that
+            // call `close` directly — where clearing at close would have to be
+            // remembered at each of them.
+            dpPartial[fds[0]] = nil
+            dpPartial[fds[1]] = nil
             var timeout = timeval(tv_sec: 1, tv_usec: 0)
             setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
             var on: Int32 = 1
@@ -3757,11 +7575,9 @@ enum SelfTest {
             let count = recv(fd, &buf, buf.count, 0)
             return count > 0 ? Data(buf[0..<count]) : Data()
         }
-        /// Non-blocking, unlike `dpRecv`. The peer ends carry `SO_RCVTIMEO` of
-        /// one second, so a poll loop built on the blocking read spends up to a
-        /// second per turn and can outlast the very delay it is trying to
-        /// detect — which is exactly how a throttle assertion ends up unable to
-        /// fail.
+        /// Non-blocking, unlike `dpRecv`: a poll loop built on the blocking read
+        /// can spend up to the peer's 1s `SO_RCVTIMEO` per turn and outlast the
+        /// very delay it is trying to detect.
         func dpRecvNow(_ fd: Int32) -> Data {
             var buf = [UInt8](repeating: 0, count: 4096)
             let count = recv(fd, &buf, buf.count, MSG_DONTWAIT)
@@ -3782,123 +7598,231 @@ enum SelfTest {
             }
             return ready()
         }
+        /// Decodes every complete frame currently sitting in `fd`'s buffer,
+        /// non-blocking. Replaces the hand-rolled `while case .frame(...) =
+        /// decode(...)` loop that most scenarios below used to repeat.
+        ///
+        /// The leftover is CARRIED between calls, per descriptor. `SOCK_STREAM`
+        /// does not preserve write boundaries, so a frame can be split across
+        /// `recv` calls; discarding the prefix would leave every later poll
+        /// starting in the middle of a frame and reporting it missing —
+        /// intermittently, and only under the timing that splits the write.
+        /// Only a `needMore` remainder is carried, and only that. A first
+        /// attempt kept whatever the `while case .frame` loop stopped on, which
+        /// exhausted memory: `fatal` consumes nothing, so the loop halted on
+        /// the same bytes every turn while each poll appended more, and
+        /// `dpFrameArrives` polls in a tight loop. Retaining a decodable
+        /// remainder is bounded by one frame; retaining an undecodable one is
+        /// not bounded at all. The entry is dropped when empty so a recycled
+        /// descriptor never inherits another socket's bytes — and `dpSocketPair`
+        /// clears the entry at birth, which covers the case where a one-shot
+        /// call leaves a real prefix behind on a descriptor about to be closed.
+        func dpFrames(_ fd: Int32) -> [(DiscordIPC.Opcode, Data)] {
+            var buf = (dpPartial[fd] ?? Data()) + dpRecvNow(fd)
+            var out: [(DiscordIPC.Opcode, Data)] = []
+            decoding: while !buf.isEmpty {
+                switch DiscordIPC.decode(from: &buf) {
+                case .frame(let op, let body): out.append((op, body))
+                case .discard: continue
+                case .needMore: break decoding
+                // Unrecoverable by definition, so there is nothing to carry.
+                case .fatal: buf.removeAll()
+                }
+            }
+            dpPartial[fd] = buf.isEmpty ? nil : buf
+            return out
+        }
         /// Counts calls to an injected connect factory. Mutated on the client's
         /// serial queue and read after `drainForTesting()`/`dpWaitUntil`, which
         /// is what orders the two.
         final class DPCounter: @unchecked Sendable {
             var value = 0
         }
+        /// The common shape roughly twenty scenarios below repeat: one socket
+        /// pair, a plain connect factory, start, drain the handshake, run
+        /// `body`, then stop and close. Scenarios that need two socket pairs, a
+        /// mode-counting connect factory, or `holdQueueForTesting` keep their
+        /// own setup instead — this shape does not fit them.
+        ///
+        /// `peerClosedByBody` hands descriptor ownership to the body. The
+        /// SIGPIPE scenario closes the peer itself to provoke the write
+        /// failure, and closing it again here would be a double close: in a
+        /// harness with a live serial queue the number can already have been
+        /// reused, so the second `close` can take an unrelated socket out from
+        /// under `stop()` and make later scenarios fail unpredictably.
+        @discardableResult
+        func dpScenario<T>(
+            peerClosedByBody: Bool = false, _ body: (Int32, DiscordIPCClient) -> T
+        ) -> T {
+            let (local, peer) = dpSocketPair()
+            let client = DiscordIPCClient(connect: { local })
+            client.start()
+            client.drainForTesting()
+            _ = dpRecv(peer) // the handshake
+            let result = body(peer, client)
+            client.stop()
+            client.drainForTesting()
+            if !peerClosedByBody { close(peer) }
+            return result
+        }
+        /// The cases `dpScenario` excludes: several socket pairs handed out in
+        /// order, so a scenario can break one connection and watch the client
+        /// arrive on the next. Local funcs rather than a type, because a type
+        /// declared in a function body cannot capture the helpers above it.
+        func dpRig(peers count: Int) -> ([Int32], DiscordIPCClient, DPCounter) {
+            let pairs = (0..<count).map { _ in dpSocketPair() }
+            let handed = DPCounter()
+            let client = DiscordIPCClient(connect: {
+                let i = min(handed.value, pairs.count - 1)
+                handed.value += 1
+                return pairs[i].0
+            })
+            return (pairs.map { $0.1 }, client, handed)
+        }
+        /// The READY frame Discord actually sends, sentinels included: the
+        /// account's username, id and avatar, none of which may be read, kept
+        /// or echoed. Declared here rather than beside its first assertion
+        /// because the helpers below capture it, and a local `let` cannot be
+        /// captured before its declaration.
+        let dpReadyBody = "{\"cmd\":\"DISPATCH\",\"evt\":\"READY\",\"data\":{\"v\":1,"
+            + "\"user\":{\"username\":\"SECRET_USERNAME\",\"id\":\"SECRET_ID\","
+            + "\"avatar\":\"SECRET_AVATAR\",\"discriminator\":\"0001\"}}}"
+        /// Answers a handshake the client has already sent. The client only
+        /// leaves `ready` on an inbound READY, so every scenario past the
+        /// connect path needs this.
+        func dpSendReady(_ peer: Int32) {
+            dpFrameBytes(1, dpReadyBody).withUnsafeBytes { raw in
+                _ = send(peer, raw.baseAddress!, raw.count, 0)
+            }
+        }
+        /// Drains the handshake, answers READY, and waits for the client to
+        /// record it. The Bool is the liveness half of every conjunction below:
+        /// without it an absence assertion passes on a client that never
+        /// connected.
+        func dpReachReady(_ peer: Int32, _ client: DiscordIPCClient) -> Bool {
+            _ = dpRecv(peer)
+            dpSendReady(peer)
+            return dpWaitUntil { client.inboundTokenForTesting == "ready" }
+        }
+        /// Parks the client's queue so several calls can be enqueued behind one
+        /// another and released together. Signal the returned semaphore to let
+        /// them run.
+        func dpHold(_ client: DiscordIPCClient) -> DispatchSemaphore {
+            let gate = DispatchSemaphore(value: 0)
+            client.holdQueueForTesting(until: gate)
+            return gate
+        }
+        func dpFinish(_ client: DiscordIPCClient, _ peers: [Int32]) {
+            client.stop()
+            client.drainForTesting()
+            for peer in peers where peer >= 0 { close(peer) }
+        }
+        /// The payload shape every lifecycle scenario publishes. Only `details`
+        /// varies, and it is what the assertions look for on the wire.
+        func dpP(_ details: String, state: String = "Amp · $10-25") -> DiscordPresence.Payload {
+            DiscordPresence.Payload(details: details, state: state, largeImageKey: "tokenbar")
+        }
 
-        // A6 — framing resilience. `encode` is pinned against an independently
-        // built frame first, so a byte-order regression cannot hide behind a
-        // symmetric decoder.
+        // A6 — framing resilience, pinned against a frame built independently
+        // of the encoder.
         expect(DiscordIPC.encode(.handshake, Data("{}".utf8)) == dpRaw(0, 2, Data("{}".utf8)),
             "the frame encoder emits LE opcode, LE length, then body")
 
         // A6a — an absurd length is refused before the completeness check, so
-        // no allocation is ever sized from the wire. Dropping the bound check
-        // does not blow up here; it silently turns this into `needMore`, which
-        // is a connection that waits forever for 4 GiB that will never arrive.
+        // no allocation is ever sized from the wire; the cap is exactly 64 KiB.
         var dpOversize = dpRaw(1, 0xFFFF_FFFF, Data())
         expect(DiscordIPC.decode(from: &dpOversize) == .fatal && dpOversize.count == 8,
             "A6a: an oversized frame length is fatal and consumes nothing "
-                + "(mutation: dropping the maxFrameLength check yields needMore)")
-        // Literal bounds, not the constant they guard: 64 KiB is the contract.
+                + "(mutation: dropping the maxFrameLength check yields needMore forever)")
         var dpAtCap = dpRaw(1, 65_536, Data())
-        expect(DiscordIPC.decode(from: &dpAtCap) == .needMore,
-            "a length exactly at the 64 KiB cap is allowed")
         var dpOverCap = dpRaw(1, 65_537, Data())
-        expect(DiscordIPC.decode(from: &dpOverCap) == .fatal,
-            "one byte over the 64 KiB cap is fatal")
+        expect(DiscordIPC.decode(from: &dpAtCap) == .needMore
+                && DiscordIPC.decode(from: &dpOverCap) == .fatal,
+            "a length exactly at the 64 KiB cap is allowed, one byte over is fatal")
 
         // A6b — opcode allowlist.
         var dpOpFive = dpFrameBytes(5, "{}")
-        expect(DiscordIPC.decode(from: &dpOpFive) == .discard && dpOpFive.isEmpty,
-            "A6b: opcode 5 is discarded and consumed "
-                + "(mutation: dropping the Opcode allowlist surfaces it as a frame)")
         var dpOpMax = dpFrameBytes(0xFFFF_FFFF, "{}")
-        expect(DiscordIPC.decode(from: &dpOpMax) == .discard && dpOpMax.isEmpty,
-            "A6b: opcode 0xFFFFFFFF is discarded, not read as a negative int")
+        expect(DiscordIPC.decode(from: &dpOpFive) == .discard && dpOpFive.isEmpty
+                && DiscordIPC.decode(from: &dpOpMax) == .discard && dpOpMax.isEmpty,
+            "A6b: an unknown opcode is discarded and consumed, whether small or "
+                + "0xFFFFFFFF read as a negative int "
+                + "(mutation: dropping the Opcode allowlist surfaces it as a frame)")
 
         // A6c — partial reads never block and never consume.
         var dpHeaderOnly = dpRaw(1, 2, Data())
-        expect(DiscordIPC.decode(from: &dpHeaderOnly) == .needMore && dpHeaderOnly.count == 8,
-            "A6c: a header with no body needs more and leaves the buffer intact "
-                + "(mutation: consuming on an incomplete frame loses the header)")
         var dpHalfHeader = Data([1, 0, 0, 0])
-        expect(DiscordIPC.decode(from: &dpHalfHeader) == .needMore && dpHalfHeader.count == 4,
-            "A6c: fewer than 8 bytes needs more")
+        expect(DiscordIPC.decode(from: &dpHeaderOnly) == .needMore && dpHeaderOnly.count == 8
+                && DiscordIPC.decode(from: &dpHalfHeader) == .needMore && dpHalfHeader.count == 4,
+            "A6c: a header with no body, or fewer than 8 bytes, needs more and leaves the buffer "
+                + "intact (mutation: consuming on an incomplete frame loses the header)")
 
-        // A6d — malformed bodies are dropped silently. One validity check
-        // covers both cases: JSONSerialization rejects a body that is not valid
-        // UTF-8 as well as one that is not valid JSON.
+        // A6d — malformed bodies are dropped silently. One check covers both:
+        // JSONSerialization rejects invalid UTF-8 the same way it rejects
+        // invalid JSON.
         var dpNonUTF8 = dpRaw(1, 3, Data([0xFF, 0xFE, 0xFD]))
-        expect(DiscordIPC.decode(from: &dpNonUTF8) == .discard && dpNonUTF8.isEmpty,
-            "A6d: a non-UTF-8 body is discarded "
-                + "(mutation: dropping the body validity check surfaces it as a frame)")
         var dpBadJSON = dpFrameBytes(1, "{not json")
-        expect(DiscordIPC.decode(from: &dpBadJSON) == .discard && dpBadJSON.isEmpty,
-            "A6d: an unparseable JSON body is discarded")
+        expect(DiscordIPC.decode(from: &dpNonUTF8) == .discard && dpNonUTF8.isEmpty
+                && DiscordIPC.decode(from: &dpBadJSON) == .discard && dpBadJSON.isEmpty,
+            "A6d: a non-UTF-8 or unparseable-JSON body is discarded "
+                + "(mutation: dropping the body validity check surfaces it as a frame)")
 
-        // A6e — several frames in one read are taken one at a time, in order.
+        // A6e — several frames in one read are taken one at a time, in order,
+        // and the bad middle frame does not desync the buffer.
         var dpStream = dpFrameBytes(1, "{\"a\":1}")
             + dpFrameBytes(5, "{}")
             + dpFrameBytes(0, "{\"b\":2}")
         expect(DiscordIPC.decode(from: &dpStream) == .frame(.frame, Data("{\"a\":1}".utf8)),
             "A6e: the first of three concatenated frames comes out intact")
-        expect(DiscordIPC.decode(from: &dpStream) == .discard,
-            "A6e: the bad middle frame is skipped without disturbing the rest")
-        expect(DiscordIPC.decode(from: &dpStream) == .frame(.handshake, Data("{\"b\":2}".utf8)),
-            "A6e: the third frame follows "
+        expect(DiscordIPC.decode(from: &dpStream) == .discard
+                && DiscordIPC.decode(from: &dpStream) == .frame(.handshake, Data("{\"b\":2}".utf8)),
+            "A6e: the bad middle frame is skipped and the third follows intact "
                 + "(mutation: advancing the buffer by the wrong amount fails here)")
         expect(DiscordIPC.decode(from: &dpStream) == .needMore && dpStream.isEmpty,
             "A6e: the buffer is fully drained afterwards")
 
         // A-wire — the published surface and the serialized bytes are the same
-        // set. `leafStrings` walks the real JSON, nesting included, and renders
-        // numbers too, so a field smuggled in as a number is just as visible.
+        // set. `leafStrings`/`leafKeys` walk the real JSON, nesting included,
+        // so a field or key smuggled in anywhere is visible — including one
+        // whose VALUE repeats an existing leaf, which a Set would erase.
         let dpWirePayload = DiscordPresence.Payload(
             details: "12K tokens today", state: "Amp · $1-5", largeImageKey: "tokenbar")
         let dpWire = DiscordIPC.activityJSON(dpWirePayload, pid: 4242, nonce: "NONCE-1")
-        // Sorted arrays, not Sets: a Set erases multiplicity, so a smuggled
-        // field whose value merely REPEATS an existing leaf — assets
-        // .small_image = the same "tokenbar", or a numeric field equal to the
-        // pid — left the set unchanged and escaped entirely. Counting leaves
-        // is what closes that.
-        expect(
-            DiscordIPC.leafStrings(dpWire).sorted()
-                == (Array(dpWirePayload.fields.values) + ["SET_ACTIVITY", "NONCE-1", "4242"]).sorted(),
-            "A-wire: the activity's leaves are exactly Payload.fields plus Discord's structural "
-                + "constants, counted (mutation: adding any field — hostname, startTimestamp, or "
-                + "one whose value duplicates an existing leaf — fails here)")
         let dpWireObject = (try? JSONSerialization.jsonObject(with: dpWire)) as? [String: Any]
         let dpWireArgs = dpWireObject?["args"] as? [String: Any]
         let dpWireActivity = dpWireArgs?["activity"] as? [String: Any]
         let dpWireAssets = dpWireActivity?["assets"] as? [String: Any]
-        expect(dpWireAssets?["large_image"] as? String == "tokenbar",
-            "A-wire: largeImageKey is published as assets.large_image, renamed but unaltered")
-        expect(dpWireActivity?["details"] as? String == "12K tokens today"
-            && dpWireActivity?["state"] as? String == "Amp · $1-5",
-            "A-wire: details and state go out verbatim")
-        expect(dpWireActivity?.count == 3,
-            "A-wire: the activity object holds exactly details, state and assets")
-        // The nested level needs its own count: `activity.count` only sees the
-        // top level, so a field added under `assets` kept it at 3.
-        // Keys are a channel of their own. A leaf scan cannot see them, and an
-        // empty container has no leaves at all, so `"x-<hostname>": [:]` was
-        // published with all 517 assertions green until this landed. Sorted
-        // array, not a Set, so a key repeated at another level shows too.
         expect(
-            DiscordIPC.leafKeys(dpWire).sorted() == [
-                "activity", "args", "assets", "cmd", "details",
-                "large_image", "nonce", "pid", "state",
-            ],
-            "A-wire: the frame's keys are exactly the protocol's (mutation: adding a key whose "
-                + "VALUE is an empty object smuggles the key text out with no new leaf — this is "
-                + "the only assertion that sees it)")
-        expect(dpWireAssets?.count == 1,
-            "A-wire: assets holds exactly large_image (mutation: adding assets.small_image, "
-                + "even with a value that duplicates an existing leaf, fails here)")
+            DiscordIPC.leafStrings(dpWire).sorted()
+                == (Array(dpWirePayload.fields.values)
+                    // Literals, not the constants: the button is carried by the
+                    // transport, not the payload, so a value derived from
+                    // anything — a `?ref=` parameter being the obvious one —
+                    // fails right here instead of being admitted as just
+                    // another field.
+                    + ["View on GitHub", "https://github.com/Nanako0129/TokenBar"]
+                    + ["SET_ACTIVITY", "NONCE-1", "4242"]).sorted()
+                && DiscordIPC.leafKeys(dpWire).sorted() == [
+                    "activity", "args", "assets", "buttons", "cmd", "details",
+                    "label", "large_image", "nonce", "pid", "state", "url",
+                ]
+                && dpWireAssets?.count == 1
+                // Per KEY, not only as a sorted multiset. Swapping `details`
+                // and `state` in `activityJSON` preserves the sorted leaves,
+                // the sorted keys and the object counts, so every clause above
+                // still passes while Discord renders the token summary in the
+                // cost field and the client name in the other.
+                && dpWireActivity?["details"] as? String == dpWirePayload.details
+                && dpWireActivity?["state"] as? String == dpWirePayload.state
+                && dpWireAssets?["large_image"] as? String == dpWirePayload.largeImageKey,
+            "A-wire: the activity's leaves are exactly Payload.fields plus Discord's structural "
+                + "constants, counted; each field keeps its own key; its keys are exactly the "
+                + "protocol's; and assets holds "
+                + "exactly large_image (mutation: adding any field or key — even one whose value "
+                + "or an empty-object value duplicates an existing leaf — fails one of these three)")
+        expect(dpWireActivity?.count == 4 && dpWireAssets?["large_image"] as? String == "tokenbar",
+            "A-wire: the activity holds exactly details, state, assets and buttons, and "
+                + "largeImageKey is published as assets.large_image, renamed but unaltered")
         expect(dpWireObject?["cmd"] as? String == "SET_ACTIVITY"
             && dpWireArgs?["pid"] as? Int == 4242 && dpWireObject?["nonce"] as? String == "NONCE-1",
             "A-wire: the envelope is SET_ACTIVITY with the given pid and nonce")
@@ -3906,64 +7830,54 @@ enum SelfTest {
             .contains("\"activity\":null"),
             "clearing the presence sends activity: null")
 
-        // A-wire, the OTHER outbound frames. The activity frame is not the
-        // only thing that leaves this machine: the handshake goes out on every
-        // connect, and the clear goes out on every stop. Both are serialized
-        // by the same helper and neither had a single assertion — the same key
-        // and leaf channels were wide open there while the activity frame was
-        // being tightened four times over. Pinning what leaves means pinning
-        // every frame, not the one that happened to be under review.
+        // The handshake and the clear are serialized by the same helper and
+        // deserve the same pin — the activity frame is not the only thing that
+        // leaves this machine.
         let dpShake = DiscordIPC.handshakeJSON()
-        expect(DiscordIPC.leafKeys(dpShake).sorted() == ["client_id", "v"],
-            "A-wire: the handshake's keys are exactly v and client_id")
-        expect(DiscordIPC.leafStrings(dpShake).sorted()
-            == [DiscordIPC.applicationID, "1"].sorted(),
-            "A-wire: the handshake carries the application id and the protocol version, and "
-                + "nothing else (mutation: adding any field, or a key with an empty value, fails "
-                + "one of these two)")
+        expect(DiscordIPC.leafKeys(dpShake).sorted() == ["client_id", "v"]
+                && DiscordIPC.leafStrings(dpShake).sorted() == [DiscordIPC.applicationID, "1"].sorted(),
+            "A-wire: the handshake's keys are exactly v and client_id, and it carries the "
+                + "application id and protocol version — nothing else")
         let dpClear = DiscordIPC.activityJSON(nil, pid: 4242, nonce: "NONCE-2")
-        expect(DiscordIPC.leafKeys(dpClear).sorted()
-            == ["activity", "args", "cmd", "nonce", "pid"],
-            "A-wire: the clear frame's keys are exactly the protocol's")
-        expect(DiscordIPC.leafStrings(dpClear).sorted()
-            == ["4242", "NONCE-2", "SET_ACTIVITY", "null"].sorted(),
-            "A-wire: the clear frame carries no payload data at all")
+        expect(DiscordIPC.leafKeys(dpClear).sorted() == ["activity", "args", "cmd", "nonce", "pid"]
+                && DiscordIPC.leafStrings(dpClear).sorted()
+                    == ["4242", "NONCE-2", "SET_ACTIVITY", "null"].sorted(),
+            "A-wire: the clear frame's keys are exactly the protocol's, and it carries no payload "
+                + "data at all")
 
-        // A13 — nothing from an inbound frame may be read, kept or echoed. The
-        // READY frame Discord actually sends carries the account's username, id
-        // and avatar.
-        let dpReadyBody = "{\"cmd\":\"DISPATCH\",\"evt\":\"READY\",\"data\":{\"v\":1,"
-            + "\"user\":{\"username\":\"SECRET_USERNAME\",\"id\":\"SECRET_ID\","
-            + "\"avatar\":\"SECRET_AVATAR\",\"discriminator\":\"0001\"}}}"
+        // A13 — nothing from an inbound frame may be read, kept or echoed.
+        // `dpReadyBody` above is the frame Discord actually sends, sentinels
+        // and all.
         let dpInboundToken = DiscordIPC.inbound(Data(dpReadyBody.utf8))
         // Literal "ready", not DiscordIPC.readyEvent: an expectation read out of
         // the constant it guards passes whatever that constant becomes.
-        expect(dpInboundToken == "ready" && !dpInboundToken.contains("SECRET_"),
-            "A13: a READY frame yields a fixed token and no frame content "
+        expect(dpInboundToken == "ready" && !dpInboundToken.contains("SECRET_")
+                && DiscordIPC.inbound(Data("{\"evt\":\"ERROR\",\"data\":{}}".utf8)) == "other",
+            "A13: a READY frame yields a fixed token and no frame content, and a non-READY event "
+                + "is not mistaken for it "
                 + "(mutation: returning the parsed user object, or the raw body, leaks SECRET_)")
-        expect(DiscordIPC.inbound(Data("{\"evt\":\"ERROR\",\"data\":{}}".utf8)) == "other",
-            "A13: a non-READY event is not mistaken for READY")
 
         // A-path — sun_path is 104 bytes and truncation does not fail, it
         // connects somewhere else.
         func dpAddressFits(_ path: String) -> Bool {
             DiscordIPC.unixSocketAddress(path: path).map { _ in true } ?? false
         }
-        expect(!dpAddressFits(String(repeating: "a", count: 200)),
-            "A-path: an over-long socket path is refused "
-                + "(mutation: truncating to fit connects to a different path)")
-        expect(!dpAddressFits(String(repeating: "a", count: 104)),
-            "A-path: a path filling sun_path exactly leaves no room for the NUL")
-        expect(dpAddressFits(String(repeating: "a", count: 103)),
-            "A-path: 103 bytes still fits")
         var dpAddress = DiscordIPC.unixSocketAddress(path: "/tmp/discord-ipc-0")!
         let dpAddressPath = withUnsafeBytes(of: &dpAddress.sun_path) {
             String(cString: $0.bindMemory(to: CChar.self).baseAddress!)
         }
-        expect(dpAddressPath == "/tmp/discord-ipc-0",
-            "A-path: the address carries the path verbatim")
+        expect(
+            !dpAddressFits(String(repeating: "a", count: 200))
+                && !dpAddressFits(String(repeating: "a", count: 104))
+                && dpAddressFits(String(repeating: "a", count: 103))
+                && dpAddressPath == "/tmp/discord-ipc-0",
+            "A-path: an over-long path or one filling sun_path exactly is refused, 103 bytes "
+                + "fits, and the accepted path round-trips verbatim "
+                + "(mutation: truncating to fit connects to a different path)")
 
-        // A7a/A7c/A13 over a real socket pair.
+        // A7a/A7c/A13 over a real socket pair, reused across the button and
+        // privacy checks below — this fixture inspects the handshake bytes
+        // itself, so it does not go through dpScenario.
         let (dpLocal, dpPeer) = dpSocketPair()
         let dpConnects = DPCounter()
         let dpClient = DiscordIPCClient(connect: {
@@ -3995,8 +7909,7 @@ enum SelfTest {
             "A13: nothing from the READY frame survives in the client's state")
 
         dpClient.publish(dpWirePayload)
-        dpClient.publish(DiscordPresence.Payload(
-            details: "999K tokens today", state: "Zed · $50-100", largeImageKey: "tokenbar"))
+        dpClient.publish(dpP("999K tokens today", state: "Zed · $50-100"))
         dpClient.drainForTesting()
         var dpActivityBuffer = dpRecv(dpPeer)
         var dpActivityText = ""
@@ -4005,40 +7918,79 @@ enum SelfTest {
             dpActivityText = String(decoding: body, as: UTF8.self)
             dpActivityBody = body
         }
-        expect(dpActivityText.contains("12K tokens today"),
-            "the first publish reaches the socket immediately")
+        // Every A-wire assertion above calls `activityJSON` with a fixed pid
+        // and nonce, so the real `pid()`/`nonce()` that supply every actual
+        // frame were exercised by none of them; this checks the bytes that
+        // left the socket, not just the pure function.
+        expect(dpActivityText.contains("12K tokens today")
+                && DiscordIPC.leafKeys(dpActivityBody).sorted() == [
+                    "activity", "args", "assets", "buttons", "cmd", "details",
+                    "label", "large_image", "nonce", "pid", "state", "url",
+                ],
+            "the first publish reaches the socket immediately, carrying exactly the protocol's "
+                + "keys")
 
-        // The bytes that actually left the socket, pinned the same way the
-        // pure-function frames are. Every A-wire assertion above calls
-        // `activityJSON` with `pid: 4242, nonce: "NONCE-1"`, so `pid()` and
-        // `nonce()` — which supply every real frame — were executed by no
-        // assertion at all. A `nonce()` returning
-        // `NSUserName() + "@" + hostName` shipped the username and this
-        // machine's reverse-DNS name on every publish with all 525 green.
-        // Guarding a serializer is not guarding what it is called with.
-        expect(
-            DiscordIPC.leafKeys(dpActivityBody).sorted() == [
-                "activity", "args", "assets", "cmd", "details",
-                "large_image", "nonce", "pid", "state",
-            ],
-            "the frame on the wire carries exactly the protocol's keys")
+        // A26 — the button's shape, against Discord's documented limits and
+        // against the one way this constant could become a channel.
+        if let dpWireButtons = (((try? JSONSerialization.jsonObject(with: dpActivityBody))
+            as? [String: Any])?["args"] as? [String: Any])?["activity"] as? [String: Any],
+            let dpButtons = dpWireButtons["buttons"] as? [[String: String]] {
+            let dpLabel = dpButtons.first?["label"] ?? ""
+            let dpURL = dpButtons.first?["url"] ?? ""
+            expect(dpButtons.count == 1 && !dpLabel.isEmpty && dpLabel.count <= 32
+                    && !dpURL.isEmpty && dpURL.count <= 512,
+                "A26: exactly one button goes out, label and URL within Discord's 1-32/1-512 "
+                    + "character limits (a longer value is silently dropped by Discord, so the "
+                    + "button would simply not appear)")
+            let dpURLParts = URLComponents(string: dpURL)
+            expect(
+                dpURLParts?.scheme == "https" && dpURLParts?.host == "github.com"
+                    && dpURLParts?.query == nil && dpURLParts?.fragment == nil
+                    && dpURLParts?.user == nil && dpURLParts?.password == nil,
+                "A26-URL: the URL is a bare https://github.com link with no query, fragment or "
+                    + "credentials (mutation: `buttonURL + \"?ref=\" + installID` — the shape a "
+                    + "per-user tracking parameter takes — fails here, and it is the reason this "
+                    + "constant lives in the transport rather than in the payload)")
+        } else {
+            // Not a formality. The cast above is what asserts the wire shape:
+            // if `buttons` regressed from an array to an OBJECT carrying the
+            // same `label` and `url`, this block would simply be skipped, and
+            // every other check still passes — the leaf-key and leaf-value
+            // assertions see identical leaves from both shapes. Discord renders
+            // nothing for the object form, so the button would silently vanish.
+            expect(false, "A26: the activity carries `buttons` as an ARRAY of objects")
+        }
+
+        // A26b — buttons ride with an activity, never with a clear. A cleared
+        // presence is the user withdrawing; sending them a link at that moment
+        // would be the one place this feature turns into advertising.
+        let dpClearFrame = DiscordIPC.activityJSON(nil, pid: 4242, nonce: "NONCE-C")
+        expect(!String(decoding: dpClearFrame, as: UTF8.self).contains("buttons")
+            && DiscordIPC.leafStrings(dpClearFrame).allSatisfy {
+                $0 != DiscordIPC.buttonURL && $0 != DiscordIPC.buttonLabel
+            },
+            "A26b: a clear carries no buttons (mutation: attaching them outside the `if let "
+                + "payload` sends a link on the frame that withdraws the presence)")
         let dpLiveLeaves = DiscordIPC.leafStrings(dpActivityBody)
-        let dpLivePayloadLeaves = ["12K tokens today", "Amp · $1-5", "tokenbar", "SET_ACTIVITY"]
-        expect(
-            dpLiveLeaves.count == dpLivePayloadLeaves.count + 2
-                && dpLivePayloadLeaves.allSatisfy(dpLiveLeaves.contains),
-            "the frame on the wire carries the payload, the envelope constant, and exactly two "
-                + "more leaves — the pid and the nonce")
+        // Literals, not the constants they pin, for the same reason the button
+        // URL above is: a future non-constant value fails HERE rather than
+        // riding along as one more payload field.
+        let dpLivePayloadLeaves = [
+            "12K tokens today", "Amp · $1-5", "tokenbar", "SET_ACTIVITY",
+            "View on GitHub", "https://github.com/Nanako0129/TokenBar",
+        ]
         let dpLiveExtra = dpLiveLeaves.filter { !dpLivePayloadLeaves.contains($0) }
-        expect(dpLiveExtra.contains(String(ProcessInfo.processInfo.processIdentifier)),
-            "the pid on the wire is this process's own (mutation: deriving it from a hostname "
-                + "hash, or anything else, fails here)")
         let dpLiveNonce = dpLiveExtra.first {
             $0 != String(ProcessInfo.processInfo.processIdentifier)
         }
-        expect(dpLiveNonce.map { UUID(uuidString: $0) != nil } == true,
-            "the nonce on the wire is a bare UUID and carries nothing else (mutation: building it "
-                + "from NSUserName() or the host name fails here)")
+        expect(
+            dpLiveLeaves.count == dpLivePayloadLeaves.count + 2
+                && dpLivePayloadLeaves.allSatisfy(dpLiveLeaves.contains)
+                && dpLiveExtra.contains(String(ProcessInfo.processInfo.processIdentifier))
+                && dpLiveNonce.map { UUID(uuidString: $0) != nil } == true,
+            "the frame on the wire carries the payload, the envelope constant, and exactly two "
+                + "more leaves — this process's own pid and a bare UUID nonce "
+                + "(mutation: deriving either from NSUserName() or a hostname hash fails here)")
         expect(!dpActivityText.contains("999K") && dpActivityBuffer.isEmpty,
             "a second publish inside the 15s floor is coalesced rather than sent")
 
@@ -4051,30 +8003,24 @@ enum SelfTest {
                 dpClearSeen = true
             }
         }
-        expect(dpClearSeen,
+        expect(dpClearSeen && !dpClient.isConnectedForTesting,
             "A7c: stop() sends the activity clear before closing the socket "
                 + "(mutation: closing first loses the frame entirely)")
-        expect(!dpClient.isConnectedForTesting, "A7c: stop() closes the socket")
         close(dpPeer)
 
         // A9 — SIGPIPE. The connection is established first (SO_NOSIGPIPE only
-        // applies to a live socket — on a dead one setsockopt returns EINVAL),
-        // then the peer is closed and a frame written in the same queue item so
-        // the EOF handler cannot get there first. With SO_NOSIGPIPE removed
-        // this does not fail, it kills the selftest process: no FAIL line, no
-        // "selftest passed", exit status 141.
-        let (dpDeadLocal, dpDeadPeer) = dpSocketPair()
-        let dpSigClient = DiscordIPCClient(connect: { dpDeadLocal })
-        dpSigClient.start()
-        dpSigClient.drainForTesting()
-        _ = dpRecv(dpDeadPeer)
-        dpSigClient.probeWriteForTesting { close(dpDeadPeer) }
-        expect(dpSigClient.writeErrnoForTesting == EPIPE,
-            "A9: a write to a closed socket returns EPIPE and the process survives "
+        // applies to a live socket), then the peer is closed and a frame
+        // written in the same queue item so the EOF handler cannot get there
+        // first. With SO_NOSIGPIPE removed this does not fail, it kills the
+        // selftest process: no FAIL line, no "selftest passed", exit 141.
+        let dpSigOK = dpScenario(peerClosedByBody: true) { peer, client in
+            client.probeWriteForTesting { close(peer) }
+            return client.writeErrnoForTesting == EPIPE && !client.isConnectedForTesting
+        }
+        expect(dpSigOK,
+            "A9: a write to a closed socket returns EPIPE, tearing the connection down, and the "
+                + "process survives "
                 + "(mutation: dropping SO_NOSIGPIPE terminates the selftest on signal 13)")
-        expect(!dpSigClient.isConnectedForTesting,
-            "A9: the failed write tears the connection down")
-        dpSigClient.stop()
 
         // A7b, part 1 — retries are bounded. Every connection here is born
         // broken (peer closed immediately), so the retry path runs to its limit.
@@ -4088,17 +8034,16 @@ enum SelfTest {
         })
         dpRetryClient.reconnectDelay = 0.02
         dpRetryClient.start()
-        expect(dpWaitUntil { dpRetries.value >= 2 },
-            "a broken connection is retried at all (without this the bound below is vacuous)")
-        expect(dpWaitUntil { dpRetries.value == 6 },
-            "the retry budget is the initial attempt plus five")
+        let dpRetriesBudgeted = dpWaitUntil { dpRetries.value >= 2 }
+            && dpWaitUntil { dpRetries.value == 6 }
         usleep(300_000)
-        expect(dpRetries.value == 6,
-            "A7b: reconnection stops at the attempt limit "
-                + "(mutation: dropping the maxReconnectAttempts guard retries forever)")
+        expect(dpRetriesBudgeted && dpRetries.value == 6,
+            "A7b: a broken connection retries, and the budget is exactly the initial attempt "
+                + "plus five (mutation: dropping maxReconnectAttempts retries forever)")
         dpRetryClient.stop()
 
-        // A7b, part 2 — stop() cancels the armed retry.
+        // A7b, part 2 — stop() cancels the armed retry, and idempotence has to
+        // hold while a retry is armed too, where `fd < 0` no longer covers it.
         let dpCancelCount = DPCounter()
         let dpCancelClient = DiscordIPCClient(connect: {
             dpCancelCount.value += 1
@@ -4109,22 +8054,19 @@ enum SelfTest {
         })
         dpCancelClient.reconnectDelay = 0.5
         dpCancelClient.start()
-        expect(dpWaitUntil { dpCancelClient.reconnectPendingForTesting },
-            "the disconnect arms a retry")
-        // A7a, second half: idempotence has to hold while a retry is armed too,
-        // where `fd < 0` no longer covers it.
+        let dpArmed = dpWaitUntil { dpCancelClient.reconnectPendingForTesting }
         dpCancelClient.start()
         dpCancelClient.drainForTesting()
-        expect(dpCancelCount.value == 1,
+        expect(dpArmed && dpCancelCount.value == 1,
             "A7a: start() during an armed retry does not open a second connection "
                 + "(mutation: dropping the `!running` guard in start() connects immediately)")
         dpCancelClient.stop()
         dpCancelClient.drainForTesting()
-        expect(!dpCancelClient.reconnectPendingForTesting,
-            "A7b: stop() cancels the armed retry "
-                + "(mutation: dropping reconnectWork?.cancel() leaves it armed)")
+        let dpCancelled = !dpCancelClient.reconnectPendingForTesting
         usleep(700_000)
-        expect(dpCancelCount.value == 1, "A7b: the cancelled retry never fires")
+        expect(dpCancelled && dpCancelCount.value == 1,
+            "A7b: stop() cancels the armed retry, and the cancelled retry never fires "
+                + "(mutation: dropping reconnectWork?.cancel() leaves it armed)")
 
         // A7b, part 3 — after stop(), no path rebuilds the connection. Driven
         // directly, because once stop() has closed the socket there is no
@@ -4138,57 +8080,294 @@ enum SelfTest {
         dpStopClient.reconnectDelay = 0.02
         dpStopClient.start()
         dpStopClient.drainForTesting()
-        expect(dpStopConnects.value == 1, "the stopped-client fixture connected once")
         dpStopClient.stop()
         dpStopClient.drainForTesting()
         dpStopClient.scheduleReconnectForTesting()
         usleep(300_000)
         expect(dpStopConnects.value == 1,
-            "A7b: no path reconnects after stop() "
+            "A7b: no path rebuilds the connection after stop() "
                 + "(mutation: dropping the running guard in openConnection reconnects here)")
         close(dpStopPeer)
 
-        // A2 — the two behaviours the previous review found unguarded.
+        // A14b — consent withdrawn while a publish is queued behind its own
+        // paired start(). This is the ONE ordering `applyDiscordPresence`
+        // actually produces; A14's bare `stop()` with no paired start ahead
+        // of the publish is not, and is subsumed by this fixture's mutation.
+        let (dpPairedLocal, dpPairedPeer) = dpSocketPair()
+        let dpPairedClient = DiscordIPCClient(connect: { dpPairedLocal })
+        dpPairedClient.start()
+        dpPairedClient.drainForTesting()
+        let dpPairedReady = dpReachReady(dpPairedPeer, dpPairedClient)
+        let dpPairedGate = dpHold(dpPairedClient)
+        dpPairedClient.start()
+        dpPairedClient.publish(dpP("99K tokens today"))
+        dpPairedClient.stop()
+        dpPairedGate.signal()
+        dpPairedClient.drainForTesting()
+        let dpPairedTail = String(decoding: dpDrainToEOF(dpPairedPeer), as: UTF8.self)
+        expect(dpPairedReady && !dpPairedTail.contains("99K tokens today")
+                && dpPairedTail.contains("\"activity\":null"),
+            "A14b: a publish queued behind its paired start() never reaches the socket, though "
+                + "the clear still does "
+                + "(mutation: re-arming consent inside start()'s queued block publishes it anyway)")
+        close(dpPairedPeer)
 
-        // Superseding a live connection must close the old socket, not leak
-        // it. Checked from the OLD PEER, never from the fd number: descriptors
-        // get reused, so "is fd N still open" can be true simply because N is
-        // now the NEW socket. Only the peer reaching EOF proves every copy of
-        // the old local end is gone.
-        let dpSupA = dpSocketPair()
-        let dpSupB = dpSocketPair()
-        let dpSupIdx = DPCounter()
-        let dpSupFDs: [Int32] = [dpSupA.0, dpSupB.0]
-        let dpSupClient = DiscordIPCClient(connect: {
-            let i = min(dpSupIdx.value, dpSupFDs.count - 1)
-            dpSupIdx.value += 1
-            return dpSupFDs[i]
+        // A14c — off then straight back on while a publish is still queued. A
+        // single consent Bool cannot survive this: `start()` re-arms it and
+        // the pre-withdrawal payload flushes. The epoch a later `start()`
+        // cannot undo is what `stop()` retired.
+        let (dpEpochPeers, dpEpochClient, dpEpochHanded) = dpRig(peers: 2)
+        dpEpochClient.start()
+        dpEpochClient.drainForTesting()
+        let dpEpochReady = dpReachReady(dpEpochPeers[0], dpEpochClient)
+        let dpEpochGate = dpHold(dpEpochClient)
+        dpEpochClient.publish(dpP("41K tokens today"))
+        dpEpochClient.stop()
+        dpEpochClient.start()
+        dpEpochClient.publish(dpP("42K tokens today"))
+        dpEpochGate.signal()
+        dpEpochClient.drainForTesting()
+        let dpEpochOld = String(decoding: dpDrainToEOF(dpEpochPeers[0]), as: UTF8.self)
+        let dpEpochOldOK = !dpEpochOld.contains("41K tokens today")
+            && dpEpochOld.contains("\"activity\":null")
+        close(dpEpochPeers[0])
+        let dpEpochReconnected = dpWaitUntil { dpEpochHanded.value >= 2 }
+        _ = dpReachReady(dpEpochPeers[1], dpEpochClient)
+        let dpEpochNewArrived = dpFrameArrives(dpEpochPeers[1], "42K tokens today", within: 2)
+        dpFinish(dpEpochClient, [dpEpochPeers[1]])
+        expect(dpEpochReady && dpEpochOldOK && dpEpochReconnected && dpEpochNewArrived,
+            "A14c: a publish made before the switch went off is not re-authorized by switching "
+                + "it back on, though the off half still cleared the activity and the on half "
+                + "kept working "
+                + "(mutation: a single consent Bool is set again by start() and the stale "
+                + "payload reaches Discord)")
+
+        // A18 — after a withdrawal the only thing this process sends is the
+        // clear, even for a ping whose read handler queued ahead of `stop()`.
+        let (dpPingLocal, dpPingPeer) = dpSocketPair()
+        let dpPingClient = DiscordIPCClient(connect: { dpPingLocal })
+        dpPingClient.start()
+        dpPingClient.drainForTesting()
+        _ = dpRecv(dpPingPeer)
+        let dpPingGate = dpHold(dpPingClient)
+        dpFrameBytes(3, "{\"ping\":1}").withUnsafeBytes { raw in
+            _ = send(dpPingPeer, raw.baseAddress!, raw.count, 0)
+        }
+        // Let the read source fire and enqueue its handler while the queue is
+        // parked, so the handler really is ahead of the stop block below.
+        usleep(50_000)
+        dpPingClient.stop()
+        dpPingGate.signal()
+        dpPingClient.drainForTesting()
+        let dpPingFrames = dpFrames(dpPingPeer)
+        let dpPongSeen = dpPingFrames.contains { $0.0 == .pong }
+        let dpPingClearSeen = dpPingFrames.contains {
+            String(decoding: $0.1, as: UTF8.self).contains("\"activity\":null")
+        }
+        expect(!dpPongSeen && dpPingClearSeen,
+            "A18: a ping whose handler was queued before the switch went off is not answered, "
+                + "though the clear still goes out "
+                + "(mutation: an ungated writeFrame(.pong,) replies to Discord after opt-out)")
+        close(dpPingPeer)
+
+        // A20 — a reduction retires what was computed before it. "Switch off,
+        // hide a client, switch on" coalesces to one apply with no `stop()`,
+        // so the hide itself has to retire the stale payload.
+        let (dpStaleLocal, dpStalePeer) = dpSocketPair()
+        let dpStaleClient = DiscordIPCClient(connect: { dpStaleLocal })
+        dpStaleClient.start()
+        dpStaleClient.drainForTesting()
+        let dpStaleReady = dpReachReady(dpStalePeer, dpStaleClient)
+        let dpStaleGate = dpHold(dpStaleClient)
+        dpStaleClient.publish(dpP("70K tokens today"))
+        dpStaleClient.publish(dpP("71K tokens today", state: "Zed · $10-25"), visibility: .reducing)
+        dpStaleGate.signal()
+        dpStaleClient.drainForTesting()
+        let dpStaleSeen = dpFramesNow(dpStalePeer)
+        expect(dpStaleReady && !dpStaleSeen.contains("70K tokens today")
+                && dpStaleSeen.contains("71K tokens today"),
+            "A20: a payload computed before the hide never reaches the socket, though the "
+                + "reduction itself does "
+                + "(mutation: without the reduction retiring earlier work it is written first, "
+                + "putting the client the user just hid back on the profile)")
+        dpFinish(dpStaleClient, [dpStalePeer])
+
+        // A19 — a clear that lost its socket is retried on the next
+        // connection. `nil` stands for both "nothing given yet" and "the
+        // clear was given", so a fresh connection can wrongly claim it holds
+        // one already and drop it.
+        let (dpReclearPeers, dpReclearClient, dpReclearHanded) = dpRig(peers: 2)
+        dpReclearClient.reconnectDelay = 0.02
+        dpReclearClient.start()
+        _ = dpWaitUntil { dpReclearClient.isConnectedForTesting }
+        let dpReclearReady = dpReachReady(dpReclearPeers[0], dpReclearClient)
+        dpReclearClient.publish(dpP("60K tokens today"))
+        dpReclearClient.drainForTesting()
+        let dpReclearPublished = dpFramesNow(dpReclearPeers[0]).contains("60K tokens today")
+        // Park the queue, put the clear behind it, then break the socket. The
+        // clear's write is attempted against a peer that is already gone, so
+        // it fails and tears the connection down with the clear still pending.
+        let dpReclearGate = dpHold(dpReclearClient)
+        dpReclearClient.publish(nil, visibility: .reducing)
+        close(dpReclearPeers[0])
+        dpReclearGate.signal()
+        dpReclearClient.drainForTesting()
+        let dpReclearReconnected = dpWaitUntil { dpReclearHanded.value >= 2 }
+        _ = dpReachReady(dpReclearPeers[1], dpReclearClient)
+        let dpReclearArrived = dpFrameArrives(dpReclearPeers[1], "\"activity\":null", within: 2)
+        dpFinish(dpReclearClient, [dpReclearPeers[1]])
+        expect(dpReclearReady && dpReclearPublished && dpReclearReconnected && dpReclearArrived,
+            "A19: a clear that lost its socket is retried on the next connection "
+                + "(mutation: one `nil` for both \"nothing delivered yet\" and \"the clear was "
+                + "delivered\" makes the fresh connection treat it as already held and drop it)")
+
+        // A17 — on then off before the queue has run the start: the gate's
+        // contract is that this process may not connect at all.
+        let dpOptOutConnects = DPCounter()
+        let dpOptOutClient = DiscordIPCClient(connect: {
+            dpOptOutConnects.value += 1
+            var fds: [Int32] = [-1, -1]
+            _ = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
+            close(fds[1])
+            return fds[0]
         })
+        let dpOptOutGate = dpHold(dpOptOutClient)
+        dpOptOutClient.start()
+        dpOptOutClient.publish(dpP("51K tokens today"))
+        dpOptOutClient.stop()
+        dpOptOutGate.signal()
+        dpOptOutClient.drainForTesting()
+        // A control fixture without the opt-out: without it, the assertion
+        // below would pass on a client that simply never connects at all.
+        let dpOptInConnects = DPCounter()
+        let dpOptInClient = DiscordIPCClient(connect: {
+            dpOptInConnects.value += 1
+            var fds: [Int32] = [-1, -1]
+            _ = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
+            close(fds[1])
+            return fds[0]
+        })
+        let dpOptInGate = dpHold(dpOptInClient)
+        dpOptInClient.start()
+        dpOptInClient.publish(dpP("51K tokens today"))
+        dpOptInGate.signal()
+        dpOptInClient.drainForTesting()
+        dpOptInClient.stop()
+        dpOptInClient.drainForTesting()
+        expect(dpOptOutConnects.value == 0 && dpOptInConnects.value == 1,
+            "A17: a start queued before the switch went off never opens a socket, though the "
+                + "same fixture without the opt-out does connect "
+                + "(mutation: guarding openConnection on the queue-local `running` alone hands "
+                + "Discord a connection and a handshake after the user opted out)")
+
+        // The floor applies to every NEW sample, including one caused by a
+        // hide. That is the whole behavioural change of removing the bypass,
+        // and it is what the consent copy now states. A clear is different and
+        // still is not throttled: it carries no new information, and delaying
+        // one would keep a stale presence public after the user switched off.
+        let (dpNoBypassLocal, dpNoBypassPeer) = dpSocketPair()
+        let dpNoBypassClient = DiscordIPCClient(connect: { dpNoBypassLocal })
+        dpNoBypassClient.start()
+        dpNoBypassClient.drainForTesting()
+        let dpNoBypassReady = dpReachReady(dpNoBypassPeer, dpNoBypassClient)
+        dpNoBypassClient.publish(dpP("10K tokens today", state: "Amp · $1-5"))
+        dpNoBypassClient.drainForTesting()
+        let dpNoBypassArmed = String(decoding: dpRecvNow(dpNoBypassPeer), as: UTF8.self)
+            .contains("10K tokens today")
+        dpNoBypassClient.publish(dpP("11K tokens today", state: "Amp · $1-5"), visibility: .reducing)
+        dpNoBypassClient.drainForTesting()
+        let dpNoBypassHeld = !String(decoding: dpRecvNow(dpNoBypassPeer), as: UTF8.self).contains("11K")
+        dpNoBypassClient.publish(nil, visibility: .reducing)
+        dpNoBypassClient.drainForTesting()
+        let dpNoBypassCleared = String(decoding: dpRecvNow(dpNoBypassPeer), as: UTF8.self)
+            .contains("\"activity\":null")
+        dpFinish(dpNoBypassClient, [dpNoBypassPeer])
+        expect(dpNoBypassReady && dpNoBypassArmed && dpNoBypassHeld && dpNoBypassCleared,
+            "a hide waits out the publish floor like any other new sample, while a clear still "
+                + "goes out immediately (mutation: re-adding a bypass republishes the hide "
+                + "sub-interval; throttling the clear leaves a stale presence public)")
+        // The superseded-grant fixture is gone with the grant: nothing is armed, so nothing can be inherited or destroyed.
+
+        // A clear carries no new information, so it is not throttled — but it
+        // must not re-arm the floor's CLOCK either, or the unhide behind it
+        // goes out inside the interval. Windows below are wall-clock.
+        func dpFramesNow(_ fd: Int32) -> String {
+            dpFrames(fd).filter { $0.0 == .frame }
+                .map { String(decoding: $0.1, as: UTF8.self) }.joined()
+        }
+        func dpFrameArrives(_ fd: Int32, _ needle: String, within seconds: Double) -> Bool {
+            let deadline = DispatchTime.now() + seconds
+            repeat {
+                if dpFramesNow(fd).contains(needle) { return true }
+                usleep(5_000)
+            } while DispatchTime.now() < deadline
+            return false
+        }
+        let (dpOneShotLocal, dpOneShotPeer) = dpSocketPair()
+        let dpOneShotClient = DiscordIPCClient(connect: { dpOneShotLocal })
+        dpOneShotClient.publishInterval = 1.0
+        dpOneShotClient.start()
+        dpOneShotClient.drainForTesting()
+        let dpOneShotReady = dpReachReady(dpOneShotPeer, dpOneShotClient)
+        dpOneShotClient.publish(dpP("20K tokens today", state: "Amp · $1-5"))
+        dpOneShotClient.drainForTesting()
+        let dpOneShotArmedAt = DispatchTime.now()
+        let dpOneShotArmed = dpFramesNow(dpOneShotPeer).contains("20K tokens today")
+        // Every client hidden: the payload is nil and what goes out is a clear.
+        dpOneShotClient.publish(nil, visibility: .reducing)
+        dpOneShotClient.drainForTesting()
+        let dpOneShotCleared = dpFramesNow(dpOneShotPeer).contains("\"activity\":null")
+        dpOneShotClient.publish(dpP("21K tokens today", state: "Amp · $1-5"))
+        dpOneShotClient.drainForTesting()
+        // The fixture has to still be inside the 1s floor here, or the
+        // assertions below would be reporting payloads that were simply due.
+        let dpOneShotSpent = Double(
+            DispatchTime.now().uptimeNanoseconds - dpOneShotArmedAt.uptimeNanoseconds)
+            / 1_000_000_000
+        let dpOneShotFast = dpOneShotSpent < 0.5
+        // 300ms: well inside the 1s floor, well over the time a due frame needs.
+        let dpOneShotHeld = !dpFrameArrives(dpOneShotPeer, "21K tokens today", within: 0.3)
+        let dpOneShotArrivedLater = dpFrameArrives(dpOneShotPeer, "21K tokens today", within: 3)
+        dpFinish(dpOneShotClient, [dpOneShotPeer])
+        expect(dpOneShotReady && dpOneShotArmed && dpOneShotCleared && dpOneShotFast
+                && dpOneShotHeld && dpOneShotArrivedLater,
+            "A15c: the unhide that follows a clear still waits out the floor, and does arrive "
+                + "once it expires (fixture spent \(String(format: "%.3f", dpOneShotSpent))s "
+                + "arming; mutation: letting the clear reset `lastSent` leaves the clock cleared "
+                + "through it, and this payload goes out inside the interval)")
+
+        // A15d is gone with the grant it tested — an armed-but-unspent state cannot occur.
+
+        // A2 — the two behaviours a previous review found unguarded.
+
+        // Superseding a live connection must close the old socket, checked
+        // from the OLD PEER reaching EOF — an fd number can be reused, so "is
+        // fd N still open" proves nothing.
+        let (dpSupPeers, dpSupClient, dpSupIdx) = dpRig(peers: 2)
         dpSupClient.reconnectDelay = 0.02
         dpSupClient.start()
         _ = dpWaitUntil { dpSupClient.isConnectedForTesting }
         // Drain the handshake first, or the peer has bytes waiting and can
         // never report EOF.
-        _ = dpRecv(dpSupA.1)
+        _ = dpRecv(dpSupPeers[0])
         dpSupClient.scheduleReconnectForTesting()
         _ = dpWaitUntil { dpSupIdx.value >= 2 }
         let dpSupClosed = dpWaitUntil {
             var byte: UInt8 = 0
-            return recv(dpSupA.1, &byte, 1, MSG_DONTWAIT) == 0
+            return recv(dpSupPeers[0], &byte, 1, MSG_DONTWAIT) == 0
         }
         expect(dpSupClosed,
             "reconnecting over a live connection closes the superseded socket (mutation: dropping "
                 + "openConnection's `if fd >= 0 { teardown() }` leaks the descriptor and the old "
                 + "peer never sees EOF)")
         dpSupClient.stop()
-        close(dpSupA.1)
-        close(dpSupB.1)
+        close(dpSupPeers[0])
+        close(dpSupPeers[1])
 
-        // The retry budget resets once a connection reaches READY, so a long
-        // session survives more than `maxReconnectAttempts` Discord restarts.
-        // The peer answers READY and only then drops: a fixture that closes
-        // immediately never reaches READY and would pass even with the reset
-        // removed, which is exactly the trap that made this look untestable.
+        // The retry budget resets on READY, so a long session survives more
+        // than `maxReconnectAttempts` restarts — the peer must answer READY
+        // before dropping, or a fixture that closes immediately would pass
+        // even with the reset removed.
         let dpReadyFrame = dpFrameBytes(1, "{\"evt\":\"READY\"}")
         let dpReadyCount = DPCounter()
         let dpReadyClient = DiscordIPCClient(connect: {
@@ -4210,17 +8389,10 @@ enum SelfTest {
             dpReadyCount.value > DiscordIPCClient.maxReconnectAttempts + 1
         }
         dpReadyClient.stop()
-        expect(dpReadyBeyondCap,
-            "reaching READY resets the retry budget (mutation: dropping `attempts = 0` from the "
-                + "READY branch caps reconnects at maxReconnectAttempts for the whole start() "
-                + "lifetime, so the presence never returns after enough restarts)")
 
-        // The mirror image, and the one that pins the reset's TIMING rather
-        // than its existence: a peer that connects, says nothing, and drops.
-        // That is Discord running but refusing us, and it must still exhaust
-        // the budget. Resetting on the socket opening instead of on READY
-        // would reconnect against it forever — the assertion above cannot see
-        // that difference, because its connections do reach READY.
+        // The mirror image: a peer that connects, says nothing, and drops
+        // must still exhaust the budget — the reset has to be on READY, not
+        // on socket-open, or this reconnects forever.
         let dpMuteCount = DPCounter()
         let dpMuteClient = DiscordIPCClient(connect: {
             var fds: [Int32] = [-1, -1]
@@ -4240,28 +8412,21 @@ enum SelfTest {
         // pad the suite.
         for _ in 0..<60 where dpMuteCount.value <= dpMuteCap { usleep(5_000) }
         dpMuteClient.stop()
-        expect(dpMuteCount.value <= dpMuteCap,
-            "a peer that never reaches READY still exhausts the retry budget (mutation: resetting "
-                + "`attempts` when the socket opens instead of when READY arrives reconnects "
-                + "forever against a peer that accepts and immediately drops)")
+        expect(dpReadyBeyondCap && dpMuteCount.value <= dpMuteCap,
+            "reaching READY resets the retry budget, and a peer that never reaches READY still "
+                + "exhausts it as normal "
+                + "(mutation: dropping `attempts = 0` from the READY branch caps reconnects at "
+                + "maxReconnectAttempts for the whole start() lifetime; resetting on socket-open "
+                + "instead reconnects forever against a peer that accepts and immediately drops)")
 
         // Codex round 1 on the transport PR — four findings that were all the
         // same root: the lifecycle treated "connected, published, dropped" as
         // the end of the story instead of something that has to come back.
 
-        // Reconnecting republishes the last activity. Discord restarting is
-        // ordinary; before this the payload was marked sent, `hasPending` went
-        // false, and the READY on the replacement connection flushed nothing —
-        // the presence stayed missing until the producer happened to publish
-        // again, up to the tray's 5-minute poll away.
+        // Reconnecting republishes the last activity, or the presence stays
+        // missing until the producer happens to publish again.
         let dpRepubReady = dpFrameBytes(1, "{\"evt\":\"READY\"}")
-        let dpRepubPairs = [dpSocketPair(), dpSocketPair()]
-        let dpRepubIdx = DPCounter()
-        let dpRepubClient = DiscordIPCClient(connect: {
-            let i = min(dpRepubIdx.value, dpRepubPairs.count - 1)
-            dpRepubIdx.value += 1
-            return dpRepubPairs[i].0
-        })
+        let (dpRepubPeers, dpRepubClient, dpRepubIdx) = dpRig(peers: 2)
         dpRepubClient.reconnectDelay = 0.02
         // Deliberately high: a restore re-sends bytes Discord already has, so
         // it must not queue behind the sampling floor. With the throttle
@@ -4270,27 +8435,23 @@ enum SelfTest {
         dpRepubClient.publishInterval = 30
         dpRepubClient.start()
         _ = dpWaitUntil { dpRepubClient.isConnectedForTesting }
-        _ = dpRepubReady.withUnsafeBytes { send(dpRepubPairs[0].1, $0.baseAddress, $0.count, 0) }
+        _ = dpRepubReady.withUnsafeBytes { send(dpRepubPeers[0], $0.baseAddress, $0.count, 0) }
         _ = dpWaitUntil { dpRepubClient.inboundTokenForTesting == DiscordIPC.readyEvent }
         dpRepubClient.publish(dpWirePayload)
         dpRepubClient.drainForTesting()
-        _ = dpDrainToEOF(dpRepubPairs[0].1)
+        _ = dpDrainToEOF(dpRepubPeers[0])
         // Break the first connection; the client retries onto the second pair.
-        close(dpRepubPairs[0].1)
+        close(dpRepubPeers[0])
         _ = dpWaitUntil { dpRepubIdx.value >= 2 }
-        _ = dpRepubReady.withUnsafeBytes { send(dpRepubPairs[1].1, $0.baseAddress, $0.count, 0) }
+        _ = dpRepubReady.withUnsafeBytes { send(dpRepubPeers[1], $0.baseAddress, $0.count, 0) }
         dpRepubClient.drainForTesting()
         // No second `publish()` anywhere: whatever arrives here was resent by
         // the client itself.
         var dpRepubSeen = false
         _ = dpWaitUntil {
-            var buf = dpRecv(dpRepubPairs[1].1)
-            while case .frame(let op, let body) = DiscordIPC.decode(from: &buf) {
-                if op == .frame,
-                   String(decoding: body, as: UTF8.self).contains("12K tokens today") {
-                    dpRepubSeen = true
-                }
-            }
+            if dpFrames(dpRepubPeers[1]).contains(where: {
+                $0.0 == .frame && String(decoding: $0.1, as: UTF8.self).contains("12K tokens today")
+            }) { dpRepubSeen = true }
             return dpRepubSeen
         }
         expect(dpRepubSeen,
@@ -4298,7 +8459,7 @@ enum SelfTest {
                 + "(mutation: dropping the READY branch's `hasPending = true` leaves the presence "
                 + "missing until the next producer update)")
         dpRepubClient.stop()
-        close(dpRepubPairs[1].1)
+        close(dpRepubPeers[1])
 
         // Exhausting the retry budget returns the client to a state a later
         // start() can act on. Leaving `running` true made start() hit the
@@ -4348,19 +8509,15 @@ enum SelfTest {
 
         // Codex round 2 — both findings are consequences of round 1's fixes.
 
-        // The kill switch clears the queued payload even when the retry budget
-        // already gave up. `giveUp()` keeps `pending` on purpose so a later
-        // start() can restore, and `stop()` used to bail on `!running`, which
-        // left that payload alive to be republished after the user turned the
-        // feature off.
+        // The kill switch clears the queued payload even when the retry
+        // budget already gave up (`giveUp()` keeps `pending` on purpose so a
+        // later start() can restore).
         let dpAbandonReady = dpFrameBytes(1, "{\"evt\":\"READY\"}")
         let dpAbandonPairs = [dpSocketPair(), dpSocketPair()]
         // The counter doubles as the fixture's mode: 0 hands out the first
         // socket, anything below `dpAbandonRevive` fails so the budget is
-        // genuinely exhausted, and the test raises it later to let the second
-        // start() connect. An earlier version simply indexed the pair array,
-        // which handed out the second socket on the first retry and never
-        // reached the given-up state the assertion is about.
+        // genuinely exhausted, and the test raises it later for the second
+        // start() to connect.
         let dpAbandonIdx = DPCounter()
         let dpAbandonRevive = DPCounter()
         dpAbandonRevive.value = 1_000_000
@@ -4396,13 +8553,9 @@ enum SelfTest {
         dpAbandonClient.drainForTesting()
         var dpAbandonRepublished = false
         for _ in 0..<60 where !dpAbandonRepublished {
-            var buf = dpRecvNow(dpAbandonPairs[1].1)
-            while case .frame(let op, let body) = DiscordIPC.decode(from: &buf) {
-                if op == .frame,
-                   String(decoding: body, as: UTF8.self).contains("12K tokens today") {
-                    dpAbandonRepublished = true
-                }
-            }
+            if dpFrames(dpAbandonPairs[1].1).contains(where: {
+                $0.0 == .frame && String(decoding: $0.1, as: UTF8.self).contains("12K tokens today")
+            }) { dpAbandonRepublished = true }
             usleep(5_000)
         }
         dpAbandonClient.stop()
@@ -4416,38 +8569,31 @@ enum SelfTest {
         // sampling floor: delaying one keeps a stale presence public for up to
         // the whole interval after the user hid the clients that produced it.
         let dpClearReady = dpFrameBytes(1, "{\"evt\":\"READY\"}")
-        let dpClearPair = dpSocketPair()
-        let dpClearClient = DiscordIPCClient(connect: { dpClearPair.0 })
-        dpClearClient.publishInterval = 30
-        dpClearClient.start()
-        _ = dpWaitUntil { dpClearClient.isConnectedForTesting }
-        _ = dpClearReady.withUnsafeBytes { send(dpClearPair.1, $0.baseAddress, $0.count, 0) }
-        _ = dpWaitUntil { dpClearClient.inboundTokenForTesting == DiscordIPC.readyEvent }
-        dpClearClient.publish(dpWirePayload)
-        dpClearClient.drainForTesting()
-        _ = dpDrainToEOF(dpClearPair.1)
-        dpClearClient.publish(nil)
-        dpClearClient.drainForTesting()
-        var dpClearSent = false
-        for _ in 0..<60 where !dpClearSent {
-            var buf = dpRecvNow(dpClearPair.1)
-            while case .frame(let op, let body) = DiscordIPC.decode(from: &buf) {
-                if op == .frame,
-                   String(decoding: body, as: UTF8.self).contains("\"activity\":null") {
-                    dpClearSent = true
-                }
+        let dpClearSent = dpScenario { peer, client in
+            client.publishInterval = 30
+            _ = dpClearReady.withUnsafeBytes { send(peer, $0.baseAddress, $0.count, 0) }
+            _ = dpWaitUntil { client.inboundTokenForTesting == DiscordIPC.readyEvent }
+            client.publish(dpWirePayload)
+            client.drainForTesting()
+            _ = dpDrainToEOF(peer)
+            client.publish(nil)
+            client.drainForTesting()
+            var sent = false
+            for _ in 0..<60 where !sent {
+                if dpFrames(peer).contains(where: {
+                    $0.0 == .frame && String(decoding: $0.1, as: UTF8.self).contains("\"activity\":null")
+                }) { sent = true }
+                usleep(5_000)
             }
-            usleep(5_000)
+            return sent
         }
-        dpClearClient.stop()
-        close(dpClearPair.1)
         expect(dpClearSent,
             "a clear goes out immediately rather than waiting for the publish floor (mutation: "
                 + "throttling it unconditionally leaves a stale presence public for the whole "
                 + "interval after the user hid everything)")
 
         // Codex round 3 — user intent vs connection state, descriptor
-        // inheritance, and the duplicate that round 2's throttle bypass let in.
+        // inheritance, and the duplicate the restore exemption let in.
 
         // A producer update while the retry budget is spent is still the
         // latest intent, and the client is what a later start() must restore.
@@ -4477,8 +8623,7 @@ enum SelfTest {
         close(dpIntentPairs[0].1)
         _ = dpWaitUntil { dpIntentIdx.value > DiscordIPCClient.maxReconnectAttempts + 1 }
         // The producer moves on while the client is abandoned.
-        let dpIntentNewer = DiscordPresence.Payload(
-            details: "77K tokens today", state: "Zed · $1-5", largeImageKey: "tokenbar")
+        let dpIntentNewer = dpP("77K tokens today", state: "Zed · $1-5")
         dpIntentClient.publish(dpIntentNewer)
         dpIntentRevive.value = dpIntentIdx.value
         dpIntentClient.start()
@@ -4488,11 +8633,10 @@ enum SelfTest {
         var dpIntentGotNewer = false
         var dpIntentGotStale = false
         for _ in 0..<60 where !dpIntentGotNewer {
-            var buf = dpRecvNow(dpIntentPairs[1].1)
-            while case .frame(let op, let body) = DiscordIPC.decode(from: &buf) {
+            for (op, body) in dpFrames(dpIntentPairs[1].1) where op == .frame {
                 let text = String(decoding: body, as: UTF8.self)
-                if op == .frame, text.contains("77K tokens today") { dpIntentGotNewer = true }
-                if op == .frame, text.contains("12K tokens today") { dpIntentGotStale = true }
+                if text.contains("77K tokens today") { dpIntentGotNewer = true }
+                if text.contains("12K tokens today") { dpIntentGotStale = true }
             }
             usleep(5_000)
         }
@@ -4503,9 +8647,8 @@ enum SelfTest {
                 + "(mutation: having giveUp() clear `running` makes publish() drop it and the "
                 + "reconnect republishes the pre-give-up payload)")
 
-        // The socket must not survive into a child process. The Rust core
-        // spawns helpers, and an inherited descriptor keeps Discord seeing a
-        // connection this app has already torn down.
+        // The socket must not survive into a child process the Rust core
+        // spawns, checked both as adopted and from the moment it is created.
         let dpCloexecPair = dpSocketPair()
         let dpCloexecClient = DiscordIPCClient(connect: { dpCloexecPair.0 })
         dpCloexecClient.start()
@@ -4513,124 +8656,1274 @@ enum SelfTest {
         let dpCloexecFlags = fcntl(dpCloexecPair.0, F_GETFD)
         dpCloexecClient.stop()
         close(dpCloexecPair.1)
-        expect(dpCloexecFlags >= 0 && (dpCloexecFlags & FD_CLOEXEC) != 0,
-            "the adopted socket is close-on-exec (mutation: dropping the fcntl leaks the "
-                + "connection into every helper the Rust core spawns)")
 
         // Publishing the same payload twice on one connection sends it once.
-        // Round 2's throttle bypass is for restores; without a per-connection
+        // The throttle exemption is for restores; without a per-connection
         // record it also let a duplicate through immediately, which resets the
         // floor's clock and delays the next real payload behind a no-op.
         let dpDupReady = dpFrameBytes(1, "{\"evt\":\"READY\"}")
-        let dpDupPair = dpSocketPair()
-        let dpDupClient = DiscordIPCClient(connect: { dpDupPair.0 })
-        dpDupClient.publishInterval = 0
-        dpDupClient.start()
-        _ = dpWaitUntil { dpDupClient.isConnectedForTesting }
-        _ = dpDupReady.withUnsafeBytes { send(dpDupPair.1, $0.baseAddress, $0.count, 0) }
-        _ = dpWaitUntil { dpDupClient.inboundTokenForTesting == DiscordIPC.readyEvent }
-        dpDupClient.publish(dpWirePayload)
-        dpDupClient.drainForTesting()
-        _ = dpDrainToEOF(dpDupPair.1)
-        dpDupClient.publish(dpWirePayload)
-        dpDupClient.drainForTesting()
-        var dpDupResent = false
-        for _ in 0..<40 where !dpDupResent {
-            var buf = dpRecvNow(dpDupPair.1)
-            while case .frame(let op, let body) = DiscordIPC.decode(from: &buf) {
-                if op == .frame,
-                   String(decoding: body, as: UTF8.self).contains("12K tokens today") {
-                    dpDupResent = true
-                }
+        let dpDupResent = dpScenario { peer, client in
+            client.publishInterval = 0
+            _ = dpDupReady.withUnsafeBytes { send(peer, $0.baseAddress, $0.count, 0) }
+            _ = dpWaitUntil { client.inboundTokenForTesting == DiscordIPC.readyEvent }
+            client.publish(dpWirePayload)
+            client.drainForTesting()
+            _ = dpDrainToEOF(peer)
+            client.publish(dpWirePayload)
+            client.drainForTesting()
+            var resent = false
+            for _ in 0..<40 where !resent {
+                if dpFrames(peer).contains(where: {
+                    $0.0 == .frame && String(decoding: $0.1, as: UTF8.self).contains("12K tokens today")
+                }) { resent = true }
+                usleep(5_000)
             }
-            usleep(5_000)
+            return resent
         }
-        dpDupClient.stop()
-        close(dpDupPair.1)
         expect(!dpDupResent,
             "an identical payload on the same connection is not sent twice (mutation: dropping "
                 + "the deliveredOnThisConnection check resends it immediately, past the floor)")
 
         // Codex round 4 — the connect path itself, which every earlier round
         // had treated as a detail that either works or throws.
-
-        // Close-on-exec from birth. The previous round set the flag after
-        // `connectFD()` returned, which left `socket()` and `connect()` inside
-        // the window an exec can inherit through — and `connect()` is exactly
-        // the call the next assertion shows can take a while.
         let dpBornFD = DiscordIPC.makeSocket()
         let dpBornFlags = fcntl(dpBornFD, F_GETFD)
         close(dpBornFD)
-        expect(dpBornFD >= 0 && (dpBornFlags & FD_CLOEXEC) != 0,
-            "the socket is close-on-exec before connect() runs (mutation: moving the fcntl back "
-                + "out of makeSocket leaves the whole connect window inheritable)")
+        expect((dpCloexecFlags >= 0 && (dpCloexecFlags & FD_CLOEXEC) != 0)
+                && (dpBornFD >= 0 && (dpBornFlags & FD_CLOEXEC) != 0),
+            "the socket is close-on-exec both as adopted and from the moment makeSocket() "
+                + "creates it (mutation: dropping either fcntl leaks the descriptor into helpers "
+                + "the Rust core spawns, or leaves the connect() window inheritable)")
 
-        // Codex round 5 — the bypass skipped the floor but still moved its
+        // The restore skipped the floor but still moved its
         // clock, so a restore delayed the next real payload by a full
         // interval measured from the restore instead of from the last sample.
         let dpFloorReady = dpFrameBytes(1, "{\"evt\":\"READY\"}")
-        let dpFloorPairs = [dpSocketPair(), dpSocketPair()]
-        let dpFloorIdx = DPCounter()
-        let dpFloorClient = DiscordIPCClient(connect: {
-            let i = min(dpFloorIdx.value, dpFloorPairs.count - 1)
-            dpFloorIdx.value += 1
-            return dpFloorPairs[i].0
-        })
+        let (dpFloorPeers, dpFloorClient, dpFloorIdx) = dpRig(peers: 2)
         dpFloorClient.reconnectDelay = 0.02
         dpFloorClient.publishInterval = 1.0
         dpFloorClient.start()
         _ = dpWaitUntil { dpFloorClient.isConnectedForTesting }
-        _ = dpFloorReady.withUnsafeBytes { send(dpFloorPairs[0].1, $0.baseAddress, $0.count, 0) }
+        _ = dpFloorReady.withUnsafeBytes { send(dpFloorPeers[0], $0.baseAddress, $0.count, 0) }
         _ = dpWaitUntil { dpFloorClient.inboundTokenForTesting == DiscordIPC.readyEvent }
         dpFloorClient.publish(dpWirePayload)
         dpFloorClient.drainForTesting()
-        _ = dpDrainToEOF(dpFloorPairs[0].1)
+        _ = dpDrainToEOF(dpFloorPeers[0])
         // Let the interval elapse against the real sample, so the payload that
         // follows the restore is due immediately if the clock was left alone.
         usleep(1_200_000)
-        close(dpFloorPairs[0].1)
+        close(dpFloorPeers[0])
         _ = dpWaitUntil { dpFloorIdx.value >= 2 }
-        _ = dpFloorReady.withUnsafeBytes { send(dpFloorPairs[1].1, $0.baseAddress, $0.count, 0) }
-        // Wait for the restore to actually reach the socket before publishing
-        // the next payload. `drainForTesting` only syncs the queue, and the
-        // READY read event may not be on it yet — publishing early lets the
-        // new payload flush before the restore ever runs, at which point both
-        // the fixed and the broken build send it immediately and the
-        // assertion measures nothing.
+        _ = dpFloorReady.withUnsafeBytes { send(dpFloorPeers[1], $0.baseAddress, $0.count, 0) }
+        // Wait for the restore to actually reach the socket before
+        // publishing next, or both builds send it immediately and this
+        // measures nothing.
         var dpFloorRestored = false
         for _ in 0..<200 where !dpFloorRestored {
-            var buf = dpRecvNow(dpFloorPairs[1].1)
-            while case .frame(let op, let body) = DiscordIPC.decode(from: &buf) {
-                if op == .frame,
-                   String(decoding: body, as: UTF8.self).contains("12K tokens today") {
-                    dpFloorRestored = true
-                }
-            }
+            if dpFrames(dpFloorPeers[1]).contains(where: {
+                $0.0 == .frame && String(decoding: $0.1, as: UTF8.self).contains("12K tokens today")
+            }) { dpFloorRestored = true }
             usleep(5_000)
         }
-        let dpFloorNewer = DiscordPresence.Payload(
-            details: "55K tokens today", state: "Amp · $5-10", largeImageKey: "tokenbar")
-        dpFloorClient.publish(dpFloorNewer)
+        dpFloorClient.publish(dpP("55K tokens today", state: "Amp · $5-10"))
         dpFloorClient.drainForTesting()
         // 400ms: comfortably under the 1s the buggy path would defer by, and
         // comfortably over the time a due payload needs to reach the socket.
         var dpFloorPrompt = false
         for _ in 0..<80 where !dpFloorPrompt {
-            var buf = dpRecvNow(dpFloorPairs[1].1)
-            while case .frame(let op, let body) = DiscordIPC.decode(from: &buf) {
-                if op == .frame,
-                   String(decoding: body, as: UTF8.self).contains("55K tokens today") {
-                    dpFloorPrompt = true
-                }
-            }
+            if dpFrames(dpFloorPeers[1]).contains(where: {
+                $0.0 == .frame && String(decoding: $0.1, as: UTF8.self).contains("55K tokens today")
+            }) { dpFloorPrompt = true }
             usleep(5_000)
         }
         dpFloorClient.stop()
-        close(dpFloorPairs[1].1)
+        close(dpFloorPeers[1])
         expect(dpFloorRestored && dpFloorPrompt,
             "a restore does not consume the publish interval (mutation: advancing lastSent on a "
                 + "write that carries no new information throttles the next real payload from the "
                 + "restore instead of from the last sample)")
+
+        // MARK: - Discord Rich Presence wiring (DISCORD-PRESENCE M2b)
+        //
+        // M1 built the payload and M2a the transport, both with no caller. This
+        // section covers the only question the wiring adds: can data actually
+        // get out, and under what.
+
+        // A1 (P0) — the demo/test gate, asserted through the production factory
+        // `AppDelegate.applicationDidFinishLaunching` and `applyDiscordPresence`
+        // both call. SelfTest cannot reach the app lifecycle (`run()` returns
+        // `Never` before `NSApplication.shared`), so the gate is a static
+        // function with injectable arguments rather than something buried in a
+        // delegate method — that seam is what makes this assertion possible at
+        // all.
+        //
+        // The flag SET is pinned separately from the behaviour: every assertion
+        // below iterates `testArguments`, so all of them pass trivially on a
+        // shortened array. `--icon-gallery` is in it because that debug window
+        // enters the normal lifecycle and refreshes the live graph.
+        let dpTestFlags = DiscordPresence.testArguments
+        expect(dpTestFlags.sorted() == ["--demo", "--icon-gallery", "--selftest", "--smoke"],
+            "A1: the refused arguments are exactly demo, smoke, selftest and the icon gallery")
+        let dpLiveClient = DiscordIPCClient(connect: { throw DiscordIPC.Failure.unavailable })
+        expect(
+            dpTestFlags.allSatisfy {
+                AppDelegate.makeDiscordClient(
+                    arguments: ["TokenBar", $0, "--open-popover"], enabled: true) == nil
+                    && AppDelegate.makeDiscordClient(
+                        existing: dpLiveClient, arguments: ["TokenBar", $0], enabled: true) == nil
+                    && !DiscordPresence.mayConnect(arguments: [$0], enabled: true)
+            },
+            "A1: no demo/smoke/selftest run builds a client or keeps an existing one, even with "
+                + "the switch forced on, and the gate function itself puts the flags above the "
+                + "preference (mutation: reading the preference before the flags publishes "
+                + "fixture numbers onto the user's real Discord profile, which is the one "
+                + "failure this feature cannot take back)")
+        // The control half. Without it every assertion above passes on a
+        // factory that refuses everything unconditionally.
+        expect(
+            AppDelegate.makeDiscordClient(arguments: ["TokenBar"], enabled: true) != nil
+                && AppDelegate.makeDiscordClient(arguments: ["TokenBar"], enabled: false) == nil
+                && AppDelegate.makeDiscordClient(
+                    existing: dpLiveClient, arguments: ["TokenBar"], enabled: true) === dpLiveClient
+                && DiscordPresence.mayConnect(arguments: [], enabled: true)
+                && !DiscordPresence.mayConnect(arguments: [], enabled: false),
+            "A1 control: an ordinary run builds a client, reuses the one it was given rather "
+                + "than opening a second connection, and refuses when the switch is off")
+
+        // A15b — which visibility change retires earlier work. Getting this
+        // backwards is not cosmetic: it would retire work an unhide leaves
+        // perfectly valid while letting a hide's stale payload through — the
+        // exact inversion. The swap case is the one a subset or size test gets
+        // wrong.
+        func dpChange(_ previous: String, _ current: String) -> DiscordIPC.VisibilityChange {
+            AppDelegate.visibilityChange(previousHiddenRaw: previous, hiddenRaw: current)
+        }
+        let dpChanges: [(String, String, DiscordIPC.VisibilityChange)] = [
+            ("", "amp", .reducing), ("amp", "", .increasing),
+            ("amp", "amp,zed", .reducing), ("amp,zed", "amp", .increasing),
+            ("amp", "zed", .reducing),
+            ("amp", "amp", DiscordIPC.VisibilityChange.none), ("", "", .none),
+        ]
+        for (previous, current, expected) in dpChanges {
+            expect(dpChange(previous, current) == expected,
+                "A15b: \"\(previous)\" -> \"\(current)\" is \(expected) (mutations: collapsing "
+                    + "`.increasing` into `.none` lets an unhide inherit a pending reduction's "
+                    + "bypass; a strict-subset or size test calls the swap no change and leaves "
+                    + "the newly hidden client named for the rest of the floor; `.reducing` by "
+                    + "default hands every ordinary sample a bypass)")
+        }
+
+        // A2 — the switch. Read through the authoritative accessor against an
+        // isolated suite, never the process's own defaults.
+        // Fixed, not per-run UUID. `UserDefaults(suiteName:)` creates a
+        // persistent plist unconditionally and NONE of the cleanup calls
+        // delete the file — measured: removing the domain on the instance, on
+        // `.standard`, after clearing the keys, and after setting an empty
+        // persistent domain all leave it behind. A fresh name per run
+        // therefore deposits one more ~/Library/Preferences file every time
+        // the suite runs. One reused name caps it at a single empty file.
+        let dpSuiteName = "TokenBar.SelfTest.Discord"
+        if let dpDefaults = UserDefaults(suiteName: dpSuiteName) {
+            // On `UserDefaults.standard`, not on the suite's own instance:
+            // calling it on the instance leaves the plist behind, so every run
+            // deposited another ~/Library/Preferences file forever.
+            defer { UserDefaults.standard.removePersistentDomain(forName: dpSuiteName) }
+            // Every wrong type, by table. The string "true" is the one that
+            // matters most: the Argument Domain, which the manual acceptance
+            // flow in verification.md uses, stores `-tokenbar.<key> true` as
+            // exactly that string, and `bool(forKey:)` coerces it. The integer
+            // is 1 rather than 2 because `as? Bool` bridges NSNumber, so the
+            // one that actually slips through is the one equal to true.
+            let dpWrongTypes: [(String, Any?)] = [
+                ("an absent key", nil), ("the string \"true\"", "true"),
+                ("the integer 1", 1), ("the double 1.0", 1.0),
+                ("a non-boolean number", 2), ("a wholly wrong type", ["on"]),
+            ]
+            for (label, value) in dpWrongTypes {
+                if let value { dpDefaults.set(value, forKey: DiscordPresence.enabledKey) }
+                expect(!DiscordPresence.enabled(defaults: dpDefaults),
+                    "A2: \(label) is not the switch (mutation: `bool(forKey:)` coerces the "
+                        + "string, and `as? Bool` alone bridges the integer — only a CFBoolean "
+                        + "check rejects both)")
+            }
+            dpDefaults.set(true, forKey: DiscordPresence.enabledKey)
+            let dpRealTrue = DiscordPresence.enabled(defaults: dpDefaults)
+            dpDefaults.set(false, forKey: DiscordPresence.enabledKey)
+            expect(dpRealTrue && !DiscordPresence.enabled(defaults: dpDefaults),
+                "A2 control: a real Bool true is the switch and an explicit false is off — "
+                    + "without this the table above passes on an accessor that always says false")
+            // A25 — the cost switch reads through the SAME strict path. Sharing
+            // one reader is what keeps the two from drifting, so this checks the
+            // sharing rather than re-testing every wrong type.
+            //
+            // The key is removed rather than overwritten before the control, and
+            // that is not tidiness: writing a real `true` over a stored integer
+            // `1` DOES NOT CHANGE THE STORED TYPE — measured, it stays a
+            // non-CFBoolean NSNumber, so the control would fail against a
+            // perfectly correct accessor. A2 above only escapes this because it
+            // writes an array in between, which is true by accident.
+            let dpCostAbsent = DiscordPresence.costStyle(defaults: dpDefaults) == .banded
+            dpDefaults.set("true", forKey: DiscordPresence.wholeDollarsKey)
+            let dpCostString = DiscordPresence.costStyle(defaults: dpDefaults) == .banded
+            dpDefaults.set(1, forKey: DiscordPresence.wholeDollarsKey)
+            let dpCostInt = DiscordPresence.costStyle(defaults: dpDefaults) == .banded
+            dpDefaults.removeObject(forKey: DiscordPresence.wholeDollarsKey)
+            dpDefaults.set(true, forKey: DiscordPresence.wholeDollarsKey)
+            expect(
+                dpCostAbsent && dpCostString && dpCostInt
+                    && DiscordPresence.costStyle(defaults: dpDefaults) == .wholeDollars,
+                "A25: the cost switch refuses an absent key, the string and the integer — "
+                    + "banded is the safe direction — and a real Bool true does turn it on "
+                    + "(mutation: a second, looser reader for this key fails here)")
+            dpDefaults.removeObject(forKey: DiscordPresence.wholeDollarsKey)
+        } else {
+            expect(false, "A2: the isolated defaults suite could not be created")
+        }
+
+        // A2b and the structural half of A1. Both are claims about the SHAPE of
+        // the source — "declared in exactly one place", "constructed in exactly
+        // one place" — which no runtime value can express: a second
+        // `@AppStorage` default is invisible until the day it disagrees. So the
+        // tree this binary was built from is read directly, via this file's own
+        // compile-time path.
+        func dpSourceFiles() -> [(name: String, text: String)] {
+            let root = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()  // Sources/TokenBar
+                .deletingLastPathComponent()  // Sources
+            guard let walk = FileManager.default.enumerator(
+                at: root, includingPropertiesForKeys: nil) else { return [] }
+            var out: [(name: String, text: String)] = []
+            for case let url as URL in walk where url.pathExtension == "swift" {
+                // This file is excluded: it quotes the very strings it counts.
+                guard url.path != #filePath,
+                      let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+                out.append((url.lastPathComponent, text))
+            }
+            return out
+        }
+        func dpOccurrences(_ needle: String, in files: [(name: String, text: String)]) -> Int {
+            files.reduce(0) { $0 + $1.text.components(separatedBy: needle).count - 1 }
+        }
+        let dpSources = dpSourceFiles()
+        // Whitespace-normalized copy, so `PresenceClient.init(connect : ...)`
+        // cannot slip past a literal match. A source scan can always be evaded
+        // by someone trying; what it has to survive is an ordinary refactor.
+        let dpNormalized = dpSources.map {
+            (name: $0.name, text: $0.text.filter { !$0.isWhitespace })
+        }
+        // The Settings binding. Nothing else observes it: the accessor
+        // assertions above supply their own keys against an isolated suite, so
+        // a `SettingsPanel` key that diverges from `enabledKey` leaves the whole
+        // suite green while the toggle writes a key nobody reads — the feature
+        // never enables, or a live presence cannot be switched off. Occurrences
+        // rather than files, because a second declaration in the SAME file is
+        // the easier mistake.
+        expect(
+            dpOccurrences("@AppStorage(DiscordPresence.enabledKey)", in: dpSources) == 1
+                && dpSources.first(where: {
+                    $0.text.contains("@AppStorage(DiscordPresence.enabledKey)")
+                })?.name == "SettingsPanel.swift"
+                && dpOccurrences("\"\(DiscordPresence.enabledKey)\"", in: dpSources) == 1
+                && dpOccurrences("@AppStorage(DiscordPresence.wholeDollarsKey)", in: dpSources) == 1
+                && dpOccurrences("\"\(DiscordPresence.wholeDollarsKey)\"", in: dpSources) == 1,
+            "A2b: each switch is declared by exactly one view, in SettingsPanel, and each key "
+                + "string is written exactly once (mutation: a second `@AppStorage` default, or "
+                + "a hard-coded copy of the key — the trap `tokenbar.limits.enabled` already "
+                + "fell into — fails here)")
+        // The payload layer reads NO defaults domain, asserted at runtime rather
+        // than by scanning for `.object(forKey:`. The scan's first draft matched
+        // the receiver name and looked straight past
+        // `UserDefaults.standard.object(forKey:)`, which is exactly the natural
+        // way to violate this, and that mutation survived the whole suite.
+        //
+        // Structural, and it has to be. The M1 cost-mode conjunction catches an
+        // UNCONDITIONAL replacement of the parameter, because a payload reading
+        // a domain renders both `.banded` and `.wholeDollars` the same way. It
+        // does not catch a CONDITIONAL read — consulting the domain only when
+        // `style == .banded` renders both correctly on a default-off host and
+        // still makes the payload machine-dependent the moment a saved or
+        // command-line whole-dollar value exists.
+        //
+        // Not asserted by writing the process's own domain either, which an
+        // earlier revision did: it read the prior value with `object(forKey:)`,
+        // which searches volatile domains including `NSArgumentDomain`, while
+        // `set` and `removeObject` write the persistent application domain.
+        // Running the suite with `-tokenbar.discord.wholeDollars ...`, which
+        // the manual acceptance flow does, would have copied a command-line
+        // override into the user's saved preferences. A test must not be able
+        // to change what it measures.
+        //
+        // Scoped to the BODY of `payload(...)`, brace-matched, rather than to
+        // the file: the file legitimately declares the accessors, and every
+        // wider form of this check has been evaded in turn. Counting
+        // `.object(forKey:` matched on the receiver name and could only see
+        // reads written against a `defaults` parameter, which `payload()` does
+        // not have. Searching the file for `UserDefaults.standard` missed
+        // `DiscordPresence.costStyle()` — the accessor spells `.standard` as
+        // its own default argument, so calling it introduces no such substring.
+        // Banning the accessor calls inside this one body closes both.
+        let dpPayloadBody: String = {
+            guard let text = dpSources.first(where: { $0.name == "DiscordPresence.swift" })?.text,
+                  let start = text.range(of: "static func payload(") else { return "" }
+            var depth = 0
+            var opened = false
+            var out = ""
+            for character in text[start.lowerBound...] {
+                out.append(character)
+                if character == "{" { depth += 1; opened = true }
+                if character == "}" {
+                    depth -= 1
+                    if opened && depth == 0 { break }
+                }
+            }
+            return out
+        }()
+        expect(
+            !dpPayloadBody.isEmpty
+                && !dpPayloadBody.contains("UserDefaults")
+                && !dpPayloadBody.contains("costStyle(")
+                && !dpPayloadBody.contains("enabled("),
+            "A2b: `payload(...)` reaches no defaults domain, directly or through an accessor, so "
+                + "what it publishes depends on its arguments and not on the machine running it "
+                + "(mutations: `UserDefaults.standard.bool(forKey:)`, or the subtler "
+                + "`costStyle == .banded ? DiscordPresence.costStyle() : costStyle`, which reads "
+                + "correctly on a default-off host and goes machine-dependent the moment a saved "
+                + "whole-dollar value exists)")
+
+        // The gate is the only path to a client. All three are shape claims —
+        // "constructed in exactly one place", "not aliased", "not handed
+        // curated arguments" — which no runtime value can express: a second
+        // construction site is invisible until the day it runs, and SelfTest
+        // cannot reach the app lifecycle.
+        let dpCtorForms = ["DiscordIPCClient(connect:", "DiscordIPCClient.init(connect:"]
+        expect(
+            dpCtorForms.reduce(0) { $0 + dpOccurrences($1, in: dpNormalized) } == 1
+                && dpOccurrences("typealias", in: dpNormalized.filter {
+                    $0.text.contains("DiscordIPCClient")
+                }) == 0
+                && !dpNormalized.contains { $0.text.contains("makeDiscordClient(arguments:") },
+            "A1: exactly one production site constructs a client and it is the gated factory, "
+                + "the type is not aliased, and no call site substitutes its own arguments for "
+                + "the process's (mutations: constructing one elsewhere including via `.init`, "
+                + "renaming the type, or passing a curated array, each bypass the demo/test gate)")
+        // A16 — the same class of claim, and kept for the same reason. The
+        // disable path leaves the stopped client in `discord` on purpose:
+        // `applicationWillTerminate` drains the queued clear inside
+        // `if let discord`, so re-adding `discord = nil` after `stop()` lets an
+        // immediate quit abandon it and leave the withdrawn activity public.
+        // That needs a real app lifecycle to exercise and nothing else in the
+        // suite detects it, so the shape is asserted instead.
+        expect(dpOccurrences("discord=nil", in: dpNormalized) == 0,
+            "A16: the disable path keeps the client reference until termination drains its clear "
+                + "(mutation: re-adding `discord = nil` after `stop()` abandons the clear on an "
+                + "off-then-quit, because the drain is guarded on the reference)")
+        // A26c — the button constants, pinned as literal DECLARATIONS and as a
+        // file compiled identically in every configuration. Neither half covers
+        // the other's survivor, and both were measured to pass all 659
+        // assertions before these existed:
+        //
+        //     #if DEBUG  …literal…  #else  …+ "?ref=" + NSUserName()  #endif
+        //     static var buttonURL: String { Bundle.main.bundleIdentifier == nil
+        //         ? literal : literal + "?ref=" + hash(NSUserName()) }
+        //
+        // What would reach every viewer's click, and GitHub's request logs, is
+        // the account name of the person whose profile it is.
+        //
+        // This run is under `swift build` as a bare executable while shipping
+        // runs release configuration inside an .app, so the wire assertions
+        // ARE structurally blind to that difference here. They are not blind to
+        // it in `make selftest-bundled`, which runs this same suite from the
+        // bundled binary on every push to main and does catch all three of
+        // these — including the use-site suffix, which the scan below cannot
+        // see. What survives here is the PR-time proxy for a gate that runs at
+        // merge; it is not the enforcement, and a fourth scan is not the answer
+        // to whatever escapes it. Directives are counted as lines
+        // starting with `#if`/`#else`/`#endif`, not as a substring: the only
+        // `#if` in that file is inside the comment stating this policy.
+        let dpTransportDirectives = dpSources
+            .filter { $0.name == "DiscordIPC.swift" }
+            .flatMap { $0.text.split(separator: "\n", omittingEmptySubsequences: false) }
+            .filter {
+                let trimmed = $0.drop { $0 == " " || $0 == "\t" }
+                return trimmed.hasPrefix("#if") || trimmed.hasPrefix("#else")
+                    || trimmed.hasPrefix("#endif")
+            }
+        expect(
+            dpOccurrences(
+                "static let buttonURL = \"https://github.com/Nanako0129/TokenBar\"",
+                in: dpSources.filter { $0.name == "DiscordIPC.swift" }) == 1
+                && dpOccurrences(
+                    "static let buttonLabel = \"View on GitHub\"",
+                    in: dpSources.filter { $0.name == "DiscordIPC.swift" }) == 1
+                && dpTransportDirectives.isEmpty,
+            "A26c: both button constants are literal `static let` declarations and the transport "
+                + "compiles identically in every configuration, so what this suite observes is "
+                + "what ships (mutations: a computed `var` reading Bundle.main, or a `#if DEBUG` "
+                + "yielding the literal under test and a user-derived URL in release)")
+        // M6's gap: the wiring layer's choice of hidden set had no assertion at
+        // all, and the payload fixtures cannot see it — they are handed a set.
+        // `quotaExcludedClients()` and `hiddenLimitsClients()` are different
+        // sets with different meanings; only tab-hidden belongs here.
+        let dpDelegate = dpNormalized.first { $0.name == "AppDelegate.swift" }
+        expect(dpDelegate?.text.contains("hidden:ClientRegistry.hiddenClients()") == true
+            && dpDelegate?.text.contains("hidden:ClientRegistry.quotaExcludedClients()") == false
+            && dpDelegate?.text.contains("hidden:ClientRegistry.hiddenLimitsClients()") == false,
+            "A1: the published payload excludes the tab-hidden clients and no other set "
+                + "(mutation: swapping in quotaExcludedClients publishes a different total and "
+                + "a different top client, and every payload fixture stays green)")
+
+        // A8 — Discord absent. The common case, not an error: the connect
+        // closure fails the way `connectToDiscord` does when there is no socket
+        // to reach. Injected rather than real, because a selftest must not open
+        // a connection to whatever Discord happens to be running on the
+        // machine running it.
+        let dpAbsentAttempts = DPCounter()
+        let dpAbsentClient = DiscordIPCClient(connect: {
+            dpAbsentAttempts.value += 1
+            throw DiscordIPC.Failure.unavailable
+        })
+        dpAbsentClient.reconnectDelay = 0.01
+        let dpAbsentBegan = DispatchTime.now()
+        dpAbsentClient.start()
+        dpAbsentClient.publish(dpP("12K tokens today", state: "Amp · $1-5"))
+        let dpAbsentBlocked = Double(
+            DispatchTime.now().uptimeNanoseconds - dpAbsentBegan.uptimeNanoseconds) / 1_000_000_000
+        _ = dpWaitUntil { dpAbsentAttempts.value > DiscordIPCClient.maxReconnectAttempts }
+        let dpAbsentConnected = dpAbsentClient.isConnectedForTesting
+        dpAbsentClient.stop()
+        dpAbsentClient.drainForTesting()
+        expect(dpAbsentBlocked < 0.05 && !dpAbsentConnected && dpAbsentAttempts.value > 1,
+            "A8: with Discord absent the caller is never blocked, nothing connects, and the app "
+                + "keeps running (mutation: making start()/publish() synchronous parks the main "
+                + "actor behind a socket that is not there)")
+
+        // MARK: - LP3: restore the last-good dashboard on restart
+
+        let lp3Identity = BuildIdentity(
+            bundleIdentifier: "com.nyanako.tokenbar", shortVersion: "9.9.9", buildNumber: "999")
+        let lp3OtherBuild = BuildIdentity(
+            bundleIdentifier: "com.nyanako.tokenbar", shortVersion: "9.9.9", buildNumber: "1000")
+        let lp3OtherBundle = BuildIdentity(
+            bundleIdentifier: "com.example.other", shortVersion: "9.9.9", buildNumber: "999")
+
+        func lp3TempDir(_ label: String) -> URL {
+            FileManager.default.temporaryDirectory
+                .appendingPathComponent("tokenbar-lp3-\(label)-\(UUID().uuidString)", isDirectory: true)
+        }
+
+        func lp3Envelope(
+            year: String?,
+            identity: BuildIdentity = lp3Identity,
+            schema: Int = SnapshotEnvelope.schemaVersion,
+            savedAt: Date = Date(),
+            payload: UsagePayload? = nil,
+            knownYears: [String]? = nil
+        ) -> SnapshotEnvelope {
+            let p = payload ?? DemoData.payload(for: year)
+            return SnapshotEnvelope(
+                snapshotSchemaVersion: schema, bundleIdentifier: identity.bundleIdentifier,
+                shortVersion: identity.shortVersion, buildNumber: identity.buildNumber,
+                savedAt: savedAt, selectedYear: year, payload: p,
+                knownYears: knownYears ?? p.years.map(\.year))
+        }
+
+        let lp3Encoder: JSONEncoder = {
+            let e = JSONEncoder()
+            e.outputFormatting = [.sortedKeys]
+            return e
+        }()
+        let lp3Decoder = JSONDecoder()
+        func lp3Encode(_ envelope: SnapshotEnvelope) -> Data {
+            (try? lp3Encoder.encode(envelope)) ?? Data()
+        }
+        func lp3PrepareDir(_ dir: URL, mode: Int16 = 0o700) {
+            try? FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: mode])
+        }
+        let lp3FileName = "dashboard-snapshot.json"
+
+        // --- SnapshotStore: round trip + validate rejection matrix ---
+
+        let lp3RTDir = lp3TempDir("roundtrip")
+        let lp3RTEnvelope = lp3Envelope(year: "2033")
+        let lp3RTWrote = SnapshotStore.write(lp3Encode(lp3RTEnvelope), in: lp3RTDir)
+        let lp3RTBack = SnapshotStore.readBytes(in: lp3RTDir).flatMap {
+            try? lp3Decoder.decode(SnapshotEnvelope.self, from: $0)
+        }
+        expect(
+            lp3RTWrote
+                && lp3RTBack.map {
+                    SnapshotStore.validate($0, expectedYear: "2033", identity: lp3Identity)
+                } == true
+                && lp3RTBack?.payload.years.map(\.year) == ["2033"],
+            "LP3: a written snapshot round-trips through write/readBytes/decode/validate with "
+                + "a matching payload and year, and reaches .ready not .loading (see the "
+                + "DashboardModel-level disk-restore check below)")
+
+        func lp3ExpectRejected(
+            _ label: String, _ envelope: SnapshotEnvelope,
+            expectedYear: String? = "2033", identity: BuildIdentity = lp3Identity
+        ) {
+            expect(
+                !SnapshotStore.validate(envelope, expectedYear: expectedYear, identity: identity),
+                "LP3 validate rejects: \(label)")
+        }
+
+        lp3ExpectRejected("schema mismatch", lp3Envelope(year: "2033", schema: 999))
+        lp3ExpectRejected(
+            "build-number mismatch", lp3Envelope(year: "2033", identity: lp3OtherBuild))
+        lp3ExpectRejected(
+            "bundle-identifier mismatch", lp3Envelope(year: "2033", identity: lp3OtherBundle))
+        lp3ExpectRejected(
+            "requested-year gate (snapshot 2033, process wants 2034)",
+            lp3Envelope(year: "2033"), expectedYear: "2034")
+        lp3ExpectRejected(
+            "requested-year gate (snapshot all-time, process wants a year)",
+            lp3Envelope(year: nil), expectedYear: "2033")
+        lp3ExpectRejected(
+            "knownYears entry not four-digit ASCII",
+            lp3Envelope(year: "2033", knownYears: ["abcd"]))
+        lp3ExpectRejected(
+            "knownYears duplicated",
+            lp3Envelope(year: "2033", knownYears: ["2033", "2033"]))
+        lp3ExpectRejected(
+            "knownYears oversized",
+            lp3Envelope(
+                year: "2033",
+                knownYears: (0...SnapshotStore.maxKnownYears).map { String(1000 + $0) } + ["2033"]))
+        lp3ExpectRejected(
+            "knownYears does not cover the payload's own years",
+            lp3Envelope(year: "2033", knownYears: []))
+        lp3ExpectRejected(
+            "savedAt in the future beyond the clock-skew allowance",
+            lp3Envelope(
+                year: "2033",
+                savedAt: Date().addingTimeInterval(SnapshotStore.futureSkewAllowance + 30)))
+        lp3ExpectRejected(
+            "savedAt older than the retention bound",
+            lp3Envelope(
+                year: "2033", savedAt: Date().addingTimeInterval(-(SnapshotStore.maxAge + 30))))
+
+        // A contribution date outside the selected year — DemoData always
+        // confines a year-scoped payload's contributions to that year, so this
+        // is hand-built rather than fixture-generated.
+        func lp3PayloadWithForeignContribution() -> UsagePayload? {
+            let json: [String: Any] = [
+                "meta": [
+                    "generatedAt": "2033-06-01T12:00:00Z", "version": "test",
+                    "dateRange": ["start": "2033-01-01", "end": "2033-06-01"],
+                ],
+                "summary": [
+                    "totalTokens": 10, "totalCost": 1.0, "totalDays": 1, "activeDays": 1,
+                    "averagePerDay": 1.0, "maxCostInSingleDay": 1.0,
+                    "clients": ["codex"], "models": ["demo-codex"],
+                ],
+                "years": [[
+                    "year": "2033", "totalTokens": 10, "totalCost": 1.0,
+                    "range": ["start": "2033-01-01", "end": "2033-06-01"],
+                ]],
+                "contributions": [[
+                    // Wrong year on purpose.
+                    "date": "2032-12-31", "totals": ["tokens": 10, "cost": 1.0, "messages": 1],
+                    "intensity": 1,
+                    "tokenBreakdown": [
+                        "input": 5, "output": 5, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0,
+                    ],
+                    "clients": [[
+                        "client": "codex", "modelId": "demo-codex", "providerId": "demo",
+                        "tokens": [
+                            "input": 5, "output": 5, "cacheRead": 0, "cacheWrite": 0,
+                            "reasoning": 0,
+                        ],
+                        "cost": 1.0, "messages": 1,
+                    ]],
+                ]],
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+            return try? JSONDecoder().decode(UsagePayload.self, from: data)
+        }
+        if let foreignPayload = lp3PayloadWithForeignContribution() {
+            lp3ExpectRejected(
+                "a contribution date falls outside the selected year",
+                lp3Envelope(year: "2033", payload: foreignPayload, knownYears: ["2033"]))
+        } else {
+            expect(false, "LP3: the hand-built foreign-contribution fixture failed to decode")
+        }
+
+        // Malformed civil dates. `ISODay.init?` parses with `Int` and then
+        // multiplies, so `era * 146097` on an enormous year OVERFLOWS AND TRAPS
+        // — a file on disk could crash the dashboard at launch. An all-time
+        // snapshot skipped date checking entirely before, which is exactly the
+        // shape such a file would take, so these are all-time envelopes.
+        func lp3PayloadWithDates(
+            range: (String, String), yearRange: (String, String), contribution: String
+        ) -> UsagePayload? {
+            let json: [String: Any] = [
+                "meta": [
+                    "generatedAt": "2033-06-01T12:00:00Z", "version": "test",
+                    "dateRange": ["start": range.0, "end": range.1],
+                ],
+                "summary": [
+                    "totalTokens": 10, "totalCost": 1.0, "totalDays": 1, "activeDays": 1,
+                    "averagePerDay": 1.0, "maxCostInSingleDay": 1.0,
+                    "clients": ["codex"], "models": ["demo-codex"],
+                ],
+                "years": [[
+                    "year": "2033", "totalTokens": 10, "totalCost": 1.0,
+                    "range": ["start": yearRange.0, "end": yearRange.1],
+                ]],
+                "contributions": [[
+                    "date": contribution, "totals": ["tokens": 10, "cost": 1.0, "messages": 1],
+                    "intensity": 1,
+                    "tokenBreakdown": [
+                        "input": 5, "output": 5, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0,
+                    ],
+                    "clients": [] as [Any],
+                ]],
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+            return try? JSONDecoder().decode(UsagePayload.self, from: data)
+        }
+        let lp3Ok = ("2033-01-01", "2033-06-01")
+        let lp3Trapping = "9223372036854775807-01-01"
+        let lp3DateCases: [(String, UsagePayload?)] = [
+            ("meta.dateRange start would trap ISODay",
+             lp3PayloadWithDates(
+                 range: (lp3Trapping, "2033-06-01"), yearRange: lp3Ok,
+                 contribution: "2033-01-01")),
+            ("years[].range end would trap ISODay",
+             lp3PayloadWithDates(
+                 range: lp3Ok, yearRange: ("2033-01-01", lp3Trapping),
+                 contribution: "2033-01-01")),
+            ("a contribution date would trap ISODay",
+             lp3PayloadWithDates(
+                 range: lp3Ok, yearRange: lp3Ok, contribution: lp3Trapping)),
+            ("meta.dateRange runs backwards",
+             lp3PayloadWithDates(
+                 range: ("2033-06-01", "2033-01-01"), yearRange: lp3Ok,
+                 contribution: "2033-01-01")),
+            ("a date outside the computable era",
+             lp3PayloadWithDates(
+                 range: lp3Ok, yearRange: lp3Ok, contribution: "1899-01-01")),
+        ]
+        for (label, payload) in lp3DateCases {
+            guard let payload else {
+                expect(false, "LP3: the \(label) fixture failed to decode")
+                continue
+            }
+            // `expectedYear: nil` matters: the helper defaults to "2033", and
+            // an all-time envelope would then be rejected by the requested-year
+            // gate before any date was looked at — which is exactly how the
+            // first version of these passed while the date validation was
+            // deleted.
+            lp3ExpectRejected(
+                label, lp3Envelope(year: nil, payload: payload, knownYears: ["2033"]),
+                expectedYear: nil)
+        }
+        // Control: the same all-time shape with every date well-formed is
+        // ACCEPTED, so the five rejections above cannot be passing on a
+        // validator that rejects every hand-built payload.
+        if let sane = lp3PayloadWithDates(
+            range: lp3Ok, yearRange: lp3Ok, contribution: "2033-01-01")
+        {
+            expect(
+                SnapshotStore.validate(
+                    lp3Envelope(year: nil, payload: sane, knownYears: ["2033"]),
+                    expectedYear: nil, identity: lp3Identity),
+                "LP3 control: a hand-built all-time payload with well-formed dates is accepted "
+                    + "— without this the malformed-date rejections would pass on a validator "
+                    + "that rejects everything hand-built")
+        } else {
+            expect(false, "LP3: the well-formed control fixture failed to decode")
+        }
+
+        // --- SnapshotStore: raw-file hazards — none may hang, follow, chmod, ---
+        // --- or mutate the external object.                                 ---
+
+        let lp3CorruptDir = lp3TempDir("corrupt")
+        lp3PrepareDir(lp3CorruptDir)
+        try? Data("not json at all".utf8).write(
+            to: lp3CorruptDir.appendingPathComponent(lp3FileName))
+        let lp3CorruptBytes = SnapshotStore.readBytes(in: lp3CorruptDir)
+        let lp3CorruptDecoded = lp3CorruptBytes.flatMap {
+            try? lp3Decoder.decode(SnapshotEnvelope.self, from: $0)
+        }
+        expect(
+            lp3CorruptBytes != nil && lp3CorruptDecoded == nil,
+            "LP3: corrupt (non-JSON) bytes are read as bytes but fail to decode, so the cold "
+                + "fallback triggers at the decode step rather than a crash")
+
+        let lp3CapDir = lp3TempDir("cap")
+        lp3PrepareDir(lp3CapDir)
+        try? Data(repeating: 0x41, count: SnapshotStore.byteCap).write(
+            to: lp3CapDir.appendingPathComponent(lp3FileName))
+        expect(
+            SnapshotStore.readBytes(in: lp3CapDir)?.count == SnapshotStore.byteCap,
+            "LP3: a file at EXACTLY the byte cap is read in full")
+
+        let lp3OverCapDir = lp3TempDir("overcap")
+        lp3PrepareDir(lp3OverCapDir)
+        try? Data(repeating: 0x41, count: SnapshotStore.byteCap + 1).write(
+            to: lp3OverCapDir.appendingPathComponent(lp3FileName))
+        expect(
+            SnapshotStore.readBytes(in: lp3OverCapDir) == nil,
+            "LP3: a file one byte over the cap is rejected rather than truncated")
+
+        let lp3SymlinkFileDir = lp3TempDir("symlink-file")
+        lp3PrepareDir(lp3SymlinkFileDir)
+        let lp3SymlinkTarget = lp3TempDir("symlink-target")
+        lp3PrepareDir(lp3SymlinkTarget)
+        try? Data("target contents".utf8).write(
+            to: lp3SymlinkTarget.appendingPathComponent("real.json"))
+        _ = symlink(
+            lp3SymlinkTarget.appendingPathComponent("real.json").path,
+            lp3SymlinkFileDir.appendingPathComponent(lp3FileName).path)
+        expect(
+            SnapshotStore.readBytes(in: lp3SymlinkFileDir) == nil,
+            "LP3: a symlink where the snapshot file should be is rejected, not followed")
+
+        let lp3SymlinkDirParent = lp3TempDir("symlink-dir-parent")
+        let lp3SymlinkDirTarget = lp3TempDir("symlink-dir-target")
+        lp3PrepareDir(lp3SymlinkDirTarget)
+        _ = symlink(lp3SymlinkDirTarget.path, lp3SymlinkDirParent.path)
+        let lp3SymlinkDirRejectsRead = SnapshotStore.readBytes(in: lp3SymlinkDirParent) == nil
+        let lp3SymlinkDirRejectsWrite =
+            !SnapshotStore.write(Data("x".utf8), in: lp3SymlinkDirParent)
+        expect(
+            lp3SymlinkDirRejectsRead && lp3SymlinkDirRejectsWrite,
+            "LP3: a symlinked app directory is rejected for both read and write, not followed "
+                + "(O_NOFOLLOW constrains only the final path component, and the app directory "
+                + "itself IS that final component)")
+
+        let lp3FifoDir = lp3TempDir("fifo")
+        lp3PrepareDir(lp3FifoDir)
+        _ = mkfifo(lp3FifoDir.appendingPathComponent(lp3FileName).path, 0o600)
+        expect(
+            SnapshotStore.readBytes(in: lp3FifoDir) == nil,
+            "LP3: a FIFO where the snapshot file should be is rejected without blocking on it "
+                + "(O_NONBLOCK on the open makes this provable rather than assumed)")
+
+        let lp3DirInPlaceDir = lp3TempDir("dir-in-place")
+        lp3PrepareDir(lp3DirInPlaceDir)
+        try? FileManager.default.createDirectory(
+            at: lp3DirInPlaceDir.appendingPathComponent(lp3FileName),
+            withIntermediateDirectories: true)
+        expect(
+            SnapshotStore.readBytes(in: lp3DirInPlaceDir) == nil,
+            "LP3: a directory where the snapshot file should be is rejected")
+
+        // "Wrong owner" cannot be reproduced without root in this environment
+        // (chown to another uid requires privilege this sandbox does not have);
+        // "wrong mode" IS reproducible and is the sibling half of the same
+        // defense — a group/world-accessible app directory must be rejected
+        // for both read and write, the same as a symlinked one.
+        let lp3LooseModeDir = lp3TempDir("loose-mode")
+        lp3PrepareDir(lp3LooseModeDir, mode: 0o755)
+        expect(
+            SnapshotStore.readBytes(in: lp3LooseModeDir) == nil
+                && !SnapshotStore.write(Data("x".utf8), in: lp3LooseModeDir),
+            "LP3: a group/world-accessible app directory (not owner-only 0700) is rejected for "
+                + "both read and write")
+
+        // --- Allowlist: the encoded recursive key set, exactly ---
+
+        let lp3AllowlistEnvelope = lp3Envelope(year: "2035")
+        let lp3AllowlistJSON =
+            (try? JSONSerialization.jsonObject(with: lp3Encode(lp3AllowlistEnvelope)))
+                as? [String: Any]
+        func lp3CollectKeys(_ value: Any, parentKey: String?, into set: inout Set<String>) {
+            if let dict = value as? [String: Any] {
+                // `turnsByClient`'s own keys are client ids — DATA, not schema
+                // field names — so only its field name (recorded by the
+                // parent below) belongs in the allowlist, not its contents'
+                // dynamic keys. Every other nested dict is a fixed-shape
+                // struct and recurses normally.
+                if parentKey == "turnsByClient" {
+                    for v in dict.values { lp3CollectKeys(v, parentKey: nil, into: &set) }
+                    return
+                }
+                for (key, v) in dict {
+                    set.insert(key)
+                    lp3CollectKeys(v, parentKey: key, into: &set)
+                }
+            } else if let array = value as? [Any] {
+                for v in array { lp3CollectKeys(v, parentKey: parentKey, into: &set) }
+            }
+        }
+        var lp3ActualKeys: Set<String> = []
+        if let lp3AllowlistJSON { lp3CollectKeys(lp3AllowlistJSON, parentKey: nil, into: &lp3ActualKeys) }
+        let lp3ExpectedKeys: Set<String> = [
+            "snapshotSchemaVersion", "bundleIdentifier", "shortVersion", "buildNumber", "savedAt",
+            "selectedYear", "payload", "knownYears",
+            "meta", "generatedAt", "version", "dateRange", "start", "end",
+            "summary", "totalTokens", "totalCost", "totalDays", "activeDays", "averagePerDay",
+            "maxCostInSingleDay", "clients", "models",
+            "years", "year", "range",
+            "contributions", "date", "totals", "tokens", "cost", "messages", "intensity",
+            "tokenBreakdown", "input", "output", "cacheRead", "cacheWrite", "reasoning",
+            "client", "modelId", "providerId", "turnsByClient",
+        ]
+        expect(
+            !lp3ActualKeys.isEmpty && lp3ActualKeys == lp3ExpectedKeys,
+            "LP3: the encoded snapshot's recursive key set is EXACTLY the allowlist — every "
+                + "extra key means a persisted type stopped being explicit about its "
+                + "CodingKeys, and every missing one means this list is stale (mutation: adding "
+                + "a stored property to any persisted graph type without adding it here)")
+
+        // --- SnapshotWriter: capture-sequence ordering and content dedup ---
+
+        let lp3WriterDir = lp3TempDir("writer-order")
+        let lp3WEnvelopeB = lp3Envelope(year: "2043", savedAt: Date(timeIntervalSince1970: 2_000))
+        // A DIFFERENT year than B, on purpose: same-content-different-savedAt
+        // would also be caught by the digest dedup, which would make this
+        // assertion pass even without the sequence guard under test —
+        // content that genuinely differs isolates the sequence check alone.
+        let lp3WEnvelopeAOlder =
+            lp3Envelope(year: "2098", savedAt: Date(timeIntervalSince1970: 1_000))
+        let lp3WEnvelopeBAgain =
+            lp3Envelope(year: "2043", savedAt: Date(timeIntervalSince1970: 3_000))
+        let lp3WEnvelopeC = lp3Envelope(year: "2044", savedAt: Date(timeIntervalSince1970: 4_000))
+        let lp3WEnvelopeStaleAfterSkip =
+            lp3Envelope(year: "2045", savedAt: Date(timeIntervalSince1970: 5_000))
+        let lp3WEnvelopeFailAttempt =
+            lp3Envelope(year: "2046", savedAt: Date(timeIntervalSince1970: 6_000))
+        let lp3WEnvelopeAfterFail =
+            lp3Envelope(year: "2047", savedAt: Date(timeIntervalSince1970: 7_000))
+        let lp3WriterChecks = awaitValue { () async -> [String: Bool] in
+            var results: [String: Bool] = [:]
+            func bytesNow() -> Data? { SnapshotStore.readBytes(in: lp3WriterDir) }
+
+            await SnapshotWriter.shared.submit(
+                sequence: 2, envelope: lp3WEnvelopeB, directory: lp3WriterDir)
+            let afterB = bytesNow()
+            results["newerWrote"] = afterB != nil
+
+            // An older sequence, even with DIFFERENT content, is rejected —
+            // the file must still hold B's content untouched.
+            await SnapshotWriter.shared.submit(
+                sequence: 1, envelope: lp3WEnvelopeAOlder, directory: lp3WriterDir)
+            results["staleOlderRejected"] = bytesNow() == afterB
+
+            // Identical canonical content (savedAt differs) at a NEWER
+            // sequence must not write again.
+            await SnapshotWriter.shared.submit(
+                sequence: 3, envelope: lp3WEnvelopeBAgain, directory: lp3WriterDir)
+            results["digestSkipDidNotWrite"] = bytesNow() == afterB
+
+            // A real content change at a newer sequence DOES write.
+            await SnapshotWriter.shared.submit(
+                sequence: 4, envelope: lp3WEnvelopeC, directory: lp3WriterDir)
+            let afterC = bytesNow()
+            results["realChangeWrote"] = afterC != nil && afterC != afterB
+
+            // The mark advanced to 3 on the digest-skip above; sequence 3
+            // arriving again (older than the current mark of 4) is rejected.
+            await SnapshotWriter.shared.submit(
+                sequence: 3, envelope: lp3WEnvelopeStaleAfterSkip, directory: lp3WriterDir)
+            results["staleAfterDigestSkipRejected"] = bytesNow() == afterC
+
+            // The mark also advances on a FAILED write: deny write permission
+            // on the directory (read/execute only) so the temp file cannot be
+            // created, submit a real content change at sequence 5 (fails),
+            // restore permission, then confirm an OLDER sequence is rejected
+            // purely by the now-advanced mark rather than being let through
+            // because the write at 5 never actually landed.
+            _ = chmod(lp3WriterDir.path, 0o500)
+            await SnapshotWriter.shared.submit(
+                sequence: 5, envelope: lp3WEnvelopeFailAttempt, directory: lp3WriterDir)
+            _ = chmod(lp3WriterDir.path, 0o700)
+            results["failedWriteLeftPreviousContent"] = bytesNow() == afterC
+
+            await SnapshotWriter.shared.submit(
+                sequence: 4, envelope: lp3WEnvelopeAfterFail, directory: lp3WriterDir)
+            results["staleAfterFailedWriteRejected"] = bytesNow() == afterC
+            return results
+        } ?? [:]
+        try? FileManager.default.removeItem(at: lp3WriterDir)
+
+        expect(
+            lp3WriterChecks["newerWrote"] == true && lp3WriterChecks["realChangeWrote"] == true,
+            "LP3 writer: real content changes at increasing sequences really do write — "
+                + "without this the rejection assertions below could pass on writes that never "
+                + "happened in the first place")
+        expect(
+            lp3WriterChecks["staleOlderRejected"] == true,
+            "LP3 writer: a delayed OLDER capture cannot replace a newer one")
+        expect(
+            lp3WriterChecks["digestSkipDidNotWrite"] == true,
+            "LP3 writer: identical complete content at a newer sequence is deduplicated, not "
+                + "rewritten")
+        expect(
+            lp3WriterChecks["staleAfterDigestSkipRejected"] == true,
+            "LP3 writer: the high-water mark advances on a digest-skip outcome, so a delayed "
+                + "capture older than the SKIPPED sequence is still rejected")
+        expect(
+            lp3WriterChecks["failedWriteLeftPreviousContent"] == true,
+            "LP3 writer: a write that fails (denied directory permission) leaves the previous "
+                + "valid snapshot on disk untouched")
+        expect(
+            lp3WriterChecks["staleAfterFailedWriteRejected"] == true,
+            "LP3 writer: the high-water mark advances on a FAILED write outcome too, so a "
+                + "delayed capture older than the failed sequence is still rejected")
+
+        // --- Isolation: the production directory must never be RESOLVED off ---
+        // --- a shipping identity. Every `swift run` invocation — which is    ---
+        // --- how --demo/--smoke/--selftest/--icon-gallery (and any combined  ---
+        // --- flags) all run — carries a nil `BuildIdentity`, since           ---
+        // --- `BuildIdentity.shipping()` requires the real bundle identifier. ---
+        // --- So this exercises the actual gating mechanism directly: a nil   ---
+        // --- identity, whatever produced it.                                ---
+
+        final class LP3DirectorySpy: @unchecked Sendable {
+            private(set) var resolvedCount = 0
+            private let directory: URL
+            init(directory: URL) { self.directory = directory }
+            func resolve() -> URL? {
+                resolvedCount += 1
+                return directory
+            }
+        }
+        let lp3SpyOff = LP3DirectorySpy(directory: lp3TempDir("spy-off"))
+        _ = awaitMainActorValue { () -> Bool in
+            _ = DashboardModel(
+                cachesSnapshot: true, initialYear: "2099",
+                buildIdentity: nil, snapshotDirectory: lp3SpyOff.resolve())
+            return true
+        }
+        expect(
+            lp3SpyOff.resolvedCount == 0,
+            "LP3 isolation: with no shipping identity the production snapshot directory is "
+                + "never even RESOLVED, not merely unwritten (mutation: hoisting the "
+                + "`snapshotDirectory()` call ahead of the `buildIdentity != nil` check)")
+
+        // The block above assumed in prose that every non-user mode yields a nil
+        // identity. It did not: `shipping()` looked at the bundle identifier
+        // alone, and `scripts/bundle.sh` stamps the production one by default,
+        // so running `--selftest` on a release bundle — an ordinary way to check
+        // one — left fixture-backed models resolving the real directory. The
+        // assumption is a predicate now, and these assert it.
+        expect(
+            BuildIdentity.nonUserRuntimeFlags.sorted()
+                == ["--demo", "--icon-gallery", "--selftest", "--smoke"],
+            "LP3 isolation: the non-user runtime set is exactly the four modes the spy "
+                + "above depends on")
+        // Supply the production bundle triple explicitly. Under `swift run`
+        // there is no bundle, so overriding only `arguments` would leave every
+        // call nil for the bundle reason and the flag check untested — that
+        // mutation survived before this was written.
+        func lp3ShippingIdentity(_ args: [String]) -> BuildIdentity? {
+            BuildIdentity.shipping(
+                arguments: args,
+                bundleIdentifier: "com.nyanako.tokenbar",
+                shortVersion: "1.2.3", buildNumber: "456")
+        }
+        expect(
+            lp3ShippingIdentity(["/Applications/TokenBar.app"]) != nil,
+            "LP3 isolation control: the production bundle triple with no non-user flag DOES "
+                + "yield an identity — without this every assertion below would pass on a "
+                + "function that always returns nil")
+        for flag in BuildIdentity.nonUserRuntimeFlags {
+            expect(
+                lp3ShippingIdentity(["/Applications/TokenBar.app", flag]) == nil,
+                "LP3 isolation: \(flag) yields no shipping identity even on a production "
+                    + "bundle, so no production snapshot path exists for a fixture model")
+        }
+        expect(
+            lp3ShippingIdentity(["/Applications/TokenBar.app", "--demo", "--selftest"]) == nil,
+            "LP3 isolation: combined non-user flags still yield no shipping identity")
+        expect(
+            !BuildIdentity.isNonUserRuntime(["/Applications/TokenBar.app"]),
+            "LP3 isolation control: an ordinary launch is NOT classified as a non-user "
+                + "runtime — without this the assertions above would pass on a predicate "
+                + "that always returns true")
+
+        let lp3SpyOn = LP3DirectorySpy(directory: lp3TempDir("spy-on"))
+        _ = awaitMainActorValue { () -> Bool in
+            _ = DashboardModel(
+                cachesSnapshot: true, initialYear: "2099",
+                buildIdentity: lp3Identity, snapshotDirectory: lp3SpyOn.resolve())
+            return true
+        }
+        expect(
+            lp3SpyOn.resolvedCount == 1,
+            "LP3 isolation control: WITH a shipping identity the directory genuinely is "
+                + "resolved exactly once — without this control the assertion above could pass "
+                + "on an autoclosure that is never evaluated under any circumstance")
+
+        // --- DashboardModel: disk restore, the requested-year gate, and ---
+        // --- ApplyResult's ownership of the restored-age indicator.     ---
+
+        let lp3DiskChecks = awaitMainActorValue { () async -> [String: Bool] in
+            var results: [String: Bool] = [:]
+
+            let diskDir = lp3TempDir("disk-restore")
+            let diskYear = "2036"
+            let diskEnvelope = lp3Envelope(year: diskYear)
+            _ = SnapshotStore.write(lp3Encode(diskEnvelope), in: diskDir)
+            let diskModel = DashboardModel(
+                cachesSnapshot: true, source: ControlledTurnUsageDataSource(),
+                initialYear: diskYear, buildIdentity: lp3Identity, snapshotDirectory: diskDir)
+            if case .ready = diskModel.phase { results["diskRestoreReady"] = true }
+            else { results["diskRestoreReady"] = false }
+            results["diskRestorePayloadMatches"] =
+                diskModel.payload?.meta.generatedAt == diskEnvelope.payload.meta.generatedAt
+            results["diskRestoreYearMatches"] = diskModel.year == diskYear
+            results["diskRestoreNoModel"] =
+                diskModel.payload != nil && diskModel.modelReport == nil
+
+            // The SAME disk snapshot must not surface for a different
+            // requested year — the requested-year gate, exercised through the
+            // full DashboardModel path rather than `validate()` alone.
+            let mismatchModel = DashboardModel(
+                cachesSnapshot: true, source: ControlledTurnUsageDataSource(),
+                initialYear: "2037", buildIdentity: lp3Identity, snapshotDirectory: diskDir)
+            if case .loading = mismatchModel.phase { results["yearGateRejectsMismatch"] = true }
+            else { results["yearGateRejectsMismatch"] = false }
+
+            // ApplyResult: a redirect (empty-year branch) must not clear the
+            // restored age, and the spawned unfiltered reload it triggers
+            // shows kind `.yearSwitch` on the header indicator while it runs
+            // — this is also the "empty-year auto-clear reload" indicator case.
+            let redirectDir = lp3TempDir("redirect")
+            let redirectYear = "2038"
+            let redirectEnvelope = lp3Envelope(year: redirectYear)
+            _ = SnapshotStore.write(lp3Encode(redirectEnvelope), in: redirectDir)
+            let redirectSource = ControlledTurnUsageDataSource()
+            let redirectModel = DashboardModel(
+                cachesSnapshot: true, source: redirectSource, initialYear: redirectYear,
+                buildIdentity: lp3Identity, snapshotDirectory: redirectDir)
+            results["redirectRestored"] = redirectModel.restoredSnapshot != nil
+            await redirectSource.blockGraph(year: nil)
+            // Force the requested-year fetch to return a payload for an
+            // unrelated year, so `apply()` takes the empty-year branch
+            // instead of committing — the real scenario is logs for the
+            // selected year having been deleted or moved.
+            await redirectSource.forceNextGraphPayload(DemoData.payload(for: "1999"))
+            await redirectModel.load()
+            results["redirectDidNotCommit"] = redirectModel.restoredSnapshot != nil
+            results["redirectClearedYear"] = redirectModel.year == nil
+            let redirectSpawnedYearSwitch = await waitUntil {
+                await MainActor.run { redirectModel.backgroundRefresh?.kind == .yearSwitch }
+            }
+            results["redirectSpawnedYearSwitchKind"] = redirectSpawnedYearSwitch
+            await redirectSource.releaseGraph(year: nil)
+            let redirectApplied = await waitUntil {
+                await MainActor.run { redirectModel.restoredSnapshot == nil }
+            }
+            results["redirectEventuallyApplied"] = redirectApplied
+
+            return results
+        } ?? [:]
+
+        expect(
+            lp3DiskChecks["diskRestoreReady"] == true
+                && lp3DiskChecks["diskRestorePayloadMatches"] == true
+                && lp3DiskChecks["diskRestoreYearMatches"] == true,
+            "LP3: a valid disk snapshot restores to .ready with the matching payload and year")
+        expect(
+            lp3DiskChecks["diskRestoreNoModel"] == true,
+            "LP3: a disk restore never carries a model report — the model report is not "
+                + "persisted, so it is always re-requested")
+        expect(
+            lp3DiskChecks["yearGateRejectsMismatch"] == true,
+            "LP3: the requested-year gate rejects a disk snapshot written for a different year "
+                + "than the one this process wants, through the full DashboardModel path")
+        expect(
+            lp3DiskChecks["redirectRestored"] == true,
+            "LP3: the redirect fixture really restores a snapshot with an age to clear — "
+                + "without this the assertions below could pass on nothing being displayed")
+        expect(
+            lp3DiskChecks["redirectDidNotCommit"] == true
+                && lp3DiskChecks["redirectClearedYear"] == true,
+            "LP3: an empty-year redirect does not clear the restored age (only `.applied` "
+                + "does), even though it does clear the year filter")
+        expect(
+            lp3DiskChecks["redirectSpawnedYearSwitchKind"] == true,
+            "LP3: the reload apply() spawns for an emptied year filter shows as the "
+                + "`.yearSwitch` kind on the header indicator")
+        expect(
+            lp3DiskChecks["redirectEventuallyApplied"] == true,
+            "LP3: the spawned unfiltered reload eventually commits and THAT clears the "
+                + "restored age — a redirect defers settling, it does not abandon it")
+
+        // --- DashboardModel: the restore gate, both true task orderings ---
+        // --- (model-task-first without `load()` ever having run first). ---
+
+        let lp3GateChecks = awaitMainActorValue { () async -> [String: Bool] in
+            var results: [String: Bool] = [:]
+
+            let gateDir = lp3TempDir("gate-order")
+            let gateYear = "2039"
+            _ = SnapshotStore.write(lp3Encode(lp3Envelope(year: gateYear)), in: gateDir)
+            let gateSource = ControlledTurnUsageDataSource()
+            let gateModel = DashboardModel(
+                cachesSnapshot: true, source: gateSource, initialYear: gateYear,
+                buildIdentity: lp3Identity, snapshotDirectory: gateDir)
+            results["gateRestoredWithoutModel"] =
+                gateModel.payload != nil && gateModel.modelReport == nil
+            await gateSource.blockGraph(year: gateYear)
+            // `ensureModelData` is called BEFORE `load()` is ever invoked on
+            // this model — true model-task-first ordering. Without the
+            // restore gate, `modelSliceIsCommitted` is already true (restored
+            // payload, year matches) and `graphLoadTask` is nil (nothing has
+            // called `gatedGraph` yet), so the old code fell straight through
+            // every guard and scanned immediately.
+            let gateLens = Task { await gateModel.ensureModelData(for: .overview) }
+            let gateRaced = await waitUntil { await gateSource.modelCallCount() > 0 }
+            results["gateModelTaskFirstDidNotRace"] = !gateRaced
+            // A DIFFERENT caller (not the one awaiting the gate) is what
+            // finally calls load() — proving the gate is fulfilled by ANY
+            // settling fetch, not only one the waiter itself started.
+            let gateLoad = Task { await gateModel.load() }
+            _ = await waitUntil { await gateSource.hasPendingGraph(year: gateYear) }
+            await gateSource.releaseGraph(year: gateYear)
+            await gateLoad.value
+            await gateLens.value
+            results["gateModelArrivedAfterLoad"] = gateModel.modelReport != nil
+
+            // The failure side of the same ordering: the FIRST graph fetch a
+            // restored-without-a-current-model dashboard ever runs fails, so
+            // zero model calls should ever be issued for it.
+            let gateFailDir = lp3TempDir("gate-order-fail")
+            let gateFailYear = "2040"
+            _ = SnapshotStore.write(lp3Encode(lp3Envelope(year: gateFailYear)), in: gateFailDir)
+            let gateFailSource = ControlledTurnUsageDataSource()
+            let gateFailModel = DashboardModel(
+                cachesSnapshot: true, source: gateFailSource, initialYear: gateFailYear,
+                buildIdentity: lp3Identity, snapshotDirectory: gateFailDir)
+            let gateFailLens = Task { await gateFailModel.ensureModelData(for: .overview) }
+            await gateFailSource.failNextGraph()
+            await gateFailModel.load()
+            await gateFailLens.value
+            results["gateFailureIssuedNoScan"] = await gateFailSource.modelCallCount() == 0
+
+            return results
+        } ?? [:]
+
+        expect(
+            lp3GateChecks["gateRestoredWithoutModel"] == true,
+            "LP3: the gate fixture really restores a payload without a current model — "
+                + "without this the race assertions below could pass on a slice with nothing "
+                + "to gate")
+        expect(
+            lp3GateChecks["gateModelTaskFirstDidNotRace"] == true,
+            "LP3: calling ensureModelData BEFORE load() has ever run on a restored model does "
+                + "not race the graph — the restore gate blocks it even with graphLoadTask nil")
+        expect(
+            lp3GateChecks["gateModelArrivedAfterLoad"] == true,
+            "LP3: the gated model request still receives its report once ANY caller's load() "
+                + "settles the slice")
+        expect(
+            lp3GateChecks["gateFailureIssuedNoScan"] == true,
+            "LP3: a restored model whose first-ever graph fetch fails issues zero model calls")
+
+        // --- Header indicator ownership: only the owning token clears ---
+        // --- `backgroundRefresh`, so an overtaken fetch's completion  ---
+        // --- (success or failure) can never clear a NEWER indicator.  ---
+
+        let lp3IndicatorChecks = awaitMainActorValue { () async -> [String: Bool] in
+            var results: [String: Bool] = [:]
+
+            func settle() async { for _ in 0..<50 { await Task.yield() } }
+
+            // initial → manual overtake.
+            let indASource = ControlledTurnUsageDataSource()
+            let indAYear = "2041"
+            let indAModel = DashboardModel(source: indASource, initialYear: indAYear)
+            await indASource.blockGraph(year: indAYear)
+            let indALoad = Task { await indAModel.load() }
+            _ = await waitUntil { await indASource.pendingGraphCount(year: indAYear) == 1 }
+            results["indAInitialKind"] = indAModel.backgroundRefresh?.kind == .initial
+            let indARefresh = Task { await indAModel.refresh() }
+            _ = await waitUntil { await indASource.pendingGraphCount(year: indAYear) == 2 }
+            results["indAManualKind"] = indAModel.backgroundRefresh?.kind == .manual
+            // The OLDER (initial) fetch settles first — must not clear the
+            // manual indicator that overtook it.
+            await indASource.releaseGraph(year: indAYear, index: 0, day: 1)
+            await settle()
+            results["indAOlderSuccessDidNotClear"] = indAModel.backgroundRefresh?.kind == .manual
+            await indASource.releaseGraph(year: indAYear, index: 0, day: 3)
+            await indALoad.value
+            await indARefresh.value
+            results["indAClearedAfterSettle"] = indAModel.backgroundRefresh == nil
+
+            // initial → year-switch overtake, same ownership shape.
+            let indBSource = ControlledTurnUsageDataSource()
+            let indBYear = "2049"
+            let indBModel = DashboardModel(source: indBSource, initialYear: indBYear)
+            await indBSource.blockGraph(year: indBYear)
+            let indBLoad = Task { await indBModel.load() }
+            _ = await waitUntil { await indBSource.pendingGraphCount(year: indBYear) == 1 }
+            results["indBInitialKind"] = indBModel.backgroundRefresh?.kind == .initial
+            await indBSource.blockGraph(year: "2050")
+            let indBSwitch = Task { await indBModel.setYear("2050") }
+            _ = await waitUntil { await indBSource.hasPendingGraph(year: "2050") }
+            results["indBYearSwitchKind"] = indBModel.backgroundRefresh?.kind == .yearSwitch
+            // The OLDER (initial, year 2049) fetch settles — must not clear
+            // the year-switch indicator for the NEW year.
+            await indBSource.releaseGraph(year: indBYear)
+            await settle()
+            results["indBOlderDidNotClear"] = indBModel.backgroundRefresh?.kind == .yearSwitch
+            await indBSource.releaseGraph(year: "2050")
+            await indBLoad.value
+            await indBSwitch.value
+            results["indBClearedAfterSettle"] = indBModel.backgroundRefresh == nil
+
+            // A superseded FAILURE must not clear a newer indicator either.
+            let indCSource = ControlledTurnUsageDataSource()
+            let indCYear = "2042"
+            let indCModel = DashboardModel(source: indCSource, initialYear: indCYear)
+            await indCSource.blockGraph(year: indCYear)
+            let indCLoad = Task { await indCModel.load() }
+            _ = await waitUntil { await indCSource.pendingGraphCount(year: indCYear) == 1 }
+            let indCRefresh = Task { await indCModel.refresh() }
+            _ = await waitUntil { await indCSource.pendingGraphCount(year: indCYear) == 2 }
+            results["indCManualKindBeforeFailure"] = indCModel.backgroundRefresh?.kind == .manual
+            // Fail specifically the OLDER (index 0) parked fetch, leaving the
+            // newer (manual) one still in flight.
+            await indCSource.failGraph(year: indCYear, index: 0)
+            await settle()
+            results["indCFailureDidNotClearManual"] =
+                indCModel.backgroundRefresh?.kind == .manual
+            await indCSource.releaseGraph(year: indCYear, index: 0, day: 5)
+            await indCLoad.value
+            await indCRefresh.value
+            results["indCClearedAfterSettle"] = indCModel.backgroundRefresh == nil
+
+            return results
+        } ?? [:]
+
+        expect(
+            lp3IndicatorChecks["indAInitialKind"] == true
+                && lp3IndicatorChecks["indAManualKind"] == true,
+            "LP3 indicator: the initial→manual fixture really tags each trigger's own kind "
+                + "before either settles")
+        expect(
+            lp3IndicatorChecks["indAOlderSuccessDidNotClear"] == true,
+            "LP3 indicator: an overtaken initial fetch's SUCCESS cannot clear a newer manual "
+                + "request's indicator")
+        expect(
+            lp3IndicatorChecks["indAClearedAfterSettle"] == true,
+            "LP3 indicator: the indicator clears once the OWNING (manual) fetch settles")
+        expect(
+            lp3IndicatorChecks["indBInitialKind"] == true
+                && lp3IndicatorChecks["indBYearSwitchKind"] == true,
+            "LP3 indicator: the initial→year-switch fixture really tags each trigger's own kind")
+        expect(
+            lp3IndicatorChecks["indBOlderDidNotClear"] == true
+                && lp3IndicatorChecks["indBClearedAfterSettle"] == true,
+            "LP3 indicator: an overtaken initial fetch cannot clear a newer year-switch "
+                + "request's indicator, which clears on its own settling")
+        expect(
+            lp3IndicatorChecks["indCManualKindBeforeFailure"] == true,
+            "LP3 indicator: the superseded-failure fixture really has a newer manual request "
+                + "in flight when the older one is failed")
+        expect(
+            lp3IndicatorChecks["indCFailureDidNotClearManual"] == true
+                && lp3IndicatorChecks["indCClearedAfterSettle"] == true,
+            "LP3 indicator: an overtaken fetch's FAILURE cannot clear a newer request's "
+                + "indicator either — ownership applies to both settlement routes")
 
         if failures > 0 {
             print("\(failures) selftest check(s) failed")

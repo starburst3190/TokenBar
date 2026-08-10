@@ -50,11 +50,14 @@ PT0 的 hermetic authorities are Rust last-good and binding decisions, refresh s
 | Duplicate or replay | 舊路徑的 total 與對照路徑分歧；新路徑與對照收斂 |
 | Sibling-only write | 預設 fingerprint 不失效；完整 fingerprint、mtime probe、prune 都失效 |
 | Provider cost | 缺失成本可估算；明確 provider-reported 成本不可被 stale pricing 覆蓋 |
-| Hidden client | non-empty partial selection 在 Rust fold 前排除未選 client；`nil`／empty clients 依 C ABI contract 代表 all clients；all-hidden 由 Swift lens strict membership 阻擋 |
+| Hidden client | non-empty partial selection 在 Rust fold 前排除未選 client；`nil`／empty clients 依 C ABI contract 代表 all clients；all-hidden 由 Swift lens strict membership 阻擋；對外發布面另以 hermetic payload-builder fixture 證明隱藏 client 的 token／cost 與 top-client 標籤都不出現在送出的 payload，且未註冊 id 在 producer 端就被正向 allowlist 濾掉——既不進數字也不進標籤，因此中性常數自 `payload()` 已不可達，改以「整張圖只有未註冊 id 時發布 nothing」證明其為死路 |
 | Quota account scope | 以temporary application-data root驗證exact 32-byte key、每次reload、cross-process winner、key-loss orphan recovery、atomic failure與raw-value scan；macOS／Unix驗證directory `0700`／file `0600`、symlink／non-regular／inode swap fail-closed。Windows另驗證system-preferred CNG、current-user owner、protected current-user／LocalSystem exact allow DACL、foreign／deny／inherited ACE拒絕、final symlink／junction／device／wrong type拒絕、volume plus 128-bit file identity replacement、no-delete-share lock、concurrent first-key winner、replace pre／post-commit failure、collision-safe quarantine與identity-bound rollback、sticky secure-root fallback、insecure legacy v2留原位不匯入，以及錯誤不洩漏path／SID／raw value；不得呼叫真實Keychain或provider credential |
 | Quota history | Reset jitter、floating zero、duration lifecycle、partial／future-reset cycles、active-series capacity、account isolation、corrupt recovery與current-actual shift都以temporary v3 store驗證；Codex schema-2只驗current-account-only、byte-exact read-only migration，live provider refresh只作smoke |
+| Quota history identity | 三次連續的 credential marker 變更必須產生**同一個** `SeriesKey`，且同一組 marker 仍必須產生**三個相異**的 `ProviderCacheBinding` 與三個相異的 plan-cache key——兩者要一起斷言，否則證明不了「拆身分」而只證明了「換了個鍵」。另需：`scope-history-v1` 的 known vector（期望值必須在 crate 外獨立算出，不得取自實作）與對 `scope-id-v1`／`scope-lineage-v1` 的 domain separation；常數路徑不得建立 metadata 檔；`accountScope` 為 `Err` 但 `historyScope` 為 `Ok` 的快照必須寫入**零**筆 history；每一條 authoritative 路線各有 byte-equality fixture。禁止在 real store 上跑 before/after——那會改寫使用者的生產歷史庫 |
 | Overflow input | old arithmetic fails or wraps in the targeted site；new saturating path remains bounded |
 | Individual client tray | UI-free SelfTest鎖定兩個defaults的parse前byte cap、entry／ID cap、deterministic serialization與超限no-writeback；client-scoped Auto／explicit／missing、error-only quota provider仍可配置、`antigravity-cli`只在quota lookup映射到`antigravity`且identity保持獨立、main完整route與per-client lens記憶互不污染、Settings row／picker狀態、official icon 1x＋2x reps、newer accepted publication與visible／AX／tooltip privacy都由synthetic graph／quota payload驗證，不建立真實system status items |
+| Usage attribution | 政策以結構性斷言驗證而非逐條列舉：每個 bound provider 必須指名 `providerOwnClient` 保護對象、每個 first-party 廠商必須能從其 opencode 標籤解析回自己的 client、表內每個 client 必須在註冊表中。另驗證：來源 client 可為註冊表外的動態 id 而目標不可、自家訂閱優先且不需要 quota snapshot、未調查的來源回傳 nil 而非斷言 API 支出、已宣告的 router 計入它簽入的訂閱 |
+| Quota curve snapshot | Binding admission 以真實 snapshots 驗證（trusted scope 不足以綁定：帶 `error` 的 last-good 與帶 `transport_diagnostic` 的 degraded 都必須排除），window key 由 production mapper 產生而非寫進 fixture，因此 mapper 端改身分會失敗而不是靜默 unbind；lifecycle 驗證 serialization 失敗保留前一個 tuple、generation 過期為錯誤、process restart 後不供應；binding lock 必須在 history I/O 前釋放，且 read 之後重新解析 binding——tuple 在 I/O 期間被替換（含同 generation 換帳號）必須 fail closed，settled binding 則仍正常供應 |
 | Cache schema | 舊版本 cache 不被當成新 layout 靜默接受；新 layout 可重建並 reload |
 | Provider transport fallback | last-good binding、refresh status-before-body、terminal/absent/4xx/schema/required-meter clearing、Grok additive monthly、Copilot loader、以及 diagnostic allowlist 都以 hermetic responses 驗證 |
 | FFI publication | Provider run、JSON serialize、envelope、raw C-pointer publication 的 single-flight、gate-assigned checked `publicationGeneration`、exhaustion fail-closed、可反轉的 C return order，以及單次 run 內 provider 並行分別驗證 |
@@ -72,6 +75,18 @@ swift build
 make selftest          # = swift run TokenBar --selftest -AppleLanguages "(en)"
 swift run TokenBar --smoke
 ```
+
+每一項都跑 debug configuration 的 bare executable，`Bundle.main.bundleIdentifier` 因此是 nil。凡是以那個差異為條件的值，在 suite 看得到的地方是一種樣子、在出貨的地方是另一種樣子，而任何 source scan 都關不掉這個缺口（#146 寫過三道、三道都被繞過，缺口不在原始碼文字裡）。CI 因此在 push 到 main 時多跑一次 `make selftest-bundled`：release build、裝進 `.app`、從 bundled binary 執行同一套 suite。
+
+bundle identity 是這個 target 唯一的旋鈕，而它在兩個危害之間取捨。bundled run 會把 `UserDefaults.standard` 解析到 identifier 指名的 domain，而 suite 確實會寫進去（`PopoverChrome.heightKey` 與 dashboard year key 都是先寫再還原，因為生產型別直接讀 `.standard`）；用出貨 identifier 就會寫進安裝版自己的偏好設定。
+
+所以本機預設是拋棄式的 `com.nyanako.tokenbar.selftest`，而**那是比較弱的 gate**：它抓得到以「identifier 為 nil」為條件的值，抓不到以出貨字串本身為條件的值——後者在本機走安全分支，只有裝起來之後才走另一條。CI 用 `make selftest-bundled SELFTEST_BUNDLE_ID=` 補上，空值代表「`scripts/bundle.sh` 的預設」也就是出貨 identifier；runner 是拋棄式的、沒有安裝版可污染，開發者的 Mac 有。空值而非再寫一次字面值，是為了讓未來改名只有一處要動、不會把這道 gate 無聲地弱化成對不上的字串。
+
+app 名稱**不是**第二個旋鈕。它一度是，而那等於把同一個逃脫換一個屬性重演一次：以 `CFBundleName == "TokenBar"` 或 bundle URL 結尾為條件的值，在叫別的名字的 gate 裡會走安全分支。所以它組出來的是貨真價實的 `TokenBar.app`，改用 `OUT_DIR=dist/selftest` 讓路，順便仍然不會覆蓋手動建的 `dist/TokenBar.app`。
+
+與正式發版 bundle 仍然不同、且**不打算**逐輪 review 才發現的部分：安裝路徑（`dist/selftest/` 而非 `/Applications/`）、version 與 build number（用 `bundle.sh` 預設，正式值由 `release.yml` 傳入）、簽章（ad-hoc 而非 Developer ID）。以這三者為條件的值超出這道 gate 能觀察的範圍，任何本機組裝的 bundle 都關不掉，只有安裝 notarized build 才行。這裡**觀察得到**的是 identifier、名稱，以及 release configuration 本身。
+
+**它不是 `make selftest` 的超集**：`#if DEBUG` 後面的斷言在 release configuration 不存在，所以 bundled run 的斷言數比較少。兩者都是 gate，互不取代。
 
 ### Local full code-change gates
 
@@ -95,6 +110,7 @@ Live account-scope smoke必須在hermetic security suite通過後才執行，且
 | Rust | Release static library builds from the current source |
 | Swift | SwiftPM links against the freshly built library from repository root |
 | Selftest | UI-free TokenBarCore assertions pass。部分斷言逐字比對英文 UI 文案，因此語系必須鎖定 `en`（用 `make selftest`，或自行帶 `-AppleLanguages "(en)"`）；在中文系統上直接跑 `swift run TokenBar --selftest` 會因 `Format` 輸出中文而假性失敗，入口會先印出提示 |
+| Bundled selftest | 同一套 suite 從 `dist/selftest/TokenBar.app` 的 release binary 通過（`make selftest-bundled`），證明斷言看到的是出貨 configuration。CI 只在 push 到 main 時跑，並以 `SELFTEST_BUNDLE_ID=` 帶出貨 identifier；本機預設拋棄式 identifier＝較弱版本。斷言數少於 debug run（`#if DEBUG` 的部分不存在），不是超集 |
 | Smoke | Every C ABI entry point decodes or reports an intentional error envelope；account-scope path不得存取Keychain或顯示credential authorization UI |
 | Account-scope storage | Hermetic security tests先證明permission、path、locking、atomicity與recovery；live smoke只驗證shipping data flow不彈授權UI，不取代fixture correctness |
 | Windows secure storage | M19-B0證明Native candidate與核准Windows security/storage semantic source等價；M19-B1又在hosted Windows x64 runtime執行CNG、owner／exact protected DACL、final-component reparse、file identity、exclusive no-delete-share lock、replace、quarantine、legacy upgrade與error-privacy tests。合併後的exact Windows source另在real ARM64 Windows通過351項Rust tests、12-case provider-v3 CrossCheck、ARM64 PE checks與synthetic WinUI startup；macOS tests與GitHub ARM64 cross-package都不取代這些runtime assertions |
@@ -107,7 +123,7 @@ Live account-scope smoke必須在hermetic security suite通過後才執行，且
 
 不需要 `.app` bundle 語意的人工 UI 檢查，優先從 repository root 執行 `swift run TokenBar --open-popover`。只有 icon、`Info.plist`、`LSUIElement`、Sparkle、autostart 或安裝路徑等 bundle-only 行為，才以 `make bundle` 產生的 `dist/TokenBar.app` 驗收。
 
-Provider quota pace 以 `swift run TokenBar --demo --open-popover` 提供 deterministic 人工驗收面；snapshot badge 明示 `FIXTURE`，且 `DemoUsageDataSource` 不呼叫 live FFI、不讀寫 quota cache。Historical／Linear／Off 都要實際呈現；驗收時必須區分低 remaining 觸發的 quota 長條黃／紅健康色，與只有 `available` historical deficit 才可使用的 pace marker／footer 橘色。
+Provider quota pace 以 `swift run TokenBar --demo --open-popover` 提供 deterministic 人工驗收面；snapshot badge 明示 `FIXTURE`，且 `DemoUsageDataSource` 不呼叫 live FFI、不讀寫 quota cache。Historical／Linear／Off 都要實際呈現；驗收時必須區分低 remaining 觸發的 quota 長條黃／紅健康色，與 deficit stage 觸發的 pace marker／footer 橘色。橘色只看 actual 有沒有越過 expected 線，不看是哪個 estimator 畫出那條線——Historical 與 Linear 的 deficit 同色，狀態文案仍必須分辨兩者。舊規則（只有 `available` 可上色）已廢止：`available` 由每次 refresh 重跑的 out-of-sample fit gate 決定，同一張卡會在 Historical 與 `learningHistory` 之間來回，把顏色綁在 basis 上會讓使用者看到預測「一下子就不見了」，而底層 deficit 其實一直存在。
 
 Individual client items的deterministic Settings檢查以Argument Domain注入初始偏好；這只驗visual state與initial routing，不在同一process宣稱toggle persistence：
 
@@ -127,6 +143,8 @@ swift run TokenBar --demo --settings \
 ```
 
 > **本機 bundle 邊界：** `dist/TokenBar.app` 是暫時的驗收產物，不是第二份安裝。日常使用與正式更新的 source of truth 仍是 `/Applications/TokenBar.app`。
+>
+> `make selftest-bundled` 另外會在 `dist/selftest/TokenBar.app` 產生同名 bundle。它刻意與出貨同名同 identifier（見上方 gate 段落），所以**兩者不可混淆**：UX 驗收與下方清理程序談的一律是 `dist/TokenBar.app`。selftest 產物只被直接執行、在 app lifecycle 之前就結束，不會被 LaunchServices 註冊；`bundle.sh` 也會在 `dist/selftest/` 放一份 `.metadata_never_index`。不需要時整個目錄刪掉即可。
 
 [`scripts/bundle.sh`](../../scripts/bundle.sh) 會在組裝 app 前建立 `dist/.metadata_never_index`，避免 Spotlight 主動索引本機 bundle。但這個 marker 不會回溯刪除既有 Spotlight metadata；實際啟動 `dist/TokenBar.app` 也可能讓 LaunchServices 註冊它。因此本機 UX 驗收完成、且不再需要該 bundle 作為 release artifact 時，應撤銷這個特定 app 的註冊並刪除生成物，不要以重設整個 Launchpad database 作為第一步。
 
@@ -185,12 +203,14 @@ A source reader that consumes secondary files must be verified as one unit. The 
 | Stale-data policy | A failed refresh retains the last good value instead of blanking a working card；fallback must preserve display-ready fields only for a structural same-binding request transient, mark account scope untrusted, and skip enrichment/history/re-cache. Claude、Codex、Grok與Antigravity refresh persistence must re-read and match the loaded target before write-back and preserve unrelated siblings；account switch/logout is rejected before stale usage continues, while only unchanged-target persistence failure may follow the provider's existing uncacheable／terminal policy. Codex save failure must leave auth and metadata bytes unchanged；credentials persist before lineage transfer, transfer failure attempts rollback only after the exact just-written root still matches, and the post-binding reuses the already-verified corroborating scope plus the scope returned by transfer instead of adding a second fallible metadata write. Hermetic fixtures cover A→B、logout/removal、save/metadata failure、single pre-request resolution and sibling preservation；the compare-to-atomic-rename external-writer window and cross-resource crash interval are not claimed as filesystem CAS／atomic transaction |
 | Diagnostic wire | Rust emits only `{category,status?,osCode?}` from the fixed category allowlist；`rateLimited`只允許status 429且不帶osCode，`serverError`只允許500...599且不帶osCode，非HTTP categories不得帶status，unknown category不得帶associated numerics；Swift lossy decoding逐欄丟棄malformed optional integers，非object或缺失／非字串category不建立candidate、unknown values正規化，且public logging維持bounded |
 | Swift scalar authority | Successful finite outer payloads replace memory and persistent scalar; Dashboard polling reconciles accepted publications immediately and TrayAnimator reads the coordinator's latest generated payload before its own poll completes; selection／exclusion changes re-reconcile before render; Settings task identity uses `publicationGeneration` or a legacy timestamp-plus-resolved-scalar fingerprint; terminal／Absent／unresolved／hidden-all clear the scalar; only outer FFI failure or missing payload retains it. Isolated UserDefaults tests cover restart non-revival, healthy replacement, explicit fallback windows, Auto exclusion, reconciliation identity collisions, a newer terminal result followed by a late older tray success, and a newer Dashboard success replacing an older tray payload plus scalar while invalidating the gauge-render signature |
+| Quota curve identity | Series identity 不跨 ABI：Rust 擁有 publication-owned binding table，Swift 只傳 `clientId`／`windowKey`／`publicationGeneration`。Binding 只在 serialization 成功後替換，generation 不符為錯誤而非 fallback，binding 在 history I/O 後重新解析以拒絕已移動的 identity；absent history 的 `ok:true` + `null` 由專屬 optional-envelope decoder 處理，不得與 decode failure 混同 |
 | Historical pace | Rust 的 typed `paceStatus` 擁有 lifecycle／duration，optional nested result 同時擁有 expected、ETA、will-last 與 risk；Swift 只能導出 mode policy、stage 與文字。`available + completeCycles == 0` 是合法的 validated current-window projection：Historical mode 必須使用 backend expected／ETA／will-last，partial risk 缺失時維持 nil、不顯示 risk copy，也不得退回 Linear。只有 `learningHistory` 可明示使用 exact-duration Linear estimate，`learningDuration`／`unavailable`／legacy 不得 silent fallback |
 | Lifecycle | Closing a popover or settings window cancels its tasks and stops background rendering |
+| Restart snapshot | Disk bytes carry only the aggregated graph payload plus schema/build identity, proven by a recursive exact-key assertion with a canary in every excluded field, not a keyword scan; any shape change bumps `snapshotSchemaVersion`. Restore is rejected for schema、bundle、version or exact-build mismatch, a requested year the snapshot does not match, malformed `knownYears`, a `savedAt` beyond the clock-skew or retention bounds, corrupt bytes, the byte cap and cap+1, a symlinked file or directory, a FIFO, a directory in the file's place, and wrong owner or mode. `--selftest`、`--smoke`、`--demo` and `--icon-gallery` must yield no shipping identity, asserted against an injected production bundle triple with a control proving that triple alone does yield one；a spy fails if the production directory is even resolved. Ordering is covered in both task orders, a superseded fetch must not clear a newer request, and mutation targets include the build comparison、the requested-year gate、the regular-file check、`O_NOFOLLOW`、the content digest、the capture sequence and the indicator's ownership check |
 
 ## Cross-port fixture cross-check
 
-Windows port（[Nanako0129/TokenBar-Windows](https://github.com/Nanako0129/TokenBar-Windows)）的 C# `TokenBar.Core` 是 `Sources/TokenBarCore` 的逐檔移植。兩個 consumer 現在都 pin `84e0d66413d4e0d87b734f66f7a848b3bc323258`；same-pin 只證明 shared source 相同，不取代下述 cross-check 這道跨語言 gate；app-owned FFI、Swift 與 C# surfaces 仍可獨立漂移。單元測試的期望值由移植者撰寫，因此對「一致地誤讀 Swift 語意」的移植錯誤沒有偵測力；對拍（cross-check）以同一份 fixture JSON 餵 Swift 與 C# 兩邊、逐欄位 diff 輸出，才是移植忠實度的判準。
+Windows port（[Nanako0129/TokenBar-Windows](https://github.com/Nanako0129/TokenBar-Windows)）的 C# `TokenBar.Core` 是 `Sources/TokenBarCore` 的逐檔移植。Native pin 為 `5b5f500d3a8abe66ab5fa44b18f4fc1aaee53947`，Windows 仍為 `84e0d66413d4e0d87b734f66f7a848b3bc323258`；新增的 `DailyContribution.turns_by_client` 是 additive 且 `#[serde(default)]`，未認得它的 decoder 仍可解，故此差異不阻塞 Windows。 same-pin 只證明 shared source 相同，不取代下述 cross-check 這道跨語言 gate；app-owned FFI、Swift 與 C# surfaces 仍可獨立漂移。單元測試的期望值由移植者撰寫，因此對「一致地誤讀 Swift 語意」的移植錯誤沒有偵測力；對拍（cross-check）以同一份 fixture JSON 餵 Swift 與 C# 兩邊、逐欄位 diff 輸出，才是移植忠實度的判準。
 
 | 項目 | 內容 |
 |---|---|

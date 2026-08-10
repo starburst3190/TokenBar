@@ -18,7 +18,18 @@ extension Int64 {
     }
 }
 
-public struct TokenBreakdown: Decodable, Sendable {
+public struct TokenBreakdown: Codable, Sendable {
+        // Explicit rather than synthesised: LP3 writes these values to disk, and a
+        // synthesised `Encodable` would silently persist any field added later.
+        // Adding a property here without deciding its persistence fails the
+        // recursive exact-key test instead of leaking it.
+    enum CodingKeys: String, CodingKey {
+        case input
+        case output
+        case cacheRead
+        case cacheWrite
+        case reasoning
+    }
     public let input: Int64
     public let output: Int64
     public let cacheRead: Int64
@@ -38,7 +49,19 @@ public struct TokenBreakdown: Decodable, Sendable {
     }
 }
 
-public struct ContributionClient: Decodable, Sendable {
+public struct ContributionClient: Codable, Sendable {
+        // Explicit rather than synthesised: LP3 writes these values to disk, and a
+        // synthesised `Encodable` would silently persist any field added later.
+        // Adding a property here without deciding its persistence fails the
+        // recursive exact-key test instead of leaking it.
+    enum CodingKeys: String, CodingKey {
+        case client
+        case modelId
+        case providerId
+        case tokens
+        case cost
+        case messages
+    }
     public let client: String
     public let modelId: String
     public let providerId: String
@@ -47,8 +70,29 @@ public struct ContributionClient: Decodable, Sendable {
     public let messages: Int
 }
 
-public struct Contribution: Decodable, Sendable {
-    public struct Totals: Decodable, Sendable {
+public struct Contribution: Codable, Sendable {
+        // Explicit rather than synthesised: LP3 writes these values to disk, and a
+        // synthesised `Encodable` would silently persist any field added later.
+        // Adding a property here without deciding its persistence fails the
+        // recursive exact-key test instead of leaking it.
+    enum CodingKeys: String, CodingKey {
+        case date
+        case totals
+        case intensity
+        case tokenBreakdown
+        case clients
+        case turnsByClient
+    }
+    public struct Totals: Codable, Sendable {
+            // Explicit rather than synthesised: LP3 writes these values to disk, and a
+            // synthesised `Encodable` would silently persist any field added later.
+            // Adding a property here without deciding its persistence fails the
+            // recursive exact-key test instead of leaking it.
+        enum CodingKeys: String, CodingKey {
+            case tokens
+            case cost
+            case messages
+        }
         public let tokens: Int64
         public let cost: Double
         public let messages: Int
@@ -59,28 +103,94 @@ public struct Contribution: Decodable, Sendable {
     public let intensity: Int
     public let tokenBreakdown: TokenBreakdown
     public let clients: [ContributionClient]
+    /// Interaction turns for this day, keyed by exact client id. Rust counts
+    /// these in the same fold that produces the day's tokens and messages, so a
+    /// day/month view no longer runs a second full report just for turns.
+    /// Absent on a payload from an engine that predates the field, and absent
+    /// for a day with no recorded turns — both decode as an empty map.
+    public let turnsByClient: [String: Int64]?
+
+    /// Turns for `clients`, summed. Empty selection yields nil rather than 0 so
+    /// a caller can tell "no clients selected" from "selected clients had none",
+    /// matching how the lenses treat an all-hidden slice everywhere else.
+    public func turns(for clients: [String]) -> Int64? {
+        guard !clients.isEmpty else { return nil }
+        let counts = turnsByClient ?? [:]
+        return clients.reduce(Int64(0)) { $0.saturatingAdding(counts[$1] ?? 0) }
+    }
 }
 
-public struct DateRange: Decodable, Sendable {
+public struct DateRange: Codable, Sendable {
+        // Explicit rather than synthesised: LP3 writes these values to disk, and a
+        // synthesised `Encodable` would silently persist any field added later.
+        // Adding a property here without deciding its persistence fails the
+        // recursive exact-key test instead of leaking it.
+    enum CodingKeys: String, CodingKey {
+        case start
+        case end
+    }
     public let start: String
     public let end: String
 }
 
-public struct YearMeta: Decodable, Sendable {
+public struct YearMeta: Codable, Sendable {
+        // Explicit rather than synthesised: LP3 writes these values to disk, and a
+        // synthesised `Encodable` would silently persist any field added later.
+        // Adding a property here without deciding its persistence fails the
+        // recursive exact-key test instead of leaking it.
+    enum CodingKeys: String, CodingKey {
+        case year
+        case totalTokens
+        case totalCost
+        case range
+    }
     public let year: String
     public let totalTokens: Int64
     public let totalCost: Double
     public let range: DateRange
 }
 
-public struct UsagePayload: Decodable, Sendable {
-    public struct Meta: Decodable, Sendable {
+public struct UsagePayload: Codable, Sendable {
+        // Explicit rather than synthesised: LP3 writes these values to disk, and a
+        // synthesised `Encodable` would silently persist any field added later.
+        // Adding a property here without deciding its persistence fails the
+        // recursive exact-key test instead of leaking it.
+    enum CodingKeys: String, CodingKey {
+        case meta
+        case summary
+        case years
+        case contributions
+    }
+    public struct Meta: Codable, Sendable {
+            // Explicit rather than synthesised: LP3 writes these values to disk, and a
+            // synthesised `Encodable` would silently persist any field added later.
+            // Adding a property here without deciding its persistence fails the
+            // recursive exact-key test instead of leaking it.
+        enum CodingKeys: String, CodingKey {
+            case generatedAt
+            case version
+            case dateRange
+        }
         public let generatedAt: String
         public let version: String
         public let dateRange: DateRange
     }
 
-    public struct Summary: Decodable, Sendable {
+    public struct Summary: Codable, Sendable {
+            // Explicit rather than synthesised: LP3 writes these values to disk, and a
+            // synthesised `Encodable` would silently persist any field added later.
+            // Adding a property here without deciding its persistence fails the
+            // recursive exact-key test instead of leaking it.
+        enum CodingKeys: String, CodingKey {
+            case totalTokens
+            case totalCost
+            case totalDays
+            case activeDays
+            case averagePerDay
+            case maxCostInSingleDay
+            case clients
+            case models
+        }
         public let totalTokens: Int64
         public let totalCost: Double
         public let totalDays: Int
@@ -127,6 +237,12 @@ public struct TrayTotals: Sendable {
 }
 
 extension UsagePayload {
+    /// The one membership test both stages use, so the published top client can
+    /// never disagree with the figures beside it.
+    static func survives(_ id: String, hidden: Set<String>, only: Set<String>?) -> Bool {
+        (only?.contains(id) ?? true) && !hidden.contains(id)
+    }
+
     /// Fold per-client×model×provider stripes into per-client totals and return
     /// the id with the most tokens. `hidden` uses the same membership test as
     /// `trayTotals`, with no normalization, so both agree by construction.
@@ -141,11 +257,22 @@ extension UsagePayload {
     /// tokens, then higher cost, then lexicographically smallest id. The fold
     /// walks the keys in sorted order because `Dictionary`'s own iteration order
     /// is unspecified (and per-process seeded).
+    /// `only`, when non-nil, is a POSITIVE allowlist: a stripe survives when
+    /// `id ∈ only && id ∉ hidden`. Both conditions must hold, which is what
+    /// makes "a selection cannot defeat hiding" structural rather than guarded.
+    ///
+    /// Positive rather than a complement, and that is not a style choice. The
+    /// obvious `hidden ∪ (allIds − {selected})` is wrong: the aggregator emits
+    /// ids that are not in `allIds` — `cc-mirror/<name>`, and any agent
+    /// detected before the registry catches up — so a complement cannot
+    /// subtract what it does not know about and those ids survive the filter.
+    /// The published figure would be "the selected agent plus every
+    /// unregistered client".
     public static func topVisibleClient(
-        in clients: [ContributionClient], hidden: Set<String>
+        in clients: [ContributionClient], hidden: Set<String>, only: Set<String>? = nil
     ) -> String? {
         var byClient: [String: (tokens: Int64, cost: Double)] = [:]
-        for cc in clients where !hidden.contains(cc.client) {
+        for cc in clients where survives(cc.client, hidden: hidden, only: only) {
             let prev = byClient[cc.client] ?? (0, 0)
             byClient[cc.client] = (prev.tokens.saturatingAdding(cc.tokens.total), prev.cost + cc.cost)
         }
@@ -181,13 +308,18 @@ extension UsagePayload {
     /// `summary` — the day-level clamp is not reproducible from the stripes
     /// alone, so we do NOT try to. Smoke's `trayDrift` probe compares the two
     /// on real data every run to catch any vendor-sync regression.
-    public func trayTotals(hidden: Set<String>, today: String) -> TrayTotals {
+    public func trayTotals(
+        hidden: Set<String>, today: String, only: Set<String>? = nil
+    ) -> TrayTotals {
         let todayEntry = contributions.last(where: { $0.date == today })
         // Shared by both paths so the published top client can never disagree
         // with the figures next to it (same stripes, same membership test).
         let todayTopClient = UsagePayload.topVisibleClient(
-            in: todayEntry?.clients ?? [], hidden: hidden)
-        if hidden.isEmpty {
+            in: todayEntry?.clients ?? [], hidden: hidden, only: only)
+        // `only == nil` as well as an empty hidden set: the fast path reads
+        // `summary`, which is unfiltered, so a positive filter must never take
+        // it. Callers that pass no `only` keep the byte-identical fast path.
+        if hidden.isEmpty && only == nil {
             return TrayTotals(
                 todayTokens: todayEntry?.totals.tokens ?? 0,
                 todayCost: todayEntry?.totals.cost ?? 0,
@@ -201,7 +333,7 @@ extension UsagePayload {
         var todayCost = 0.0
         for c in contributions {
             let isToday = c.date == today
-            for cc in c.clients where !hidden.contains(cc.client) {
+            for cc in c.clients where UsagePayload.survives(cc.client, hidden: hidden, only: only) {
                 let sum = cc.tokens.total
                 totalTokens = totalTokens.saturatingAdding(sum)
                 totalCost += cc.cost

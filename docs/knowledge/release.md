@@ -4,8 +4,8 @@ id: kb-release
 kind: canonical
 scope: repository
 read_when: changing release scripts, code signing, appcast, Sparkle, Homebrew, Pages, or post-release notes
-last_verified: 2026-07-17
-sources: [".github/workflows/release.yml", ".github/workflows/pages.yml", ".github/workflows/update-install-count.yml", "scripts/bundle.sh", "appcast.xml", "Makefile", "docs/knowledge/plans/provider-quota-pace.md", "public release history"]
+last_verified: 2026-08-09
+sources: [".github/workflows/release.yml", ".github/workflows/ci.yml", ".github/workflows/pages.yml", ".github/workflows/update-install-count.yml", "scripts/bundle.sh", "scripts/build-sparkle.sh", "appcast.xml", "Makefile", "docs/knowledge/plans/provider-quota-pace.md", "public release history"]
 ---
 
 # Release and delivery
@@ -20,6 +20,7 @@ sources: [".github/workflows/release.yml", ".github/workflows/pages.yml", ".gith
 - [Application release](#application-release)
 - [Code signing and local secret storage](#code-signing-and-local-secret-storage)
 - [Sparkle and appcast](#sparkle-and-appcast)
+- [Sparkle is compiled here, not taken from the prebuilt artifact](#sparkle-is-compiled-here-not-taken-from-the-prebuilt-artifact)
 - [Migration principle](#migration-principle)
 - [Legacy and beta migration](#legacy-and-beta-migration)
 - [Homebrew and install count](#homebrew-and-install-count)
@@ -55,6 +56,8 @@ The release workflow is tag-driven. It validates and bundles the native app, pro
 | `appcast.xml` | `scripts/make_appcast.sh` and generated feed | XML parses, old items remain, channel semantics are correct |
 | Homebrew cask | Release workflow generator plus tap repository | Version, URL, checksum, and style match the published asset |
 | Install count | `update-install-count.yml` | Orphan badge branch contains the current filtered asset count |
+| Discord presence artwork | Discord Developer Portal (manual, outside this repo) | Before tagging: the application's asset key matches `DiscordPresence.largeImageKey` exactly, lowercase, and still exists. Asset keys cannot be edited after saving and an unresolved key does not error — the image just disappears — so a rename adds the new key and keeps the old one |
+| Discord presence consent | This repo | The opt-in switch and everything the disclosure beside it describes must reach users in the SAME release. The switch has never shipped — v1.12.0 carries the payload builder but no key, no transport and no Settings section — so today every user's first sight of it is with the current disclosure. Shipping an addition to the published surface (the repository button was the first) in a LATER release than the switch would resume publishing for anyone already opted in, under copy they never read. Either ship them together or reset the key |
 
 > **授權邊界：** 發版是不可逆的公開狀態變更。除非使用者明確要求，不能自行 tag、push appcast、改 Release body、更新 cask 或發佈 asset。
 
@@ -69,6 +72,18 @@ The release workflow is tag-driven. It validates and bundles the native app, pro
 The feed is a single multi-item appcast. Stable items are channel-less; prerelease items carry the beta channel. The generator reads the existing feed, preserves prior items and signatures, and keeps a bounded history instead of overwriting the feed with one item.
 
 This matters because a single-item writer can hide a still-valid stable version when a bridge or prerelease item is added. The appcast fix uses Sparkle's `generate_appcast` and keeps the application-side channel toggle as a lazy delegate for a possible future beta lane.
+
+## Sparkle is compiled here, not taken from the prebuilt artifact
+
+`scripts/bundle.sh` embeds a `Sparkle.framework` built by `scripts/build-sparkle.sh` with `SPARKLE_NORMALIZE_INSTALLED_APPLICATION_NAME=1`. The official prebuilt xcframework ships that macro off, and it is a compile-time constant rather than an Info.plist key, so no app-side declaration can turn it on. With it off, Sparkle always installs over the host bundle's existing path — an app can never change its own filename through an update. Enabling it is what allows a future rename of the installed bundle to happen through the updater instead of the app moving itself.
+
+The macro has three consumers, all inside the framework, so one rebuild covers them: choosing the install path, switching away from the atomic swap when that path changes, and relaunching the app at the new path.
+
+Source comes from SwiftPM's own checkout under `.build/checkouts/Sparkle`, which `Package.resolved` already pins. A separate clone would introduce a second revision to keep in sync with the one the app links against. The macro appears in none of the framework's public headers, so the app still compiles and links against the stock SPM artifact and `Package.swift` is unchanged; only the binary copied into `Contents/Frameworks` differs. Building it takes roughly two to three minutes and is skipped when the output already matches the pinned revision.
+
+> **Updater rule：** this is the highest-consequence single point in the release chain. A defective framework breaks updating for the entire installed base at once, and the cask is `auto_updates true`, so `brew upgrade` is not a rescue channel. `scripts/bundle.sh` therefore asserts on the binary it just copied — the bundled `Autoupdate` must reference `SUNormalizedInstallationPath` — and fails the build otherwise. The assertion is on the shipping artifact rather than on source text, and it discriminates: the official prebuilt scores zero under the same check. Do not weaken it into a source scan, and do not make embedding the framework conditional; an app assembled without an updater looks fine and silently never updates again.
+
+CI runs `scripts/bundle.sh` on pushes to `main` through `make selftest-bundled`, so a broken Sparkle build fails there rather than after a tag is pushed. Upgrading Sparkle now means rebuilding it here; the prebuilt artifact cannot simply be consumed again.
 
 ## Migration principle
 

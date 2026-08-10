@@ -10,9 +10,13 @@ struct OverviewView: View {
     let clientIds: [String]
     let stats: UsageStats
     let modelReport: ModelReport?
+    /// Forwarded to ModelBreakdownCard; see its `loading` doc.
+    var modelLoading = false
     let colors: ModelColorMap
     let trace: [TraceBucket]
     let agentUsage: AgentUsagePayload?
+    /// Forwarded to AgentLimitsCard; see its `usageAttempted` doc.
+    var usageAttempted = true
     /// Set when this view shows a single client's slice.
     var singleClient: String?
     /// Dashboard year filter (nil = all time), forwarded to the chart card.
@@ -38,6 +42,7 @@ struct OverviewView: View {
                 if limitsEnabled && !hiddenLimits.contains(singleClient) {
                     AgentLimitsCard(
                         clients: [singleClient], trace: trace, agentUsage: agentUsage,
+                        usageAttempted: usageAttempted,
                         title: "%@ limits".localized(name),
                         note: "Session / weekly / model limits",
                         restrict: true)
@@ -45,17 +50,19 @@ struct OverviewView: View {
                 chart
                 ModelBreakdownCard(
                     report: modelReport, clientIds: clientIds, colors: colors,
-                    title: "%@ models".localized(name))
+                    title: "%@ models".localized(name), loading: modelLoading)
             } else {
                 chart
                 if limitsEnabled {
                     AgentLimitsCard(
                         clients: clientIds, trace: trace, agentUsage: agentUsage,
+                        usageAttempted: usageAttempted,
                         reorderable: true)
                 }
                 UsageTraceCard(buckets: trace, windowSecs: 600, hidden: hidden)
                 ModelBreakdownCard(
-                    report: modelReport, clientIds: clientIds, colors: colors)
+                    report: modelReport, clientIds: clientIds, colors: colors,
+                    loading: modelLoading)
             }
             StreaksCard(streaks: stats.streaks)
         }

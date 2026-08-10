@@ -17,6 +17,16 @@ struct AgentLimitsCard: View {
     let clients: [String]
     let trace: [TraceBucket]
     let agentUsage: AgentUsagePayload?
+    /// Whether the first quota fetch has finished, successfully or not.
+    ///
+    /// `agentUsage == nil` cannot tell "the first attempt is still in flight"
+    /// from "the attempt finished and produced nothing", and the empty copy
+    /// below asserts the second. Restoring a dashboard from disk makes that
+    /// distinction visible: quota is deliberately never persisted (it carries
+    /// account identity), so the graph renders instantly while these cards wait
+    /// on their own poller. Defaults to true so call sites that always have a
+    /// settled answer stay unchanged.
+    var usageAttempted = true
     var title = "Agent limits"
     var note = "OAuth quota"
     /// When true, show only the passed `clients` (single-client view) instead
@@ -93,8 +103,16 @@ struct AgentLimitsCard: View {
             }
         }
 
-        static func isHistoricalDeficit(_ pace: UsagePace?) -> Bool {
-            pace?.isHistoricalDeficit == true
+        /// Warning color follows codexbar: the marker is tinted when actual
+        /// usage has passed the expected line, whichever estimator drew that
+        /// line. Keying it to the basis instead made the warning blink out
+        /// whenever the Historical fit failed to re-qualify — `available` is
+        /// re-decided on every refresh by an out-of-sample fit gate, so a card
+        /// oscillates between Historical and `learningHistory` while the deficit
+        /// underneath never moves. The status text still names the basis, so a
+        /// Linear estimate stays identifiable without the color flickering.
+        static func isDeficit(_ pace: UsagePace?) -> Bool {
+            pace?.stage.isDeficit == true
         }
     }
 
@@ -105,13 +123,6 @@ struct AgentLimitsCard: View {
         "claude": ["Session", "Weekly"],
         "gemini": ["Pro", "Flash"],
         "grok": ["Weekly"],
-    ]
-
-    /// Maps opencode subscription labels (from the backend) to the agent
-    /// client ids whose quota cards represent them.
-    private static let subLabelToId: [String: String] = [
-        "Codex": "codex", "Claude": "claude", "Copilot": "copilot",
-        "Gemini": "antigravity",
     ]
 
     /// Every client id that can show a row in the multi-agent Agent-limits
@@ -157,7 +168,11 @@ struct AgentLimitsCard: View {
         let snapshots = self.snapshots
         if opencodeView {
             return opencodeSubs
-                .map { Self.subLabelToId[$0] ?? $0.lowercased() }
+                // The subscription-owner resolution, not the raw label mapper:
+                // `Xai` maps to `xai` there, while the quota snapshot is keyed
+                // `grok`, so the filter below would drop the very card opencode
+                // is authed against.
+                .compactMap(UsageAttributionSettings.subscriptionClient(forLabel:))
                 .filter { snapshots[$0] != nil }
         }
         func known(_ id: String) -> Bool {
@@ -199,7 +214,19 @@ struct AgentLimitsCard: View {
                         opencodeSubs.joined(separator: " · ")))
             }
             let visible = visibleClients
-            if visible.isEmpty {
+            if visible.isEmpty, !usageAttempted {
+                // Say "still asking" rather than "none": claiming no supported
+                // agents while the first request is outstanding is a false
+                // answer, not an empty one.
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking agent limits…".localized)
+                }
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 8)
+            } else if visible.isEmpty {
                 Text(
                     opencodeView && !opencodeSubs.isEmpty
                         ? "Subscriptions: %@".localized(
@@ -488,7 +515,7 @@ struct AgentLimitsCard: View {
                         let left = asUsed ? $0.expectedUsedPercent : 100 - $0.expectedUsedPercent
                         return min(100, max(0, left))
                     },
-                    paceIsDeficit: Self.PacePresentation.isHistoricalDeficit(pace))
+                    paceIsDeficit: Self.PacePresentation.isDeficit(pace))
                 paceFooter(window: window, leftLabel: leftLabel, pace: pace)
             }
         }
@@ -558,9 +585,20 @@ struct AgentLimitsCard: View {
             // Pace/ETA is tertiary text like every other former .tertiary
             // label; a deficit pace flips it to orange as a warning.
             .foregroundStyle(
-                Self.PacePresentation.isHistoricalDeficit(pace)
+                Self.PacePresentation.isDeficit(pace)
                     ? AnyShapeStyle(.orange)
                     : AnyShapeStyle(.tertiaryAdaptive))
+    }
+
+    /// What a row with no quota value should say.
+    ///
+    /// "No data" asserts the provider was asked and had nothing. Before the
+    /// first fetch settles that is a false answer: the client list comes from
+    /// the graph payload, which a disk restore brings back instantly, so every
+    /// row renders while quota is still outstanding. Quota is deliberately
+    /// never persisted, so this window exists on every relaunch.
+    private var placeholderValueLabel: String {
+        usageAttempted ? "No data".localized : "Checking…".localized
     }
 
     private func placeholderRow(_ label: String, brand: String) -> some View {
@@ -570,14 +608,14 @@ struct AgentLimitsCard: View {
                     .font(.caption2.weight(.medium))
                 Spacer()
                 if classic {
-                    Text("No data")
+                    Text(placeholderValueLabel)
                         .font(.caption2)
                         .foregroundStyle(.tertiaryAdaptive)
                 }
             }
             bar(fillPercent: 0, color: Color(hex: brand), paceLeft: nil, paceIsDeficit: false)
             if !classic {
-                Text("No data")
+                Text(placeholderValueLabel)
                     .font(.caption2)
                     .foregroundStyle(.tertiaryAdaptive)
             }

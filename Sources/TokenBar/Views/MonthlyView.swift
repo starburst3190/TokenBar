@@ -14,10 +14,10 @@ struct MonthlyView: View {
     /// consistent with DailyView/DayBars/UsageStats — so an all-hidden slice
     /// can't leak the drill-down.
     var clientIds: [String] = []
-    let hourlyReport: HourlyReport?
     var turnClientIds: [String] = []
-    var turnsLoading = false
     let colors: ModelColorMap
+    /// See `DailyView.onExpand`.
+    var onExpand: (() -> Void)?
 
     @State private var openMonth: String?
     @Environment(TooltipHost.self) private var tooltipHost
@@ -49,10 +49,9 @@ struct MonthlyView: View {
     /// `nonisolated`: pure data fold with no UI state, called from SelfTest's
     /// nonisolated context (it would otherwise inherit @MainActor from View).
     nonisolated static func monthRows(
-        payload: UsagePayload, clientIds: [String], hourlyReport: HourlyReport? = nil
+        payload: UsagePayload, clientIds: [String], turnClientIds: [String] = []
     ) -> [MonthRow] {
         let allow = Set(clientIds)
-        let turnsByMonth = TurnCountBuckets.byMonth(hourlyReport)
         var grouped: [String: MonthRow] = [:]
         for c in payload.contributions {
             var tokens: Int64 = 0
@@ -69,13 +68,14 @@ struct MonthlyView: View {
             var slot = grouped[month]
                 ?? MonthRow(
                     month: month, tokens: 0, cost: 0, messages: 0,
-                    turns: hourlyReport == nil ? nil : turnsByMonth[month] ?? 0,
-                    contributions: [])
+                    turns: nil, contributions: [])
             slot.tokens = slot.tokens.saturatingAdding(tokens)
             slot.cost += cost
             slot.messages += messages
-            if hourlyReport != nil {
-                slot.turns = turnsByMonth[month] ?? 0
+            // Each day carries its own turns, so the month is their sum — no
+            // second report to wait for, hence no per-row loading state.
+            if let dayTurns = c.turns(for: turnClientIds) {
+                slot.turns = (slot.turns ?? 0).saturatingAdding(dayTurns)
             }
             slot.contributions.append(c)
             grouped[month] = slot
@@ -121,10 +121,10 @@ struct MonthlyView: View {
 
     var body: some View {
         let rows = Self.monthRows(
-            payload: payload, clientIds: clientIds, hourlyReport: hourlyReport)
+            payload: payload, clientIds: clientIds, turnClientIds: turnClientIds)
         DashCard(
             "Monthly",
-            subtitle: hourlyReport == nil ? nil : TurnCountBuckets.scope(turnClientIds),
+            subtitle: TurnCountBuckets.scope(turnClientIds),
             trailing: {
                 Text((rows.count == 1 ? "%lld active month" : "%lld active months")
                     .localized(rows.count))
@@ -150,6 +150,11 @@ struct MonthlyView: View {
         let isOpen = openMonth == row.month
         VStack(spacing: 4) {
             Button {
+                // Upstream clears its local `hover` state here; this branch
+                // routes hover through the shared TooltipHost instead, so the
+                // equivalent dismissal is a host clear.
+                tooltipHost.clear()
+                if !isOpen { onExpand?() }
                 withAnimation(.easeOut(duration: 0.15)) {
                     openMonth = isOpen ? nil : row.month
                 }
@@ -168,14 +173,6 @@ struct MonthlyView: View {
                         Text("%@ turns".localized(turns.formatted()))
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
-                    } else if TurnCountBuckets.showsLoading(
-                        report: hourlyReport, requestInFlight: turnsLoading,
-                        clientIds: turnClientIds)
-                    {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .frame(width: 10, height: 10)
-                            .accessibilityLabel("Loading…")
                     }
                     Spacer()
                     Text(Format.compactTokens(row.tokens))

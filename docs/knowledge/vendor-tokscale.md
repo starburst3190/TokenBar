@@ -12,7 +12,7 @@ sources: [".gitmodules", "vendor/README.md", "public tokscale-core UPSTREAM at b
 
 ## 文件目的
 
-TokenBar consumes the public [`tokscale-core`](https://github.com/Nanako0129/tokscale-core) engine through the pinned `vendor/tokscale-core` submodule. This document explains the consumer boundary and the method for safely aligning the shared engine. The exact upstream baseline, commit table, local patch table, and upstream report numbers for TokenBar's current reviewed pin live in the engine's immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/84e0d66413d4e0d87b734f66f7a848b3bc323258/UPSTREAM.md); [`vendor/README.md`](../../vendor/README.md) records TokenBar's source and pin. Newer engine work is not part of TokenBar until a separate consumer change advances that gitlink and passes the consumer gates.
+TokenBar consumes the public [`tokscale-core`](https://github.com/Nanako0129/tokscale-core) engine through the pinned `vendor/tokscale-core` submodule. This document explains the consumer boundary and the method for safely aligning the shared engine. The exact upstream baseline, commit table, local patch table, and upstream report numbers for TokenBar's current reviewed pin live in the engine's immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/5b5f500d3a8abe66ab5fa44b18f4fc1aaee53947/UPSTREAM.md); [`vendor/README.md`](../../vendor/README.md) records TokenBar's source and pin. Newer engine work is not part of TokenBar until a separate consumer change advances that gitlink and passes the consumer gates.
 
 ## 目錄
 
@@ -32,7 +32,7 @@ The engine's true baseline is recorded in `tokscale-core/UPSTREAM.md`; the Cargo
 
 > **不要在 consumer branch 直接改 submodule source。** Shared Rust changes first land and pass review in `tokscale-core`; TokenBar then advances only the reviewed gitlink and runs its consumer gates. A clean build alone cannot prove that streaming or cache semantics were preserved.
 
-兩個 consumer 現在都 pin reviewed engine commit `84e0d66413d4e0d87b734f66f7a848b3bc323258`。這只證明兩邊採用同一份 shared source，不構成 cross-port parity 主張，也不取代 cross-check 這道跨語言 gate；兩個 consumer 仍各自擁有 FFI、C header、Swift／C# bridge 與 build surfaces。Shared Rust changes land in the engine first；each consumer then advances its gitlink and runs its own app gates, while app-owned ABI changes are ported and independently cross-checked. See [`architecture.md`](architecture.md#windows-downstream-consumer) and the completed [`shared-rust-engine-extraction.md`](plans/shared-rust-engine-extraction.md).
+Native 現在 pin reviewed engine commit `5b5f500d3a8abe66ab5fa44b18f4fc1aaee53947`（Claude transcript-rewrite retention、claude／codex lane 批次平行解析），Windows 仍在 `84e0d66413d4e0d87b734f66f7a848b3bc323258`。這段落差目前不阻塞 Windows：`5546bd5` 帶進的 `DailyContribution.turns_by_client` 是 additive 且 `#[serde(default)]`，未認得它的 decoder 仍可解；而 `5546bd5` 到 `5b5f500` 之間**沒有 serde 可見的報表欄位變動**（改動落在 cache 格式與掃描排程），所以 Windows 的 payload 解析不受影響。同 pin 時也只證明兩邊採用同一份 shared source，不構成 cross-port parity 主張，也不取代 cross-check 這道跨語言 gate；兩個 consumer 仍各自擁有 FFI、C header、Swift／C# bridge 與 build surfaces。Shared Rust changes land in the engine first；each consumer then advances its gitlink and runs its own app gates, while app-owned ABI changes are ported and independently cross-checked. See [`architecture.md`](architecture.md#windows-downstream-consumer) and the completed [`shared-rust-engine-extraction.md`](plans/shared-rust-engine-extraction.md).
 
 ### Grok attribution adoption
 

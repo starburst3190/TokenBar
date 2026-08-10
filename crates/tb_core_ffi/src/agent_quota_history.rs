@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use crate::agent_account_scope::HistoryScope;
 use crate::agent_quota_duration::{
     self, observe_reset, valid_duration, DurationEvidence, DurationResolution, DurationSource,
     DurationUnavailableReason, ObservedState,
@@ -13,7 +14,7 @@ use crate::agent_quota_duration::{
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
@@ -38,21 +39,13 @@ pub(crate) const RETENTION_MIN_CYCLES: usize = 8;
 pub(crate) const RETENTION_MAX_CYCLES: usize = 128;
 pub(crate) const RUNOUT_THRESHOLD_PERCENT: f64 = 100.0 - 1e-9;
 pub(crate) const EPSILON: f64 = 1e-9;
-/// How far a persisted `last_activity_at` may lead this transaction's clock
-/// before the series stops being trustworthy evidence.
-///
-/// A store written by an earlier transaction can legitimately carry a timestamp
-/// this one has not reached yet: the wall clock steps backwards on an NTP
-/// correction or a sleep/wake, and `observation_now` is captured before a
-/// provider run that may outlive the step. That is a clock event, not file
-/// corruption — every sample in the file is still exactly what the provider
-/// reported. Treating it as corruption discarded the whole store (all
-/// providers, weeks of samples) over a few seconds of skew, so ordinary skew is
-/// now absorbed here and only a lead this large costs a series its history.
-pub(crate) const CLOCK_SKEW_TOLERANCE_SECONDS: i64 = 900;
 
 static HISTORY_PROCESS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static SAVE_CALL_COUNT: Cell<u64> = Cell::new(0);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StorageMode {
@@ -73,6 +66,7 @@ pub(crate) enum HistoryError {
     LockAcquire,
     LockRelease,
     Read,
+    Corrupt,
     CorruptQuarantine,
     InvalidSeriesKey,
     StoreCapacity,
@@ -88,6 +82,7 @@ impl std::fmt::Display for HistoryError {
             Self::LockAcquire => "quota pace lock could not be acquired",
             Self::LockRelease => "quota pace lock could not be released",
             Self::Read => "quota pace history could not be read",
+            Self::Corrupt => "quota pace history is corrupt and was quarantined",
             Self::CorruptQuarantine => "quota pace history could not be quarantined",
             Self::InvalidSeriesKey => "quota pace series key is invalid",
             Self::StoreCapacity => "quota pace history store capacity is exhausted",
@@ -108,15 +103,31 @@ pub(crate) struct SeriesKey {
 }
 
 impl SeriesKey {
+    /// The scope argument is a `HistoryScope`, never an `AccountScope`: a key
+    /// that outlives a credential rotation cannot be derived from the credential.
+    /// The persisted field name stays `accountScope` because the store's schema
+    /// is frozen at version 3.
     pub(crate) fn new(
         provider_id: impl Into<String>,
-        account_scope: impl Into<String>,
+        history_scope: &HistoryScope,
         window_key: impl Into<String>,
     ) -> Self {
         Self {
             provider_id: provider_id.into(),
-            account_scope: account_scope.into(),
+            account_scope: history_scope.as_str().to_string(),
             window_key: window_key.into(),
+        }
+    }
+
+    /// Rebuild a key from strings already persisted in the store. This is not
+    /// choosing a scope, so it deliberately does not go through `HistoryScope`;
+    /// giving `HistoryScope` a string constructor would reopen the hole `new`
+    /// closes.
+    fn from_stored_parts(provider_id: &str, account_scope: &str, window_key: &str) -> Self {
+        Self {
+            provider_id: provider_id.to_string(),
+            account_scope: account_scope.to_string(),
+            window_key: window_key.to_string(),
         }
     }
 
@@ -173,11 +184,7 @@ impl SeriesState {
     }
 
     fn key(&self) -> SeriesKey {
-        SeriesKey::new(
-            self.provider_id.clone(),
-            self.account_scope.clone(),
-            self.window_key.clone(),
-        )
+        SeriesKey::from_stored_parts(&self.provider_id, &self.account_scope, &self.window_key)
     }
 }
 
@@ -416,10 +423,7 @@ struct LegacyV2Store {
 #[derive(Debug)]
 struct LoadedStore {
     store: Store,
-    /// Set when the loaded store is not what the file held: the file was
-    /// quarantined and this value must be written back even if the transaction
-    /// body changes nothing, or the surviving series would be lost with it.
-    repaired: bool,
+    quarantined: bool,
 }
 
 /// Record a provider-neutral quota observation in the production v3 store.
@@ -472,12 +476,59 @@ pub(crate) fn production_history_path() -> Option<PathBuf> {
     Some(directory.join(HISTORY_FILE_NAME))
 }
 
+pub(crate) fn read_series_at_path(
+    key: &SeriesKey,
+    path: &Path,
+    now: i64,
+) -> Result<Option<SeriesState>, HistoryError> {
+    read_series_at_path_with_mode(StorageMode::Generic, key, path, now)
+}
+
+pub(crate) fn read_series(key: &SeriesKey, now: i64) -> Result<Option<SeriesState>, HistoryError> {
+    let path = production_history_path().ok_or(HistoryError::StorageUnavailable)?;
+    read_series_at_path_with_mode(StorageMode::System, key, &path, now)
+}
+
+fn read_series_at_path_with_mode(
+    mode: StorageMode,
+    key: &SeriesKey,
+    path: &Path,
+    now: i64,
+) -> Result<Option<SeriesState>, HistoryError> {
+    if !key.is_valid() {
+        return Err(HistoryError::InvalidSeriesKey);
+    }
+    let directory = path.parent().ok_or(HistoryError::StorageUnavailable)?;
+    ensure_real_directory_with_mode(mode, directory)
+        .map_err(|_| HistoryError::StorageUnavailable)?;
+
+    let _process_guard = HISTORY_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock_file = open_history_lock(mode, &directory.join(HISTORY_LOCK_FILE_NAME))?;
+    let result = load_store_at_with_mode(mode, path, now, now).and_then(|loaded| {
+        if loaded.quarantined {
+            Err(HistoryError::Corrupt)
+        } else {
+            Ok(find_target_series(&loaded.store, key).cloned())
+        }
+    });
+    let unlock = fs2::FileExt::unlock(&lock_file).map_err(|_| HistoryError::LockRelease);
+    match (result, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(series), Ok(())) => Ok(series),
+    }
+}
+
 /// Import only the legacy Codex records bound to the account ID used by the
-/// successful request. The caller supplies the already-resolved opaque scope;
-/// this API never turns a legacy raw key into a v3 scope.
+/// successful request. The caller supplies the already-resolved opaque history
+/// scope — the same one the live recording path keys on, so imported samples
+/// cannot land in a series the live path never touches again — and this API
+/// never turns a legacy raw key into a v3 scope.
 pub(crate) fn migrate_codex_v2(
     request_account_id: &str,
-    account_scope: &str,
+    history_scope: &HistoryScope,
     now: i64,
 ) -> Result<MigrationOutcome, HistoryError> {
     let Some(preferred) = dirs::data_dir().map(|directory| directory.join("com.nyanako.tokenbar"))
@@ -491,7 +542,7 @@ pub(crate) fn migrate_codex_v2(
     let destination = preferred.clone();
     migrate_codex_v2_at_paths_with_clock_and_mode(
         request_account_id,
-        account_scope,
+        history_scope,
         now,
         &preferred.join(LEGACY_V2_FILE_NAME),
         &destination.join(HISTORY_FILE_NAME),
@@ -502,14 +553,14 @@ pub(crate) fn migrate_codex_v2(
 
 pub(crate) fn migrate_codex_v2_at_paths(
     request_account_id: &str,
-    account_scope: &str,
+    history_scope: &HistoryScope,
     now: i64,
     v2_path: &Path,
     v3_path: &Path,
 ) -> Result<MigrationOutcome, HistoryError> {
     migrate_codex_v2_at_paths_with_clock_and_mode(
         request_account_id,
-        account_scope,
+        history_scope,
         now,
         v2_path,
         v3_path,
@@ -520,7 +571,7 @@ pub(crate) fn migrate_codex_v2_at_paths(
 
 fn migrate_codex_v2_at_paths_with_clock_and_mode(
     request_account_id: &str,
-    account_scope: &str,
+    history_scope: &HistoryScope,
     now: i64,
     v2_path: &Path,
     v3_path: &Path,
@@ -528,7 +579,7 @@ fn migrate_codex_v2_at_paths_with_clock_and_mode(
     transaction_clock: impl FnOnce() -> i64,
 ) -> Result<MigrationOutcome, HistoryError> {
     let accepted_account = request_account_id.trim();
-    if accepted_account.is_empty() || account_scope.trim().is_empty() {
+    if accepted_account.is_empty() || history_scope.as_str().trim().is_empty() {
         return Ok(MigrationOutcome {
             imported_samples: 0,
             skipped_samples: 0,
@@ -589,7 +640,7 @@ fn migrate_codex_v2_at_paths_with_clock_and_mode(
         });
     }
 
-    let key = SeriesKey::new("codex", account_scope.trim(), "main.weekly.v1");
+    let key = SeriesKey::new("codex", history_scope, "main.weekly.v1");
     if !key.is_valid() {
         return Err(HistoryError::InvalidSeriesKey);
     }
@@ -1489,34 +1540,82 @@ fn validate_store_at(store: &Store, now: i64) -> bool {
             .all(|series| series.last_activity_at <= now)
 }
 
-/// The largest `last_activity_at` this transaction will still vouch for.
-fn activity_ceiling(now: i64) -> i64 {
-    now.saturating_add(CLOCK_SKEW_TOLERANCE_SECONDS)
+/// The activity timestamp `validate_series`'s `activity_valid` holds a
+/// rollover to, per variant. `Candidate` has no `last_seen_at`; its activity
+/// timestamp is `first_new_seen_at`. Cycle boundaries (`reset_at`,
+/// `new_reset_at`, `old_reset_at`, `cycle_started_at`) are deliberately not
+/// consulted here — see the module-level design note on `repair_store_at`.
+fn rollover_activity_at(rollover: &ObservedState) -> i64 {
+    match rollover {
+        ObservedState::Watching { last_seen_at, .. }
+        | ObservedState::Ready { last_seen_at, .. } => *last_seen_at,
+        ObservedState::Candidate {
+            first_new_seen_at, ..
+        } => *first_new_seen_at,
+    }
 }
 
-/// Separate a structurally broken store from one that is merely ahead of this
-/// clock.
+/// Repair a structurally valid store (`validate_store` already passed) whose
+/// clock disagrees with the reading transaction: some series' derived
+/// timestamps lead `upper_bound`. Structural failures never reach this
+/// function; they still quarantine at the call site.
 ///
-/// Structural failure — schema version, series ordering, sample validity,
-/// per-cycle caps, rollover coherence, activity behind its own samples — is
-/// corruption: the caller quarantines and starts empty. A series whose
-/// `last_activity_at` leads [`activity_ceiling`] is not corrupt, it is
-/// unverifiable by this clock, so only that series is dropped and every other
-/// provider keeps its history.
+/// Every detection threshold below is `upper_bound` — the same ceiling
+/// `validate_store_at` failed against, which is what "leads the ceiling"
+/// means. Only the clamp target is `observation_now`: `is_stale_observation`
+/// compares against `observation_now`, so clamping to `upper_bound` would
+/// leave a repaired series' clock above the transaction body's clock, reject
+/// this poll's observation as stale, and repeat identically on every future
+/// load. Rollover detection only ever looks at activity timestamps
+/// (`rollover_activity_at`), never at cycle boundaries: `reset_at` and
+/// friends are future boundaries that lead `upper_bound` in essentially
+/// every healthy rollover, and including them would drop every in-flight
+/// rollover on every load.
 ///
-/// Returns the recovered store and how many series it lost, or `None` when the
-/// store is structurally invalid.
-fn recover_store_at(mut store: Store, now: i64) -> Option<(Store, usize)> {
-    if !validate_store(&store) {
-        return None;
+/// **Precondition: `observation_now <= upper_bound`.** Every current caller
+/// satisfies it — the transaction passes `observation_now.max(lock_time)` as
+/// the ceiling, and the two read paths pass the same value for both. A caller
+/// that broke it could produce a clamped `last_activity_at` above the ceiling,
+/// which the post-body `validate_store_at` would reject, failing the whole
+/// transaction for every provider rather than just one series.
+fn repair_store_at(mut store: Store, upper_bound: i64, observation_now: i64) -> Store {
+    debug_assert!(
+        observation_now <= upper_bound,
+        "repair_store_at requires observation_now <= upper_bound"
+    );
+    // A series whose own sample evidence leads the ceiling cannot be
+    // verified against any clock the reader trusts; drop it wholesale so a
+    // sibling's history is not held hostage by it.
+    store.series.retain(|series| {
+        !series
+            .samples
+            .iter()
+            .any(|sample| sample.sampled_at > upper_bound)
+    });
+
+    for series in &mut store.series {
+        if series.last_activity_at <= upper_bound {
+            continue; // gated: a series at or below the ceiling is untouched
+        }
+        if series
+            .rollover
+            .as_ref()
+            .is_some_and(|rollover| rollover_activity_at(rollover) > upper_bound)
+        {
+            series.rollover = None;
+        }
+        let floor = series
+            .samples
+            .iter()
+            .map(|sample| sample.sampled_at)
+            .max()
+            .into_iter()
+            .chain(series.rollover.as_ref().map(rollover_activity_at))
+            .max();
+        let clamped = series.last_activity_at.min(observation_now);
+        series.last_activity_at = floor.map_or(clamped, |floor| floor.max(clamped));
     }
-    let ceiling = activity_ceiling(now);
-    let before = store.series.len();
     store
-        .series
-        .retain(|series| series.last_activity_at <= ceiling);
-    let dropped = before - store.series.len();
-    Some((store, dropped))
 }
 
 fn duration_for_resolution(resolution: DurationResolution) -> Option<i64> {
@@ -2778,16 +2877,12 @@ fn with_locked_transaction_with_save_and_mode<T>(
     let result = match loaded {
         Ok(mut loaded) => {
             let before = loaded.store.clone();
-            let repaired = loaded.repaired;
             let result = body(&mut loaded.store);
             match result {
                 Ok(value) => {
-                    // The load already absorbed skew up to the tolerance, so the
-                    // post-body check has to accept the same range or a store it
-                    // just admitted would fail on the way out.
-                    if !validate_store_at(&loaded.store, activity_ceiling(upper_bound)) {
+                    if !validate_store_at(&loaded.store, upper_bound) {
                         Err(HistoryError::Serialize)
-                    } else if loaded.store == before && !repaired {
+                    } else if loaded.store == before {
                         Ok(value)
                     } else if save(path, &loaded.store).is_err() {
                         Err(HistoryError::AtomicSave)
@@ -2844,30 +2939,22 @@ fn load_store_at_with_mode(
     let Some(bytes) = read_owner_only_with_mode(mode, path).map_err(|_| HistoryError::Read)? else {
         return Ok(LoadedStore {
             store: Store::default(),
-            repaired: false,
+            quarantined: false,
         });
     };
 
-    let recovered = serde_json::from_slice::<Store>(&bytes)
+    let parsed = serde_json::from_slice::<Store>(&bytes)
         .ok()
-        .and_then(|store| recover_store_at(store, validation_now));
-    if let Some((store, dropped)) = recovered {
-        if dropped == 0 {
-            return Ok(LoadedStore {
-                store,
-                repaired: false,
-            });
-        }
-        // Structurally sound, but at least one series is dated past what this
-        // clock can vouch for. Keep the whole file as forensic evidence — the
-        // quarantine copy is what a later investigation reads — then carry on
-        // with the series that are still verifiable instead of resetting every
-        // provider's history.
-        quarantine_corrupt_with_mode(mode, path, quarantine_now)
-            .map_err(|_| HistoryError::CorruptQuarantine)?;
+        .filter(|store| validate_store(store));
+    if let Some(store) = parsed {
+        let store = if validate_store_at(&store, validation_now) {
+            store
+        } else {
+            repair_store_at(store, validation_now, quarantine_now)
+        };
         return Ok(LoadedStore {
             store,
-            repaired: true,
+            quarantined: false,
         });
     }
 
@@ -2875,7 +2962,7 @@ fn load_store_at_with_mode(
         .map_err(|_| HistoryError::CorruptQuarantine)?;
     Ok(LoadedStore {
         store: Store::default(),
-        repaired: false,
+        quarantined: true,
     })
 }
 
@@ -2984,6 +3071,8 @@ where
 }
 
 fn save_store_atomic_with_mode(mode: StorageMode, path: &Path, store: &Store) -> io::Result<()> {
+    #[cfg(test)]
+    SAVE_CALL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     #[cfg(target_os = "windows")]
     if mode.uses_windows_secure_storage() {
         return save_store_atomic_windows_secure_with_replace(
@@ -2999,6 +3088,16 @@ fn save_store_atomic_with_mode(mode: StorageMode, path: &Path, store: &Store) ->
         |temp, destination| tokscale_core::fs_atomic::replace_file(temp, destination),
         |directory| sync_directory_with_mode(mode, directory),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn save_call_count() -> u64 {
+    SAVE_CALL_COUNT.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_save_call_count() {
+    SAVE_CALL_COUNT.with(|count| count.set(0));
 }
 
 #[cfg(target_os = "windows")]
@@ -3316,6 +3415,19 @@ fn rollback_quarantine_link(path: &Path, source: &File) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Mechanical bridge for fixtures that only need a distinct scope identity.
+    fn test_key(
+        provider_id: impl Into<String>,
+        history_scope: impl AsRef<str>,
+        window_key: impl Into<String>,
+    ) -> SeriesKey {
+        SeriesKey::new(
+            provider_id,
+            &HistoryScope::for_test(history_scope.as_ref()),
+            window_key,
+        )
+    }
     use super::*;
     use chrono::Utc;
     #[cfg(target_os = "windows")]
@@ -3381,7 +3493,7 @@ mod tests {
     }
 
     fn key(account: &str) -> SeriesKey {
-        SeriesKey::new("copilot", account, "premium_interactions.v1")
+        test_key("copilot", account, "premium_interactions.v1")
     }
 
     fn temp_path(label: &str) -> (PathBuf, PathBuf) {
@@ -3825,7 +3937,7 @@ mod tests {
         duration_seconds: i64,
         cycles: usize,
     ) -> SeriesState {
-        let key = SeriesKey::new(provider_id, account_scope, window_key);
+        let key = test_key(provider_id, account_scope, window_key);
         let mut samples = Vec::new();
         for offset in 1..=cycles {
             samples.extend(complete_cycle(
@@ -4622,7 +4734,7 @@ mod tests {
             assert_eq!(
                 migrate_codex_v2_at_paths_with_clock_and_mode(
                     "acct",
-                    "opaque-scope",
+                    &HistoryScope::for_test("opaque-scope"),
                     now,
                     &v2_path,
                     &v3_path,
@@ -4657,7 +4769,7 @@ mod tests {
             assert_eq!(
                 migrate_codex_v2_at_paths_with_clock_and_mode(
                     "acct",
-                    "opaque-scope",
+                    &HistoryScope::for_test("opaque-scope"),
                     now,
                     &v2_path,
                     &v3_path,
@@ -4696,7 +4808,7 @@ mod tests {
             assert_eq!(
                 migrate_codex_v2_at_paths_with_clock_and_mode(
                     "acct",
-                    "opaque-scope",
+                    &HistoryScope::for_test("opaque-scope"),
                     now,
                     &v2_path,
                     &v3_path,
@@ -4738,7 +4850,7 @@ mod tests {
             assert_eq!(
                 migrate_codex_v2_at_paths_with_clock_and_mode(
                     "acct",
-                    "opaque-scope",
+                    &HistoryScope::for_test("opaque-scope"),
                     now,
                     &v2_path,
                     &v3_path,
@@ -4774,7 +4886,7 @@ mod tests {
             assert_eq!(
                 migrate_codex_v2_at_paths_with_clock_and_mode(
                     "acct",
-                    "opaque-scope",
+                    &HistoryScope::for_test("opaque-scope"),
                     now,
                     &v2_path,
                     &v3_path,
@@ -4836,7 +4948,7 @@ mod tests {
         assert_eq!(
             migrate_codex_v2_at_paths_with_clock_and_mode(
                 "acct",
-                "opaque-scope",
+                &HistoryScope::for_test("opaque-scope"),
                 now,
                 &v2_path,
                 &v3_path,
@@ -5874,15 +5986,24 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    /// A backwards clock step (NTP correction, sleep/wake) leaves the store
-    /// dated slightly ahead of the transaction that reads it next. That is not
-    /// corruption, so nothing is quarantined and no history is lost.
     #[test]
-    fn small_clock_skew_preserves_history_without_quarantine() {
-        let (directory, path) = temp_path("small-skew");
+    fn future_last_activity_is_repaired_not_quarantined() {
+        // This used to be the pre-repair quarantine fixture: a purely
+        // structural false-alarm — a metadata-only clock lead, no future
+        // sample, no rollover — that used to discard the sample below along
+        // with the rest of the store. The loader now repairs it in place.
+        let (directory, path) = temp_path("future-activity");
         let now = 16_000_000;
         let lock_time = now + 1;
         let reset = now + DAY;
+        let existing_sample = QuotaSample {
+            reset_at: reset,
+            duration_seconds: DAY,
+            duration_source: DurationSource::Provider,
+            used_percent: 10.0,
+            sampled_at: now,
+            origin: SampleOrigin::LiveV3,
+        };
         let store = Store {
             schema_version: HISTORY_SCHEMA_VERSION,
             series: vec![SeriesState {
@@ -5892,120 +6013,39 @@ mod tests {
                 active_reset_at: Some(reset),
                 last_activity_at: lock_time + 1,
                 rollover: None,
-                samples: vec![QuotaSample {
-                    reset_at: reset,
-                    duration_seconds: DAY,
-                    duration_source: DurationSource::Provider,
-                    used_percent: 10.0,
-                    sampled_at: now,
-                    origin: SampleOrigin::LiveV3,
-                }],
+                samples: vec![existing_sample.clone()],
             }],
-        };
-        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
-
-        record_at_lock_time(&path, "acct", Some(reset), 10.0, now, None, None, lock_time);
-
-        assert!(!directory
-            .join(format!("quota-pace-history-v3.corrupt-{now}.json"))
-            .exists());
-        let recovered = read_store(&path);
-        assert_eq!(recovered.series.len(), 1);
-        assert_eq!(recovered.series[0].active_reset_at, Some(reset));
-        assert_eq!(recovered.series[0].samples, store.series[0].samples);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    /// Past the tolerance the series is no longer verifiable by this clock, so
-    /// it loses its history — but the file is kept as evidence and every other
-    /// series in it survives untouched.
-    #[test]
-    fn far_future_series_is_dropped_while_other_series_keep_history() {
-        let (directory, path) = temp_path("far-future-activity");
-        let now = 16_000_000;
-        let lock_time = now + 1;
-        let reset = now + DAY;
-        let sample = QuotaSample {
-            reset_at: reset,
-            duration_seconds: DAY,
-            duration_source: DurationSource::Provider,
-            used_percent: 10.0,
-            sampled_at: now,
-            origin: SampleOrigin::LiveV3,
-        };
-        let series = |account: &str, last_activity_at: i64| SeriesState {
-            provider_id: "copilot".into(),
-            account_scope: account.into(),
-            window_key: "premium_interactions.v1".into(),
-            active_reset_at: Some(reset),
-            last_activity_at,
-            rollover: None,
-            samples: vec![sample.clone()],
-        };
-        let store = Store {
-            schema_version: HISTORY_SCHEMA_VERSION,
-            series: vec![
-                series("acct", activity_ceiling(lock_time) + 1),
-                series("other", now),
-            ],
         };
         let bytes = serde_json::to_vec_pretty(&store).unwrap();
         fs::write(&path, &bytes).unwrap();
 
-        record_at_lock_time(&path, "acct", Some(reset), 10.0, now, None, None, lock_time);
-
         assert_eq!(
-            fs::read(directory.join(format!("quota-pace-history-v3.corrupt-{now}.json"))).unwrap(),
-            bytes
+            record_at_lock_time(&path, "acct", Some(reset), 10.0, now, None, None, lock_time,),
+            HistoryOutcome::LearningDuration
+        );
+        assert!(
+            !directory
+                .join(format!("quota-pace-history-v3.corrupt-{now}.json"))
+                .exists(),
+            "a purely metadata-ahead series must not quarantine the store"
         );
         let recovered = read_store(&path);
-        let untouched = recovered
-            .series
-            .iter()
-            .find(|series| series.account_scope == "other")
-            .expect("an unrelated series must survive another series' clock anomaly");
-        assert_eq!(untouched.samples, vec![sample]);
-        assert_eq!(untouched.last_activity_at, now);
-        let rebuilt = recovered
-            .series
-            .iter()
-            .find(|series| series.account_scope == "acct")
-            .expect("the dropped series is rebuilt by the observation that follows");
-        assert_eq!(rebuilt.active_reset_at, None);
-        assert!(rebuilt.samples.is_empty());
+        assert_eq!(recovered.series.len(), 1);
+        assert_eq!(recovered.series[0].active_reset_at, Some(reset));
+        assert_eq!(
+            recovered.series[0].samples,
+            vec![existing_sample],
+            "the pre-existing sample must survive the repair"
+        );
+        assert!(matches!(
+            recovered.series[0].rollover,
+            Some(ObservedState::Watching {
+                reset_at,
+                consecutive_count: 1,
+                ..
+            }) if reset_at == reset
+        ));
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn recovery_keeps_the_tolerance_boundary_and_drops_one_second_past_it() {
-        let now = 16_000_000;
-        let reset = now + DAY;
-        let series = |last_activity_at: i64| SeriesState {
-            provider_id: "copilot".into(),
-            account_scope: "acct".into(),
-            window_key: "premium_interactions.v1".into(),
-            active_reset_at: Some(reset),
-            last_activity_at,
-            rollover: None,
-            samples: Vec::new(),
-        };
-        let store = |last_activity_at: i64| Store {
-            schema_version: HISTORY_SCHEMA_VERSION,
-            series: vec![series(last_activity_at)],
-        };
-
-        let (kept, dropped) = recover_store_at(store(activity_ceiling(now)), now).unwrap();
-        assert_eq!(dropped, 0);
-        assert_eq!(kept.series.len(), 1);
-
-        let (emptied, dropped) = recover_store_at(store(activity_ceiling(now) + 1), now).unwrap();
-        assert_eq!(dropped, 1);
-        assert!(emptied.series.is_empty());
-
-        // Structural corruption is still corruption, not a clock anomaly.
-        let mut malformed = store(now);
-        malformed.schema_version = HISTORY_SCHEMA_VERSION + 1;
-        assert!(recover_store_at(malformed, now).is_none());
     }
 
     #[test]
@@ -6063,13 +6103,637 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    // --- Clock disagreement is repaired per series, not quarantined
+    // wholesale. Contract and the four cross-baseline traps that shaped it:
+    // docs/knowledge/plans/provider-quota-pace.md, section
+    // "Clock disagreement is repaired, not quarantined".
+    // section 4 for the design this fixture set proves.
+
+    fn watching_rollover(reset_at: i64, first_seen_at: i64, last_seen_at: i64) -> ObservedState {
+        ObservedState::Watching {
+            reset_at,
+            first_seen_at,
+            last_seen_at,
+            consecutive_count: 1,
+        }
+    }
+
+    #[test]
+    fn clock_lead_incident_both_series_survive_with_every_sample_and_no_quarantine() {
+        let (directory, path) = temp_path("clock-incident");
+        let upper_bound = 20_000_000;
+        let observation_now = upper_bound;
+        let cycle_started_at = upper_bound - 3 * HOUR;
+        let duration_seconds = 5 * HOUR;
+        let reset = cycle_started_at + duration_seconds;
+
+        let session_samples = vec![
+            quota_sample(reset, duration_seconds, 0.10, 12.0, SampleOrigin::LiveV3),
+            quota_sample(reset, duration_seconds, 0.30, 30.0, SampleOrigin::LiveV3),
+            quota_sample(reset, duration_seconds, 0.55, 55.0, SampleOrigin::LiveV3),
+        ];
+        let session = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "session.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at: session_samples.iter().map(|s| s.sampled_at).max().unwrap(),
+            rollover: None,
+            samples: session_samples.clone(),
+        };
+
+        let weekly_samples = vec![
+            quota_sample(reset, duration_seconds, 0.20, 20.0, SampleOrigin::LiveV3),
+            quota_sample(reset, duration_seconds, 0.45, 48.0, SampleOrigin::LiveV3),
+        ];
+        let lead_activity = upper_bound + 48;
+        let weekly = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "weekly.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at: lead_activity,
+            rollover: Some(watching_rollover(reset, lead_activity - 120, lead_activity)),
+            samples: weekly_samples.clone(),
+        };
+
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![session.clone(), weekly],
+        };
+        store.series.sort_by(series_order);
+        assert!(!validate_store_at(&store, upper_bound)); // fails before the fix
+        let bytes = serde_json::to_vec_pretty(&store).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let loaded =
+            load_store_at_with_mode(StorageMode::Generic, &path, upper_bound, observation_now)
+                .unwrap();
+        assert!(!loaded.quarantined);
+        assert!(validate_store_at(&loaded.store, upper_bound)); // passes after the fix
+        assert!(!directory
+            .join(format!(
+                "quota-pace-history-v3.corrupt-{observation_now}.json"
+            ))
+            .exists());
+
+        let recovered_session = loaded
+            .store
+            .series
+            .iter()
+            .find(|s| s.window_key == "session.v1")
+            .unwrap();
+        assert_eq!(
+            *recovered_session, session,
+            "sibling series must be untouched, field for field"
+        );
+
+        let recovered_weekly = loaded
+            .store
+            .series
+            .iter()
+            .find(|s| s.window_key == "weekly.v1")
+            .unwrap();
+        assert_eq!(
+            recovered_weekly.samples, weekly_samples,
+            "every sample survives"
+        );
+        assert_eq!(recovered_weekly.samples.len(), 2);
+        assert!(recovered_weekly.last_activity_at <= upper_bound);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn future_sample_evidence_drops_only_that_series() {
+        let (directory, path) = temp_path("clock-future-sample");
+        let upper_bound = 21_000_000;
+        let observation_now = upper_bound;
+        let reset = upper_bound + DAY;
+
+        let healthy_samples = vec![quota_sample(
+            reset,
+            2 * DAY,
+            0.10,
+            10.0,
+            SampleOrigin::LiveV3,
+        )];
+        let healthy = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "session.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at: healthy_samples[0].sampled_at,
+            rollover: None,
+            samples: healthy_samples.clone(),
+        };
+
+        // This sample's own sampled_at leads the ceiling, which forces
+        // last_activity_at (>= every sample) to lead it too, per
+        // activity_valid — this series is structurally valid but
+        // unverifiable, not merely metadata-ahead.
+        let tainted_sample = QuotaSample {
+            reset_at: reset,
+            duration_seconds: 2 * DAY,
+            duration_source: DurationSource::Provider,
+            used_percent: 40.0,
+            sampled_at: upper_bound + 5,
+            origin: SampleOrigin::LiveV3,
+        };
+        let tainted = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "weekly.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at: tainted_sample.sampled_at,
+            rollover: None,
+            samples: vec![tainted_sample],
+        };
+
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![healthy.clone(), tainted],
+        };
+        store.series.sort_by(series_order);
+        assert!(!validate_store_at(&store, upper_bound));
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+        let loaded =
+            load_store_at_with_mode(StorageMode::Generic, &path, upper_bound, observation_now)
+                .unwrap();
+        assert!(!loaded.quarantined);
+        assert!(validate_store_at(&loaded.store, upper_bound));
+        assert_eq!(loaded.store.series.len(), 1);
+        assert_eq!(loaded.store.series[0], healthy, "sibling is untouched");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollover_drop_per_variant_keeps_every_sample() {
+        let (directory, path) = temp_path("clock-rollover-variants");
+        let upper_bound = 22_000_000;
+        let observation_now = upper_bound;
+        let lead = upper_bound + 30;
+        let reset = upper_bound + DAY;
+
+        let sample = || quota_sample(reset, 2 * DAY, 0.10, 10.0, SampleOrigin::LiveV3);
+
+        let watching = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "watching.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at: lead,
+            rollover: Some(watching_rollover(reset, lead - 100, lead)),
+            samples: vec![sample()],
+        };
+
+        // Ready's confirmed_at must land within ROLLOVER_GRACE_SECONDS of its
+        // own cycle_started_at (not of `lead`), so this cycle is built with
+        // its own well-separated reset rather than reusing `reset`.
+        let ready_cycle_started_at = upper_bound - DAY;
+        let ready_duration_seconds = 3 * DAY;
+        let ready_reset_at = ready_cycle_started_at + ready_duration_seconds;
+        let ready = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "ready.v1".into(),
+            active_reset_at: Some(ready_reset_at),
+            last_activity_at: lead,
+            rollover: Some(ObservedState::Ready {
+                cycle_started_at: ready_cycle_started_at,
+                reset_at: ready_reset_at,
+                duration_seconds: ready_duration_seconds,
+                confirmed_at: ready_cycle_started_at + 50,
+                last_seen_at: lead,
+            }),
+            samples: vec![sample()],
+        };
+
+        // Candidate has no last_seen_at at all; its activity timestamp for
+        // activity_valid is first_new_seen_at. Its confirmation window is
+        // ROLLOVER_GRACE_SECONDS around old_reset_at, so old_reset_at must
+        // sit close to upper_bound for first_new_seen_at (== lead, beyond
+        // upper_bound) to still fall inside that window.
+        let old_reset = upper_bound - 100;
+        let candidate = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "candidate.v1".into(),
+            active_reset_at: None,
+            last_activity_at: lead,
+            rollover: Some(ObservedState::Candidate {
+                old_reset_at: old_reset,
+                old_seen_at: old_reset - 60,
+                new_reset_at: reset,
+                first_new_seen_at: lead,
+            }),
+            samples: vec![sample()],
+        };
+
+        for series in [watching, ready, candidate] {
+            let store = Store {
+                schema_version: HISTORY_SCHEMA_VERSION,
+                series: vec![series.clone()],
+            };
+            assert!(!validate_store_at(&store, upper_bound));
+            fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+            let loaded =
+                load_store_at_with_mode(StorageMode::Generic, &path, upper_bound, observation_now)
+                    .unwrap();
+            assert!(!loaded.quarantined, "{}", series.window_key);
+            assert!(
+                validate_store_at(&loaded.store, upper_bound),
+                "{}",
+                series.window_key
+            );
+            assert_eq!(loaded.store.series.len(), 1, "{}", series.window_key);
+            assert!(
+                loaded.store.series[0].rollover.is_none(),
+                "{} rollover must be dropped",
+                series.window_key
+            );
+            assert_eq!(
+                loaded.store.series[0].samples, series.samples,
+                "{} keeps every sample",
+                series.window_key
+            );
+        }
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repaired_series_resumes_recording_in_same_transaction() {
+        let (directory, path) = temp_path("clock-resume-same-txn");
+        let observation_now = 23_000_000;
+        let lock_time = observation_now + 500;
+        let upper_bound = lock_time;
+        let reset = observation_now + DAY;
+        let duration_seconds = 2 * DAY;
+
+        let existing_sample = QuotaSample {
+            reset_at: reset,
+            duration_seconds,
+            duration_source: DurationSource::Provider,
+            used_percent: 5.0,
+            // Far enough from observation_now to land in a different
+            // phase bucket, so the new poll adds a sample rather than
+            // updating this one in place.
+            sampled_at: observation_now - 50_000,
+            origin: SampleOrigin::LiveV3,
+        };
+        let series = SeriesState {
+            provider_id: "copilot".into(),
+            account_scope: "acct".into(),
+            window_key: "premium_interactions.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at: upper_bound + 10, // leads the ceiling
+            rollover: None,
+            samples: vec![existing_sample.clone()],
+        };
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series],
+        };
+        assert!(!validate_store_at(&store, upper_bound));
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+        let outcome = record_at_lock_time(
+            &path,
+            "acct",
+            Some(reset),
+            10.0,
+            observation_now,
+            provider(reset, duration_seconds),
+            None,
+            lock_time,
+        );
+        assert!(
+            !matches!(outcome, HistoryOutcome::Ready { sampled: false, .. })
+                && !matches!(outcome, HistoryOutcome::Unavailable(_)),
+            "the repaired series must accept this poll's observation, got {outcome:?}"
+        );
+        assert!(!directory
+            .join(format!(
+                "quota-pace-history-v3.corrupt-{observation_now}.json"
+            ))
+            .exists());
+
+        let recovered = read_store(&path);
+        assert_eq!(recovered.series.len(), 1);
+        assert_eq!(
+            recovered.series[0].samples.len(),
+            2,
+            "recovery must not depend on any sibling series changing"
+        );
+        assert!(recovered.series[0]
+            .samples
+            .iter()
+            .any(|sample| sample.sampled_at == observation_now));
+        assert!(recovered.series[0].samples.contains(&existing_sample));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repair_floor_binds_for_a_surviving_sample() {
+        let upper_bound = 100;
+        let observation_now = 50;
+        let sample = QuotaSample {
+            reset_at: 1_000,
+            duration_seconds: 1_000,
+            duration_source: DurationSource::Provider,
+            used_percent: 10.0,
+            sampled_at: 80, // strictly between observation_now and upper_bound
+            origin: SampleOrigin::LiveV3,
+        };
+        let series = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "session.v1".into(),
+            active_reset_at: None,
+            last_activity_at: upper_bound + 5,
+            rollover: None,
+            samples: vec![sample],
+        };
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series],
+        };
+
+        let repaired = repair_store_at(store, upper_bound, observation_now);
+        assert_eq!(
+            repaired.series[0].last_activity_at, 80,
+            "floor must not clamp below the surviving sample"
+        );
+        assert!(validate_series(&repaired.series[0]));
+        assert!(validate_store_at(&repaired, upper_bound));
+    }
+
+    #[test]
+    fn repair_floor_binds_for_a_surviving_rollover() {
+        let upper_bound = 200;
+        let observation_now = 50;
+        let rollover_activity = 150; // strictly between observation_now and upper_bound
+        let far_reset = upper_bound + 10 * DAY; // a normal rollover's reset_at sits far beyond upper_bound
+        let series = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "weekly.v1".into(),
+            active_reset_at: Some(far_reset),
+            last_activity_at: upper_bound + 5,
+            rollover: Some(watching_rollover(
+                far_reset,
+                rollover_activity - 10,
+                rollover_activity,
+            )),
+            samples: Vec::new(),
+        };
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series],
+        };
+
+        let repaired = repair_store_at(store, upper_bound, observation_now);
+        assert!(
+            repaired.series[0].rollover.is_some(),
+            "the rollover itself survives detection"
+        );
+        assert_eq!(
+            repaired.series[0].last_activity_at, rollover_activity,
+            "floor must include the surviving rollover's activity timestamp"
+        );
+        assert!(validate_series(&repaired.series[0]));
+        assert!(validate_store_at(&repaired, upper_bound));
+    }
+
+    #[test]
+    fn repair_gate_leaves_a_series_at_or_below_the_ceiling_untouched_and_unsaved() {
+        let (directory, path) = temp_path("clock-gate");
+        let observation_now = 30_000_000;
+        let lock_time = observation_now + 100;
+        let upper_bound = lock_time;
+        let reset = observation_now + DAY;
+        // observation_now < last_activity_at <= upper_bound: a healthy band,
+        // e.g. a fresh SeriesState::new() from a faster concurrent writer.
+        // No active_reset_at/rollover/samples: retain_series clears a stray
+        // active_reset_at whenever both are empty, which would look like an
+        // unrelated mutation and defeat the "no save occurs" assertion below.
+        let series = SeriesState {
+            provider_id: "copilot".into(),
+            account_scope: "acct".into(),
+            window_key: "premium_interactions.v1".into(),
+            active_reset_at: None,
+            last_activity_at: observation_now + 50,
+            rollover: None,
+            samples: Vec::new(),
+        };
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series.clone()],
+        };
+        assert!(
+            validate_store_at(&store, upper_bound),
+            "this store is already healthy"
+        );
+        let original_bytes = serde_json::to_vec_pretty(&store).unwrap();
+        fs::write(&path, &original_bytes).unwrap();
+
+        // Not a substitute for this fixture: there floor == last_activity_at,
+        // so an ungated clamp would be a no-op and this gate's absence would
+        // be invisible.
+        let outcome = record_at_lock_time(
+            &path,
+            "acct",
+            Some(reset),
+            10.0,
+            observation_now,
+            provider(reset, DAY),
+            None,
+            lock_time,
+        );
+        assert!(
+            matches!(outcome, HistoryOutcome::Ready { sampled: false, .. })
+                || matches!(outcome, HistoryOutcome::LearningDuration),
+            "an untouched series is above the body's clock and must reject as stale, got {outcome:?}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original_bytes,
+            "a series at or below the ceiling must not be rewritten"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repair_gate_is_load_bearing_inside_repair_store_at() {
+        // The fixture above proves the end-to-end "no save" outcome, but for
+        // a *single-series* store that outcome holds even without the gate:
+        // load_store_at_with_mode only calls repair_store_at when
+        // validate_store_at already failed, which for one series means that
+        // series' own last_activity_at was the thing leading upper_bound.
+        //
+        // The gate is NOT dead code. In a multi-series store — the reported
+        // shape in #144, and any real store — series A can lead upper_bound
+        // and force the repair while sibling B sits in the healthy band
+        // (observation_now, upper_bound] left by a faster concurrent writer.
+        // Without the gate the loader lowers B's last_activity_at to
+        // observation_now, discarding a timestamp another writer committed:
+        // a lost update on the production path. Verified by driving a
+        // two-series store through load_store_at_with_mode with the gate
+        // removed. Do not delete it as unreachable.
+        //
+        // This test calls repair_store_at directly, which production never
+        // does for an already-healthy
+        // series, specifically to pin the internal gate: removing it must
+        // make this test fail even though no real load path currently can.
+        let upper_bound = 31_000_000;
+        let observation_now = upper_bound - 100;
+        let series = SeriesState {
+            provider_id: "copilot".into(),
+            account_scope: "acct".into(),
+            window_key: "premium_interactions.v1".into(),
+            active_reset_at: None,
+            last_activity_at: observation_now + 50, // within (observation_now, upper_bound]
+            rollover: None,
+            samples: Vec::new(),
+        };
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series.clone()],
+        };
+
+        let repaired = repair_store_at(store, upper_bound, observation_now);
+        assert_eq!(
+            repaired.series[0], series,
+            "a series at or below the ceiling must be returned untouched, field for field"
+        );
+    }
+
+    #[test]
+    fn healthy_store_with_far_future_reset_at_is_untouched_no_repair_no_save() {
+        let (directory, path) = temp_path("clock-healthy");
+        let upper_bound = 24_000_000;
+        let observation_now = upper_bound;
+        let far_reset = upper_bound + 30 * DAY; // days beyond upper_bound, as normal
+                                                // A cycle that started well before upper_bound, so the sample's own
+                                                // sampled_at (unlike the far-future reset_at boundary) stays behind
+                                                // the ceiling.
+        let sample = QuotaSample {
+            reset_at: far_reset,
+            duration_seconds: 60 * DAY,
+            duration_source: DurationSource::Provider,
+            used_percent: 8.0,
+            sampled_at: upper_bound - 20,
+            origin: SampleOrigin::LiveV3,
+        };
+        let series = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "weekly.v1".into(),
+            active_reset_at: Some(far_reset),
+            last_activity_at: upper_bound - 10,
+            rollover: Some(watching_rollover(
+                far_reset,
+                upper_bound - 200,
+                upper_bound - 10,
+            )),
+            samples: vec![sample],
+        };
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series.clone()],
+        };
+        assert!(validate_store_at(&store, upper_bound));
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+        let loaded =
+            load_store_at_with_mode(StorageMode::Generic, &path, upper_bound, observation_now)
+                .unwrap();
+        assert!(!loaded.quarantined);
+        assert_eq!(loaded.store, store, "no repair on an already-healthy store");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn structural_corruption_still_quarantines_under_the_new_loader_branch() {
+        let (directory, path) = temp_path("clock-structural");
+        let now = 25_000_000;
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION + 1, // structural: wrong schema
+            series: Vec::new(),
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+        let loaded = load_store_at_with_mode(StorageMode::Generic, &path, now, now).unwrap();
+        assert!(loaded.quarantined);
+        assert_eq!(loaded.store, Store::default());
+        assert!(directory
+            .join(format!("quota-pace-history-v3.corrupt-{now}.json"))
+            .exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_json_still_quarantines_under_the_new_loader_branch() {
+        let (directory, path) = temp_path("clock-malformed");
+        let now = 26_000_000;
+        fs::write(&path, b"{not-json-at-all").unwrap();
+
+        let loaded = load_store_at_with_mode(StorageMode::Generic, &path, now, now).unwrap();
+        assert!(loaded.quarantined);
+        assert_eq!(loaded.store, Store::default());
+        assert!(directory
+            .join(format!("quota-pace-history-v3.corrupt-{now}.json"))
+            .exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repair_is_a_fixed_point() {
+        let upper_bound = 27_000_000;
+        let observation_now = upper_bound - 1_000;
+        let reset = upper_bound + DAY;
+        let lead = upper_bound + 60;
+        let series = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "weekly.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at: lead,
+            rollover: Some(watching_rollover(reset, lead - 100, lead)),
+            samples: vec![quota_sample(
+                reset,
+                2 * DAY,
+                0.10,
+                20.0,
+                SampleOrigin::LiveV3,
+            )],
+        };
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series],
+        };
+
+        let once = repair_store_at(store.clone(), upper_bound, observation_now);
+        let twice = repair_store_at(once.clone(), upper_bound, observation_now);
+        assert_eq!(once, twice);
+    }
+
     #[test]
     fn stale_caller_does_not_fit_active_samples_from_its_future() {
         let (directory, path) = temp_path("stale-caller-future-fit");
         let duration = DAY;
         let cycle_start = 17_100_000;
         let reset_at = cycle_start + duration;
-        let key = SeriesKey::new("fixture", "stale-scope", "window.v1");
+        let key = test_key("fixture", "stale-scope", "window.v1");
         let mut newest_result = None;
         for phase in [0.10, 0.20, 0.30, 0.40, 0.50, 0.60] {
             let now = cycle_start + (phase * duration as f64) as i64;
@@ -6117,7 +6781,7 @@ mod tests {
         let duration = DAY;
         let completed_reset = 17_200_000 + duration;
         let active_reset = completed_reset + duration;
-        let key = SeriesKey::new("fixture", "stale-rollover-scope", "window.v1");
+        let key = test_key("fixture", "stale-rollover-scope", "window.v1");
         let active_phases = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60];
         let mut series = current_series(&key, active_reset, duration, &active_phases, 80.0);
         let completed = complete_cycle(completed_reset, duration, 80.0);
@@ -6581,7 +7245,7 @@ mod tests {
     #[test]
     fn invalid_series_key_never_creates_store() {
         let (directory, path) = temp_path("key");
-        let invalid = SeriesKey::new("provider", "", "window.v1");
+        let invalid = test_key("provider", "", "window.v1");
         let result = record_observation_at_path(
             invalid,
             Some(10_000 + DAY),
@@ -6653,7 +7317,7 @@ mod tests {
         let now = 8_000_000_000_i64;
         let duration = DAY;
         let current_reset = now + duration;
-        let key = SeriesKey::new("fixture", "scope", "window.v1");
+        let key = test_key("fixture", "scope", "window.v1");
         let mut series = seeded_series(
             &key.provider_id,
             &key.account_scope,
@@ -6701,7 +7365,7 @@ mod tests {
         for duration in durations {
             let now = 1_000_000_000;
             let current_reset = now + duration;
-            let key = SeriesKey::new("fixture", "opaque", "quota.v1");
+            let key = test_key("fixture", "opaque", "quota.v1");
             let expected_cycles = if duration < DAY { 6 } else { 3 };
             let mature_cycles = if duration < DAY { 36 } else { 5 };
             let mut series = seeded_series(
@@ -6840,7 +7504,7 @@ mod tests {
             });
         }
         store.series.sort_by(series_order);
-        let active = BTreeSet::from([SeriesKey::new("provider", "scope-active", "window.v1")]);
+        let active = BTreeSet::from([test_key("provider", "scope-active", "window.v1")]);
         evict_inactive_series(&mut store, &active, now).unwrap();
         assert_eq!(store.series.len(), MAX_SERIES);
         assert!(!store
@@ -6896,11 +7560,11 @@ mod tests {
     fn batch_emitted_existing_without_observation_stays_active() {
         let (directory, path) = temp_path("batch-emitted-active");
         let now = 5_250_000_000_i64;
-        let emitted = SeriesKey::new("provider", "scope-0000", "window.v1");
+        let emitted = test_key("provider", "scope-0000", "window.v1");
         let mut store = Store::default();
         for index in 0..=MAX_SERIES {
             store.series.push(batch_series(
-                SeriesKey::new("provider", format!("scope-{index:04}"), "window.v1"),
+                test_key("provider", format!("scope-{index:04}"), "window.v1"),
                 now,
                 None,
             ));
@@ -6930,14 +7594,14 @@ mod tests {
     fn batch_observation_key_protects_existing_history_without_explicit_emission() {
         let (directory, path) = temp_path("batch-observation-active");
         let now = 5_275_000_000_i64;
-        let existing = SeriesKey::new("provider", "scope-0000", "window.v1");
+        let existing = test_key("provider", "scope-0000", "window.v1");
         let mut store = Store {
             schema_version: HISTORY_SCHEMA_VERSION,
             series: vec![batch_series(existing.clone(), now, None)],
         };
         for index in 1..=MAX_SERIES {
             store.series.push(batch_series(
-                SeriesKey::new("provider", format!("scope-{index:04}"), "window.v1"),
+                test_key("provider", format!("scope-{index:04}"), "window.v1"),
                 now,
                 None,
             ));
@@ -6987,7 +7651,7 @@ mod tests {
         let idle = now - 57 * DAY;
         for (label, candidate) in [("watching", false), ("candidate", true)] {
             let (directory, path) = temp_path(&format!("stale-rollover-{label}"));
-            let stale_key = SeriesKey::new("provider", format!("stale-{label}"), "window.v1");
+            let stale_key = test_key("provider", format!("stale-{label}"), "window.v1");
             let mut store = Store {
                 schema_version: HISTORY_SCHEMA_VERSION,
                 series: vec![rollover_only_series(
@@ -6999,7 +7663,7 @@ mod tests {
             };
             for index in 0..MAX_SERIES - 1 {
                 store.series.push(batch_series(
-                    SeriesKey::new("provider", format!("active-{index:04}"), "window.v1"),
+                    test_key("provider", format!("active-{index:04}"), "window.v1"),
                     now,
                     Some(now + DAY),
                 ));
@@ -7007,7 +7671,7 @@ mod tests {
             store.series.sort_by(series_order);
             fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
 
-            let new_key = SeriesKey::new("provider", format!("new-{label}"), "window.v1");
+            let new_key = test_key("provider", format!("new-{label}"), "window.v1");
             let results = record_observations_at_path_and_evaluate(
                 &[],
                 &[observation(new_key.clone(), now + DAY, 10.0, DAY)],
@@ -7032,7 +7696,7 @@ mod tests {
         let now = 5_300_000_000_i64;
         let future_reset = now + 90 * DAY;
         let (directory, path) = temp_path("rollover-boundary-55d");
-        let key = SeriesKey::new("provider", "boundary-55d", "window.v1");
+        let key = test_key("provider", "boundary-55d", "window.v1");
         let store = Store {
             schema_version: HISTORY_SCHEMA_VERSION,
             series: vec![rollover_only_series(
@@ -7051,7 +7715,7 @@ mod tests {
 
         for (label, candidate) in [("watching", false), ("candidate", true)] {
             let (directory, path) = temp_path(&format!("rollover-boundary-{label}"));
-            let key = SeriesKey::new("provider", format!("boundary-{label}"), "window.v1");
+            let key = test_key("provider", format!("boundary-{label}"), "window.v1");
             let stale_store = Store {
                 schema_version: HISTORY_SCHEMA_VERSION,
                 series: vec![rollover_only_series(
@@ -7081,21 +7745,21 @@ mod tests {
     fn batch_existing_future_active_series_precedes_new_candidate() {
         let (directory, path) = temp_path("batch-existing-active");
         let now = 5_300_000_000_i64;
-        let active = SeriesKey::new("provider", "active", "window.v1");
+        let active = test_key("provider", "active", "window.v1");
         let mut store = Store {
             schema_version: HISTORY_SCHEMA_VERSION,
             series: vec![batch_series(active.clone(), now, Some(now + DAY))],
         };
         for index in 0..MAX_SERIES - 1 {
             store.series.push(batch_series(
-                SeriesKey::new("provider", format!("inactive-{index:04}"), "window.v1"),
+                test_key("provider", format!("inactive-{index:04}"), "window.v1"),
                 now,
                 None,
             ));
         }
         store.series.sort_by(series_order);
         fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
-        let new_key = SeriesKey::new("provider", "new", "window.v1");
+        let new_key = test_key("provider", "new", "window.v1");
         let results = record_observations_at_path_and_evaluate(
             &[],
             &[observation(new_key.clone(), now + DAY, 20.0, DAY)],
@@ -7119,7 +7783,7 @@ mod tests {
     fn batch_new_candidates_admit_by_key_not_input_order() {
         let now = 5_350_000_000_i64;
         let active_keys = (0..MAX_SERIES - 2)
-            .map(|index| SeriesKey::new("provider", format!("active-{index:04}"), "window.v1"))
+            .map(|index| test_key("provider", format!("active-{index:04}"), "window.v1"))
             .collect::<Vec<_>>();
         let base = Store {
             schema_version: HISTORY_SCHEMA_VERSION,
@@ -7129,9 +7793,9 @@ mod tests {
                 .map(|key| batch_series(key, now, Some(now + DAY)))
                 .collect(),
         };
-        let new_a = SeriesKey::new("provider", "new-a", "window.v1");
-        let new_b = SeriesKey::new("provider", "new-b", "window.v1");
-        let new_c = SeriesKey::new("provider", "new-c", "window.v1");
+        let new_a = test_key("provider", "new-a", "window.v1");
+        let new_b = test_key("provider", "new-b", "window.v1");
+        let new_c = test_key("provider", "new-c", "window.v1");
         let cases = [
             (
                 "batch-admission-reversed",
@@ -7187,11 +7851,7 @@ mod tests {
     fn batch_save_failure_preserves_pre_transaction_bytes() {
         let (directory, path) = temp_path("batch-save-failure");
         let now = 5_400_000_000_i64;
-        let existing = batch_series(
-            SeriesKey::new("provider", "existing", "window.v1"),
-            now,
-            None,
-        );
+        let existing = batch_series(test_key("provider", "existing", "window.v1"), now, None);
         let store = Store {
             schema_version: HISTORY_SCHEMA_VERSION,
             series: vec![existing],
@@ -7200,13 +7860,13 @@ mod tests {
         let before = fs::read(&path).unwrap();
         let observations = vec![
             observation(
-                SeriesKey::new("provider", "batch-a", "window.v1"),
+                test_key("provider", "batch-a", "window.v1"),
                 now + DAY,
                 10.0,
                 DAY,
             ),
             observation(
-                SeriesKey::new("provider", "batch-b", "window.v1"),
+                test_key("provider", "batch-b", "window.v1"),
                 now + DAY,
                 20.0,
                 DAY,
@@ -7234,7 +7894,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
         let before = fs::read(&path).unwrap();
         let item = observation(
-            SeriesKey::new("provider", "duplicate", "window.v1"),
+            test_key("provider", "duplicate", "window.v1"),
             now + DAY,
             10.0,
             DAY,
@@ -7340,8 +8000,14 @@ mod tests {
         };
         fs::write(&v3_path, serde_json::to_vec_pretty(&existing).unwrap()).unwrap();
 
-        let first =
-            migrate_codex_v2_at_paths("acct", "opaque-scope", now, &v2_path, &v3_path).unwrap();
+        let first = migrate_codex_v2_at_paths(
+            "acct",
+            &HistoryScope::for_test("opaque-scope"),
+            now,
+            &v2_path,
+            &v3_path,
+        )
+        .unwrap();
         assert_eq!(first.imported_samples, 7);
         assert_eq!(fs::read(&v2_path).unwrap(), v2_before);
         assert_eq!(
@@ -7367,8 +8033,14 @@ mod tests {
         );
 
         let bytes_after_first = fs::read(&v3_path).unwrap();
-        let second =
-            migrate_codex_v2_at_paths("acct", "opaque-scope", now, &v2_path, &v3_path).unwrap();
+        let second = migrate_codex_v2_at_paths(
+            "acct",
+            &HistoryScope::for_test("opaque-scope"),
+            now,
+            &v2_path,
+            &v3_path,
+        )
+        .unwrap();
         assert_eq!(second.imported_samples, 0);
         assert_eq!(fs::read(&v3_path).unwrap(), bytes_after_first);
 
@@ -7383,8 +8055,14 @@ mod tests {
                 "sampledAt": reset - duration + duration * 55 / 100
             }));
         fs::write(&v2_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
-        let third =
-            migrate_codex_v2_at_paths("acct", "opaque-scope", now, &v2_path, &v3_path).unwrap();
+        let third = migrate_codex_v2_at_paths(
+            "acct",
+            &HistoryScope::for_test("opaque-scope"),
+            now,
+            &v2_path,
+            &v3_path,
+        )
+        .unwrap();
         assert_eq!(third.imported_samples, 1);
         assert_ne!(fs::read(&v3_path).unwrap(), bytes_after_first);
         fs::remove_dir_all(directory).unwrap();
@@ -7428,7 +8106,14 @@ mod tests {
         };
         fs::write(&v3_path, serde_json::to_vec_pretty(&existing).unwrap()).unwrap();
         let before = fs::read(&v3_path).unwrap();
-        let outcome = migrate_codex_v2_at_paths("acct", "scope", now, &v2_path, &v3_path).unwrap();
+        let outcome = migrate_codex_v2_at_paths(
+            "acct",
+            &HistoryScope::for_test("scope"),
+            now,
+            &v2_path,
+            &v3_path,
+        )
+        .unwrap();
         assert_eq!(outcome.imported_samples, 0);
         assert_eq!(
             read_store(&v3_path).series[0].last_activity_at,
@@ -7492,7 +8177,7 @@ mod tests {
 
         let outcome = migrate_codex_v2_at_paths_with_clock_and_mode(
             "acct",
-            "scope",
+            &HistoryScope::for_test("scope"),
             stale_now,
             &v2_path,
             &v3_path,
@@ -7528,8 +8213,14 @@ mod tests {
         fs::write(&v2_path, b"not-json").unwrap();
         let v3_before = b"existing-v3-bytes";
         fs::write(&v3_path, v3_before).unwrap();
-        let outcome =
-            migrate_codex_v2_at_paths("acct", "scope", 7_000_000_000, &v2_path, &v3_path).unwrap();
+        let outcome = migrate_codex_v2_at_paths(
+            "acct",
+            &HistoryScope::for_test("scope"),
+            7_000_000_000,
+            &v2_path,
+            &v3_path,
+        )
+        .unwrap();
         assert_eq!(outcome.imported_samples, 0);
         assert_eq!(fs::read(&v2_path).unwrap(), b"not-json");
         assert_eq!(fs::read(&v3_path).unwrap(), v3_before);
@@ -7560,7 +8251,14 @@ mod tests {
         .unwrap();
         let corrupt = b"corrupt-v3-evidence";
         fs::write(&v3_path, corrupt).unwrap();
-        let outcome = migrate_codex_v2_at_paths("acct", "scope", now, &v2_path, &v3_path).unwrap();
+        let outcome = migrate_codex_v2_at_paths(
+            "acct",
+            &HistoryScope::for_test("scope"),
+            now,
+            &v2_path,
+            &v3_path,
+        )
+        .unwrap();
         assert_eq!(outcome.imported_samples, 1);
         assert_eq!(
             fs::read(directory.join(format!("quota-pace-history-v3.corrupt-{now}.json"))).unwrap(),
@@ -7742,10 +8440,24 @@ mod tests {
         let right_v2 = v2_path.clone();
         let right_v3 = v3_path.clone();
         let left = std::thread::spawn(move || {
-            migrate_codex_v2_at_paths("acct", "opaque", now, &left_v2, &left_v3).unwrap()
+            migrate_codex_v2_at_paths(
+                "acct",
+                &HistoryScope::for_test("opaque"),
+                now,
+                &left_v2,
+                &left_v3,
+            )
+            .unwrap()
         });
         let right = std::thread::spawn(move || {
-            migrate_codex_v2_at_paths("acct", "opaque", now, &right_v2, &right_v3).unwrap()
+            migrate_codex_v2_at_paths(
+                "acct",
+                &HistoryScope::for_test("opaque"),
+                now,
+                &right_v2,
+                &right_v3,
+            )
+            .unwrap()
         });
         let outcomes = [left.join().unwrap(), right.join().unwrap()];
         assert_eq!(
@@ -7867,7 +8579,7 @@ mod tests {
             normalize_reset(jittered_reset, duration)
         );
         let now = reset_at - duration / 5;
-        let key = SeriesKey::new("fixture", "exact-reset", "window.v1");
+        let key = test_key("fixture", "exact-reset", "window.v1");
         let series = seeded_series(
             &key.provider_id,
             &key.account_scope,
@@ -7920,7 +8632,7 @@ mod tests {
     fn partial_fit_rejects_span_identity_and_duration_contradictions() {
         let duration = DAY;
         let reset_at = 31_000_000_i64 + duration;
-        let key = SeriesKey::new("fixture", "partial-guards", "window.v1");
+        let key = test_key("fixture", "partial-guards", "window.v1");
         let phases = [0.10, 0.12, 0.14, 0.16, 0.18, 0.19];
         let series = current_series(&key, reset_at, duration, &phases, 80.0);
         let normalized = normalize_reset(reset_at, duration);
@@ -7972,7 +8684,7 @@ mod tests {
         let (directory, path) = temp_path("partial-fit");
         let duration = DAY;
         let reset_at = 20_000_100 + duration;
-        let key = SeriesKey::new("fixture", "partial-scope", "window.v1");
+        let key = test_key("fixture", "partial-scope", "window.v1");
         let phases = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80];
         let mut final_result = None;
         for phase in phases {
@@ -8006,7 +8718,7 @@ mod tests {
         let normalized_reset = normalize_reset(40_000_000_000_i64, duration);
         let reset_at = normalized_reset + 60;
         let now = normalized_reset;
-        let key = SeriesKey::new("fixture", "cleanup-transaction", "window.v1");
+        let key = test_key("fixture", "cleanup-transaction", "window.v1");
         let mut malformed = current_series(
             &key,
             reset_at,
@@ -8084,7 +8796,7 @@ mod tests {
         let (directory, path) = temp_path("partial-fit-leakage");
         let duration = DAY;
         let reset_at = 21_000_000 + duration;
-        let key = SeriesKey::new("fixture", "partial-leak", "window.v1");
+        let key = test_key("fixture", "partial-leak", "window.v1");
         let phases = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60];
         let mut result = None;
         for (index, phase) in phases.into_iter().enumerate() {
@@ -8143,7 +8855,7 @@ mod tests {
         let current_reset = 42_000_000_000_i64 + duration;
         let now = current_reset - duration * 4 / 10;
         let phases = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60];
-        let key = SeriesKey::new("fixture", "stale-isolation", "window.v1");
+        let key = test_key("fixture", "stale-isolation", "window.v1");
         let make_samples = |reset_at: i64, jagged: bool| {
             phases
                 .iter()
@@ -8232,7 +8944,7 @@ mod tests {
         );
         assert!(cycle_profile(normalize_reset(reset_at, duration), &mixed, now).is_none());
 
-        let key = SeriesKey::new("fixture", "mixed", "window.v1");
+        let key = test_key("fixture", "mixed", "window.v1");
         let mut series = SeriesState {
             provider_id: key.provider_id.clone(),
             account_scope: key.account_scope.clone(),
@@ -8327,7 +9039,7 @@ mod tests {
 
         let duration = DAY;
         let reset_at = 43_000_000_000_i64 + duration;
-        let key = SeriesKey::new("fixture", "partial-boundaries", "window.v1");
+        let key = test_key("fixture", "partial-boundaries", "window.v1");
         let series = current_series(&key, reset_at, duration, &phases, 80.0);
         let now = reset_at - duration + (0.80 * duration as f64) as i64;
         let normalized = normalize_reset(reset_at, duration);
@@ -8359,7 +9071,7 @@ mod tests {
         let duration = 5 * HOUR;
         let reset_at = 23_000_000 + duration;
         let now = reset_at - 60;
-        let key = SeriesKey::new("fixture", "counter-partial", "window.v1");
+        let key = test_key("fixture", "counter-partial", "window.v1");
         let samples = (0..PHASE_BUCKET_COUNT)
             .map(|bucket| {
                 let phase = (bucket as f64 + 0.25) / PHASE_BUCKET_COUNT as f64;
@@ -8447,7 +9159,7 @@ mod tests {
 
         let duration = DAY;
         let reset_at = 51_000_000_000_i64 + duration;
-        let key = SeriesKey::new("fixture", "permutation", "window.v1");
+        let key = test_key("fixture", "permutation", "window.v1");
         let mut first_series = current_series(&key, reset_at, duration, &phases, 80.0);
         let mut second_series = first_series.clone();
         second_series.samples.reverse();
@@ -8589,7 +9301,7 @@ mod tests {
         let duration = 5 * HOUR;
         let current_reset = 24_000_000_000_i64 + duration;
         let now = current_reset - 60;
-        let key = SeriesKey::new("fixture", "counter-complete", "window.v1");
+        let key = test_key("fixture", "counter-complete", "window.v1");
         let mut samples = Vec::with_capacity(129 * PHASE_BUCKET_COUNT);
         for offset in 1..=RETENTION_MAX_CYCLES {
             let reset = current_reset - offset as i64 * duration;
@@ -8659,7 +9371,7 @@ mod tests {
         let duration = 5 * HOUR;
         let current_reset = (53_000_000_000_i64 + duration + 899).div_euclid(900) * 900;
         let now = current_reset - 60;
-        let key = SeriesKey::new("fixture", "mixed-retention", "window.v1");
+        let key = test_key("fixture", "mixed-retention", "window.v1");
         let phases = (0..PHASE_BUCKET_COUNT)
             .map(|bucket| (bucket as f64 + 0.25) / PHASE_BUCKET_COUNT as f64)
             .collect::<Vec<_>>();
@@ -8772,7 +9484,7 @@ mod tests {
         let duration = 5 * HOUR;
         let current_reset = 52_000_000_000_i64 + duration;
         let now = current_reset - duration / 2;
-        let target_key = SeriesKey::new("fixture", "target", "window.v1");
+        let target_key = test_key("fixture", "target", "window.v1");
         let target = seeded_series(
             &target_key.provider_id,
             &target_key.account_scope,
@@ -8784,8 +9496,7 @@ mod tests {
         let make_unrelated = |rich: bool| {
             (0..32)
                 .map(|index| {
-                    let key =
-                        SeriesKey::new("fixture", &format!("unrelated-{index:03}"), "window.v1");
+                    let key = test_key("fixture", format!("unrelated-{index:03}"), "window.v1");
                     let samples = if rich {
                         (1..=4)
                             .flat_map(|offset| {
@@ -8888,7 +9599,7 @@ mod tests {
             for index in 0..STORE_SERIES_COUNT {
                 let account = format!("benchmark-{index:03}");
                 let window = format!("window-{index:03}.v1");
-                let key = SeriesKey::new("fixture", &account, &window);
+                let key = test_key("fixture", &account, &window);
                 let target = TARGET_INDICES.contains(&index);
                 let mut samples = Vec::new();
                 if target {

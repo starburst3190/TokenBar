@@ -9,6 +9,7 @@ struct SettingsPanel: View {
     enum Page: String, CaseIterable, Identifiable {
         case menuBar = "Menu bar"
         case dashboard = "Dashboard"
+        case usageAttribution = "Usage attribution"
         case general = "General"
         case about = "About"
 
@@ -20,6 +21,7 @@ struct SettingsPanel: View {
             switch self {
             case .menuBar: "menubar.rectangle"
             case .dashboard: "chart.bar.xaxis"
+            case .usageAttribution: "arrow.triangle.branch"
             case .general: "gearshape"
             case .about: "info.circle"
             }
@@ -31,8 +33,15 @@ struct SettingsPanel: View {
     /// For the quota-source picker (the windows currently known).
     var agentUsage: AgentUsagePayload?
 
+    /// Settings receives the all-time report so every observed provider stays
+    /// configurable even when the dashboard itself is scoped to one year.
+    var modelReport: ModelReport?
+
     /// Present clients (used for the client tabs reorder/hide UI).
-    var presentClients: [String] = []
+    /// nil until an accepted payload lands, which is DIFFERENT from a scan
+    /// that found nothing. Only the Discord picker distinguishes them; the
+    /// other readers below want "whatever is present right now" and flatten it.
+    var presentClients: [String]?
 
     /// True while either initial request is still in flight. An empty client list
     /// is otherwise indistinguishable from "still loading", and the first seconds
@@ -40,6 +49,12 @@ struct SettingsPanel: View {
     /// caller derives this from request lifecycle, not payload presence — a failed
     /// fetch leaves the payload nil forever.
     var isLoading = false
+    /// True while the model-report request is in flight. Separate from
+    /// `isLoading`, which tracks the graph and quota requests: the report has
+    /// its own lifecycle since it came off the critical path, and folding it
+    /// into the same flag would call the page unavailable while it is still
+    /// being fetched.
+    var reportLoading = false
 
     @AppStorage(TrayMode.storageKey) private var trayModeRaw = TrayMode.todayTokens.rawValue
     @AppStorage(PopoverScale.storageKey) private var popoverScaleRaw = PopoverScale.default.rawValue
@@ -64,7 +79,24 @@ struct SettingsPanel: View {
     @AppStorage("tokenbar.trace.detailed") private var detailedTrace = false
     @AppStorage("tokenbar.refresh.intervalMin") private var refreshIntervalMin = 30
     @AppStorage(AppLanguage.storageKey) private var languageRaw = AppLanguage.system.rawValue
+    /// The ONLY binding of this key in the app, and the only place other than
+    /// `DiscordPresence.enabled()` where its default appears. A second
+    /// declaration that said `true` would read as "already on" after an
+    /// upgrade — this repo has precedent (`tokenbar.limits.enabled` declares
+    /// its default in two views).
+    @AppStorage(DiscordPresence.enabledKey) private var discordEnabled = false
+    @AppStorage(DiscordPresence.wholeDollarsKey) private var discordWholeDollars = false
+    /// Stored as the raw comma-separated string the payload layer parses, so
+    /// the view and `DiscordPresence.components()` cannot drift into two
+    /// different ideas of what is selected.
+    @AppStorage(DiscordPresence.componentsKey) private var discordComponentsRaw =
+        DiscordPresence.defaultComponentsRaw
+    /// Empty means the busiest visible client. Stored as the raw id so the
+    /// panel and `DiscordPresence.selection()` read one value.
+    @AppStorage(DiscordPresence.selectionKey) private var discordSelectionRaw = ""
     @State private var showLanguageRestartPrompt = false
+    @State private var attributionNotice: String?
+    @State private var attributionRevision = 0
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -133,16 +165,16 @@ struct SettingsPanel: View {
         // Client tabs), instead of re-deriving `knownClientIds` per section.
         // `orderRaw:` overloads keep both lists reactive to a drag/reorder.
         let knownIds = AgentLimitsCard.knownClientIds(
-            agentUsage: agentUsage, present: presentClients)
+            agentUsage: agentUsage, present: presentClients ?? [])
         // Agent-limits management universe: only clients that can actually
         // render a quota card (placeholder rows or a live snapshot).
         let limitOrdered = ClientRegistry.orderedClients(knownIds, orderRaw: tabsOrderRaw)
         // Client-tabs universe: every client that can be a top tab (present)
         // OR a quota card (knownIds — e.g. quota-only Antigravity), so both
         // orderings are managed from one list. Mirrors displayClients' source.
-        let presentSet = Set(presentClients)
+        let presentSet = Set(presentClients ?? [])
         let tabsUniverse = ClientRegistry.orderedClients(
-            Self.orderedUnion(presentClients, knownIds), orderRaw: tabsOrderRaw)
+            Self.orderedUnion(presentClients ?? [], knownIds), orderRaw: tabsOrderRaw)
 
         VStack(alignment: .leading, spacing: 14) {
             switch page {
@@ -153,6 +185,8 @@ struct SettingsPanel: View {
                     limitOrdered: limitOrdered,
                     presentSet: presentSet,
                     tabsUniverse: tabsUniverse)
+            case .usageAttribution:
+                usageAttributionPage()
             case .general:
                 generalPage()
             case .about:
@@ -175,6 +209,36 @@ struct SettingsPanel: View {
         } message: {
             Text("Restart TokenBar to apply the new language.")
         }
+        .task(id: attributionInputSignature) {
+            refreshAttributionSuggestions()
+        }
+    }
+
+    private var attributionTables: (
+        confirmed: UsageAttribution.Table, suggestions: UsageAttribution.Table
+    ) {
+        _ = attributionRevision
+        return (UsageAttribution.confirmed(), UsageAttribution.suggestions())
+    }
+
+    private var attributionTargetClients: [String] {
+        UsageAttributionSettings.subscriptionClients(from: agentUsage)
+    }
+
+    /// Identity of the inputs a suggestion refresh depends on. The target list
+    /// has to contribute its *knownness*, not just its contents: a payload that
+    /// arrives carrying zero subscription candidates leaves
+    /// `attributionTargetClients` empty, which is the same string it was while
+    /// the request was still in flight. Without the lifecycle token the task
+    /// never reruns, so the page stops suppressing stored suggestions without
+    /// ever reconciling them against the now-known empty set.
+    private var attributionInputSignature: String? {
+        guard let modelReport else { return nil }
+        return UsageAttributionSettings.signature(
+            entries: modelReport.entries,
+            subscriptionClients: attributionTargetClients,
+            targetsKnown: agentUsage != nil,
+            routedSubscriptions: UsageAttributionSettings.routedSubscriptions(from: agentUsage))
     }
 
     @ViewBuilder
@@ -212,7 +276,7 @@ struct SettingsPanel: View {
     @ViewBuilder
     private func individualItemsSection() -> some View {
         let rows = ClientTray.settingsRows(
-            presentClients: presentClients,
+            presentClients: presentClients ?? [],
             payload: agentUsage,
             enabled: ClientTray.parseEnabledRaw(individualEnabledRaw),
             selections: ClientTray.parseSelectionsRaw(individualSelectionsRaw),
@@ -223,14 +287,7 @@ struct SettingsPanel: View {
         section("Individual items") {
             hint("Keep the main TokenBar item. Optional client items show each client's selected quota window; Auto chooses the tightest healthy window for that client.")
             if rows.isEmpty, isLoading {
-                HStack(spacing: 7) {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 14, height: 14)
-                    Text("Looking for eligible clients…".localized)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                LoadingLine(title: "Looking for eligible clients…")
             } else if rows.isEmpty {
                 Text("No eligible individual clients yet.")
                     .font(.caption)
@@ -539,6 +596,238 @@ struct SettingsPanel: View {
     }
 
     @ViewBuilder
+    private func usageAttributionPage() -> some View {
+        let tables = attributionTables
+        let targetClients = attributionTargetClients
+        // A stored suggestion proposes a target, and until the quota payload
+        // says which subscriptions exist there is nothing to check that target
+        // against. Suppressing rather than deleting keeps a valid table intact
+        // across a transient failure — the alternative destroys real proposals
+        // every time the request happens to be in flight.
+        let suggestions = agentUsage == nil ? [] : tables.suggestions.records
+        let rows = UsageAttributionSettings.rows(
+            entries: modelReport?.entries ?? [],
+            confirmed: tables.confirmed.records,
+            suggestions: suggestions)
+        let suggestedRows = rows.filter { $0.suggestedState != nil }
+
+        section(UsageAttributionSettings.Copy.section) {
+            hint(UsageAttributionSettings.Copy.classifyHint)
+            hint(UsageAttributionSettings.Copy.canonicalizationHint)
+            hint(UsageAttributionSettings.Copy.declarationHint)
+
+            if let attributionNotice {
+                Text(attributionNotice.localized)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !suggestedRows.isEmpty {
+                Button {
+                    acceptAllAttributionSuggestions()
+                } label: {
+                    Label(
+                        UsageAttributionSettings.Copy.acceptSuggestions.localized(
+                            Int64(suggestedRows.count)),
+                        systemImage: "checkmark.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                hint(UsageAttributionSettings.Copy.suggestionsHint)
+            }
+
+            switch UsageAttributionSettings.pageState(
+                hasReport: modelReport != nil, rowCount: rows.count,
+                isLoading: isLoading || reportLoading)
+            {
+            case .loading:
+                LoadingLine(title: "Loading usage…")
+            case .unavailable:
+                Text(UsageAttributionSettings.Copy.unavailable.localized)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .empty:
+                Text(UsageAttributionSettings.Copy.noRows.localized)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .rows:
+                VStack(spacing: 1) {
+                    ForEach(rows) { row in
+                        attributionRow(row, targetClients: targetClients)
+                    }
+                }
+                .glassCard(cornerRadius: 8)
+            }
+        }
+    }
+
+    private func attributionRow(
+        _ row: UsageAttributionSettings.Row, targetClients: [String]
+    ) -> some View {
+        // Every target this row can legitimately hold has to be selectable, and
+        // `targetClients` only lists clients with a quota snapshot. Two kinds of
+        // target fall outside it: one already confirmed, and one being suggested
+        // for a plan TokenBar draws no meter for — a Cursor row is exactly that.
+        // Offering the suggestion while the picker cannot select it leaves
+        // "Accept all" as the only way to take it, and then undoing everything
+        // else it accepted.
+        let outOfBandTargets: [String] = [row.state, row.suggestedState]
+            .compactMap { state in
+                guard case let .assigned(target)? = state else { return nil }
+                return target
+            }
+        var pickerTargets = targetClients
+        for target in outOfBandTargets where !pickerTargets.contains(target) {
+            pickerTargets.append(target)
+        }
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(UsageAttributionSettings.Copy.source.localized(
+                        ClientRegistry.style(row.client).displayName,
+                        row.providerLabel.localized))
+                        .font(.caption.weight(.medium))
+                    Text(UsageAttributionSettings.Copy.observed.localized(
+                        Format.compactTokens(row.tokens), Format.usd(row.cost)))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                // The label takes the slack instead of a Spacer so a long
+                // source name uses the full width before wrapping, and the
+                // picker below keeps a fixed width rather than shrinking to
+                // its selected title — otherwise every row's control starts
+                // and ends at a different x.
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Picker(UsageAttributionSettings.Copy.classification.localized, selection: Binding(
+                    get: { row.state },
+                    set: { next in
+                        saveAttribution(row: row, state: next)
+                    }))
+                {
+                    Text(UsageAttributionSettings.Copy.unassigned.localized)
+                        .tag(UsageAttribution.State.unassigned)
+                    Text(UsageAttributionSettings.Copy.excluded.localized)
+                        .tag(UsageAttribution.State.excluded)
+                    ForEach(pickerTargets, id: \.self) { target in
+                        Text(UsageAttributionSettings.Copy.assigned.localized(
+                            ClientRegistry.style(target).displayName))
+                            .tag(UsageAttribution.State.assigned(target))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 168)
+                .accessibilityLabel(UsageAttributionSettings.Copy.classificationFor.localized(
+                    row.providerLabel.localized))
+            }
+
+            if let suggestedState = row.suggestedState {
+                Text(Self.suggestionLabel(for: suggestedState))
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+    }
+
+    /// A suggestion can propose "not a subscription" as readily as a target, so
+    /// the label follows the proposed state rather than assuming an assignment.
+    static func suggestionLabel(for state: UsageAttribution.State) -> String {
+        switch state {
+        case let .assigned(target):
+            return UsageAttributionSettings.Copy.suggested.localized(
+                ClientRegistry.style(target).displayName)
+        case .excluded:
+            return UsageAttributionSettings.Copy.suggestedExcluded.localized
+        case .unassigned:
+            return UsageAttributionSettings.Copy.unassigned.localized
+        }
+    }
+
+    private func saveAttribution(
+        row: UsageAttributionSettings.Row, state: UsageAttribution.State
+    ) {
+        let record = UsageAttribution.Record(
+            client: row.client, provider: row.provider, state: state)
+        let defaults = UserDefaults.standard
+        let table = UsageAttribution.confirmed(defaults: defaults)
+        let result = UsageAttribution.confirmedRaw(
+            updating: defaults.object(forKey: UsageAttribution.confirmedKey), record: record)
+        guard let result else {
+            attributionNotice = UsageAttributionSettings.writeFailure(
+                table: table, record: record, result: result)?.message
+            return
+        }
+        defaults.set(result, forKey: UsageAttribution.confirmedKey)
+        attributionNotice = nil
+        attributionRevision += 1
+    }
+
+    private func refreshAttributionSuggestions() {
+        guard let report = modelReport, agentUsage != nil else { return }
+        let defaults = UserDefaults.standard
+        let confirmed = UsageAttribution.confirmed(defaults: defaults)
+        let targetClients = attributionTargetClients
+        let proposed = UsageAttributionSettings.suggestionRecords(
+            entries: report.entries,
+            confirmed: confirmed.records,
+            subscriptionClients: targetClients,
+            routedSubscriptions: UsageAttributionSettings.routedSubscriptions(from: agentUsage))
+        let table = UsageAttribution.suggestions(defaults: defaults)
+        let result = UsageAttribution.suggestionsRaw(
+            replacing: defaults.object(forKey: UsageAttribution.suggestionsKey), with: proposed)
+        guard let result else {
+            attributionNotice = UsageAttributionSettings.writeFailure(
+                table: table, records: proposed, result: result)?.message
+            attributionRevision += 1
+            return
+        }
+        defaults.set(result, forKey: UsageAttribution.suggestionsKey)
+        attributionNotice = nil
+        attributionRevision += 1
+    }
+
+    private func acceptAllAttributionSuggestions() {
+        let tables = attributionTables
+        let rows = UsageAttributionSettings.rows(
+            entries: modelReport?.entries ?? [],
+            confirmed: tables.confirmed.records,
+            suggestions: tables.suggestions.records)
+        let records = UsageAttributionSettings.acceptanceRecords(rows: rows)
+        guard !records.isEmpty else { return }
+
+        let defaults = UserDefaults.standard
+        let confirmedRaw = UsageAttribution.confirmedRaw(
+            updating: defaults.object(forKey: UsageAttribution.confirmedKey), records: records)
+        guard let confirmedRaw else {
+            attributionNotice = UsageAttributionSettings.writeFailure(
+                table: tables.confirmed, records: records, result: confirmedRaw)?.message
+            attributionRevision += 1
+            return
+        }
+        let removals = records.map {
+            UsageAttribution.Record(
+                client: $0.client, provider: $0.provider, model: $0.model, state: .unassigned)
+        }
+        let suggestionsRaw = UsageAttribution.suggestionsRaw(
+            updating: defaults.object(forKey: UsageAttribution.suggestionsKey), records: removals)
+        guard let suggestionsRaw else {
+            attributionNotice = UsageAttributionSettings.writeFailure(
+                table: tables.suggestions, records: removals, result: suggestionsRaw)?.message
+            attributionRevision += 1
+            return
+        }
+
+        defaults.set(confirmedRaw, forKey: UsageAttribution.confirmedKey)
+        defaults.set(suggestionsRaw, forKey: UsageAttribution.suggestionsKey)
+        attributionNotice = nil
+        attributionRevision += 1
+    }
+
+    @ViewBuilder
     private func generalPage() -> some View {
         if AutostartService.isAvailable {
             section("Startup") {
@@ -572,6 +861,71 @@ struct SettingsPanel: View {
                 })
             hint("How often the tray re-reads your logs. The dashboard refreshes when the popover opens; live tokens/min updates every few seconds regardless.")
         }
+
+        section("Discord") {
+            toggleRow("Show today's usage on Discord", isOn: $discordEnabled)
+            // Consent copy, not a feature blurb. It has to say what leaves the
+            // machine, who ends up seeing it, and that switching back off does
+            // not undo it — the reference implementation ships "Show today's
+            // tokens, cost, and most-used AI tool in your Discord activity",
+            // which describes the display and hides the disclosure.
+            // Names the second switch's consequence here, in the disclosure the
+            // user reads BEFORE opting in, rather than only next to the switch
+            // itself. Saying "a cost range" while a setting below can turn it
+            // into a figure would describe a state the app may not be in.
+            hint("Off by default. Publishes what you pick below — today's tokens, a client name, a cost range or rounded figure — for whichever client you choose, and a link to TokenBar's source to your Discord profile. It updates while you work, so your active hours show too. Anyone who can see your profile can read and keep every update; switching this off stops new ones but cannot unshare what already went out. Hidden clients are never included, and a change here reaches your profile within about 15 seconds.")
+            toggleRow("Include today's tokens", isOn: componentBinding(.tokens))
+            toggleRow("Include the client name", isOn: componentBinding(.client))
+            toggleRow("Include cost", isOn: componentBinding(.cost))
+            // Not a hint about tidiness. Unticking everything is the one
+            // combination that would otherwise still publish — an activity
+            // carrying the app name, image and button, refreshing while you
+            // work — so it is treated as switching the feature off for as long
+            // as it stays empty.
+            hint("Untick everything and nothing is published at all.")
+            // Read here, not inside the options expression: `selection()` goes
+            // to UserDefaults and registers no SwiftUI dependency, so the list
+            // would keep a de-listed selection visible after the user picked
+            // another row. Touching the @AppStorage raw is what re-renders.
+            let selectionRaw = discordSelectionRaw
+            let discordSelection = DiscordPresence.selection()
+            radioGroup(
+                selection: Binding(
+                    get: {
+                        // Read for the SwiftUI dependency only; the ANSWER comes
+                        // from the strict accessor. `@AppStorage<String>`
+                        // substitutes its empty default for a key holding a
+                        // non-string, which would tick "most used" while the
+                        // runtime published nothing at all.
+                        _ = selectionRaw
+                        switch discordSelection {
+                        case .mostUsed: return ""
+                        case .only(let id): return id
+                        case .malformed: return DiscordPresence.malformedSelectionLabel
+                        }
+                    },
+                    set: { discordSelectionRaw = $0 }),
+                options: [("", "Whichever client you used most")]
+                    + DiscordPresence.selectableClients(
+                        present: presentClients,
+                        hiddenRaw: tabsHiddenRaw,
+                        orderRaw: tabsOrderRaw,
+                        selection: discordSelection
+                    ).map { ($0, ClientRegistry.style($0).displayName) })
+            // Nothing is ticked when the stored value is malformed, which is
+            // honest: the runtime publishes nothing, and no option describes
+            // that. Picking any row writes a well-formed value and recovers.
+            // Two consequences, and neither is obvious from the control. The
+            // first reads as a bug when it is a decision; the second is the one
+            // that compounds with the switch below it.
+            hint("Naming one client publishes only its usage, so the totals can differ from the menu bar, which counts every client including ones TokenBar does not recognise. The cost becomes that one tool's daily spend rather than the whole day's.")
+            toggleRow("Show cost as a figure instead of a range", isOn: $discordWholeDollars)
+            // Says what the trade is, not that there is one. A range puts you
+            // in a group; a figure is closer to a value only you have, and a
+            // sequence of them across weeks is closer still.
+            hint("A range keeps you among everyone else in that band. A figure is rounded to the dollar, never cents, but still says more about you — every day. With one client named above, it becomes that tool's daily spend.")
+        }
+        .id(SettingsWindowController.Destination.discord.anchor)
 
         section("Language") {
             radioGroup(
@@ -744,6 +1098,31 @@ struct SettingsPanel: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
         .glassCard(cornerRadius: 8)
+    }
+
+    /// One checkbox over the shared composition string. Written back in
+    /// `Component.allCases` order so the stored value is canonical whatever
+    /// order the boxes were ticked in, and the value gate does not see a
+    /// reordering as a change.
+    private func componentBinding(_ component: DiscordPresence.Component) -> Binding<Bool> {
+        Binding(
+            get: {
+                // `discordComponentsRaw` is read for the SwiftUI dependency
+                // only; the ANSWER comes from the authoritative accessor.
+                // `@AppStorage<String>` substitutes its default for both an
+                // absent key and one holding a non-string, while
+                // `components()` distinguishes them — so reading the wrapper
+                // for the answer would tick all three boxes over a malformed
+                // write while the runtime published nothing, and the next tick
+                // would start from that phantom all-selected state.
+                _ = self.discordComponentsRaw
+                return DiscordPresence.components().contains(component)
+            },
+            set: { isOn in
+                var selected = DiscordPresence.components()
+                if isOn { selected.insert(component) } else { selected.remove(component) }
+                self.discordComponentsRaw = DiscordPresence.rawComponents(selected)
+            })
     }
 
     private func toggleRow(_ label: String, isOn: Binding<Bool>) -> some View {

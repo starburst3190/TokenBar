@@ -17,9 +17,17 @@ public enum ClientRegistry {
         "openclaw": ("OpenClaw", "#dc2626"),
         "gemini": ("Gemini CLI", "#60a5fa"),
         "opencode": ("OpenCode", "#1f2937"),
-        "codex": ("Codex CLI", "#9ca3af"),
-        "copilot": ("Copilot CLI", "#1f2937"),
-        "cursor": ("Cursor IDE", "#0ea5e9"),
+        // No form-factor suffix on these three: their sources are not
+        // surface-scoped. `codex` reads ~/.codex/sessions, written by Codex
+        // Desktop / the IDE extension / the CLI alike (a 1733-file sample was
+        // 70% "Codex Desktop", 4% CLI). `copilot` merges the CLI/VS Code OTel
+        // export with the desktop app's ~/.copilot/data.db. `cursor` is not a
+        // session parser at all — it reads Cursor's account usage export CSV,
+        // which bills IDE, cursor-agent and cloud agents into one undifferentiated
+        // ledger.
+        "codex": ("Codex", "#9ca3af"),
+        "copilot": ("Copilot", "#1f2937"),
+        "cursor": ("Cursor", "#0ea5e9"),
         "amp": ("Amp", "#10b981"),
         "droid": ("Droid", "#22c55e"),
         "hermes": ("Hermes", "#a78bfa"),
@@ -67,7 +75,7 @@ public enum ClientRegistry {
     public static func shortName(_ id: String) -> String {
         let name = style(id).displayName
         let registeredNames = Set(entries.values.map { $0.displayName })
-        for suffix in [" CLI", " Code", " IDE"] where name.hasSuffix(suffix) {
+        for suffix in [" CLI", " Code"] where name.hasSuffix(suffix) {
             let base = String(name.dropLast(suffix.count))
             // Don't collapse onto a base that is itself another client's full
             // name — e.g. "Antigravity CLI" must stay distinct from the IDE
@@ -104,6 +112,38 @@ public enum ClientRegistry {
         case "gemini-cli": return "gemini"
         default: return id
         }
+    }
+
+    /// The client whose quota snapshot a client's usage is served by, where the
+    /// two identities differ. `antigravity-cli` is a registered client in its own
+    /// right — process identity, tab, icon and preferences all stay distinct —
+    /// but it draws on the `antigravity` subscription and the quota views have
+    /// always folded it that way. Anything reasoning about which subscription a
+    /// client's tokens consume has to fold it too, or it will conclude the CLI
+    /// owns no subscription at all.
+    public static func quotaOwner(_ id: String) -> String {
+        id == "antigravity-cli" ? "antigravity" : id
+    }
+
+    /// The registered client behind an opencode subscription label. opencode
+    /// reports which providers it is authed against as display labels rather
+    /// than ids (`agent_usage.rs` builds them in `subscription_label`), so a
+    /// consumer that needs the id must map them back here.
+    /// The four labels `subscription_label` renames outright, and the client
+    /// each names. Everything else it emits is a capitalized provider key, which
+    /// cannot be resolved from this table alone. Kept as data rather than a
+    /// `switch` so a caller can tell a rename from a passthrough — three of the
+    /// four lowercase to their own id, so comparing the result against
+    /// `label.lowercased()` cannot make that distinction.
+    public static let subscriptionLabelAliases: [String: String] = [
+        "Codex": "codex",
+        "Claude": "claude",
+        "Copilot": "copilot",
+        "Gemini": "antigravity",
+    ]
+
+    public static func clientId(forSubscriptionLabel label: String) -> String {
+        subscriptionLabelAliases[label] ?? label.lowercased()
     }
 
     /// Parses the comma-separated id form persisted by the tab order/hidden

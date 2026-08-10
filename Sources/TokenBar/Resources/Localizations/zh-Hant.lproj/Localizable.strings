@@ -25,6 +25,9 @@
 "All" = "全部";
 "Filter usage by year" = "依年份篩選用量";
 "Refresh usage data (⌘R)" = "重新整理用量資料（⌘R）";
+"Refresh usage data" = "重新整理用量資料";
+"Refresh usage data (⌘R) — showing data from %@" = "重新整理用量資料（⌘R）— 顯示的是%@的資料";
+"Updating usage data" = "正在更新用量資料";
 "Loading usage…" = "正在載入用量…";
 "Loading…" = "載入中…";
 "Settings" = "設定";
@@ -43,8 +46,10 @@
 "No agent activity in this range" = "這個區間沒有 Agent 活動";
 "No activity in this window" = "這個時間窗內沒有活動";
 "No data" = "沒有資料";
+"Checking…" = "查詢中…";
 "No clients with usage data yet." = "目前沒有任何用戶端有用量資料。";
 "No supported agents yet" = "目前沒有支援的 Agent";
+"Checking agent limits…" = "正在查詢額度…";
 
 /* ===== 卡片標題 ===== */
 "Token Usage" = "Token 用量";
@@ -193,12 +198,38 @@
 "Popover size" = "視窗尺寸";
 "Data refresh" = "資料更新";
 "Language" = "語言";
+"Discord" = "Discord";
 "About" = "關於";
 "Menu bar" = "選單列";
 "Dashboard" = "儀表板";
 "General" = "一般";
 "Agent limits card" = "Agent 額度卡片";
 "Live session card" = "即時工作階段卡片";
+"Usage attribution" = "用量歸屬";
+"API-list-price equivalent" = "API 列表價格等值";
+"Nothing is classified yet. Classify sources in Settings → Usage attribution." = "目前尚未分類任何內容。請前往「設定」→「用量歸屬」分類來源。";
+"No attributed usage in this range." = "這個區間沒有歸屬用量。";
+"Classify each observed client/provider source against the subscription it should count toward. Nothing here is inferred as a billing event." = "將每個觀察到的用戶端／供應商來源分類到它應計入的訂閱。這裡沒有任何內容是推測出的帳務事件。";
+"Provider IDs are compared exactly as the source emitted them, so related-looking routes may appear as separate rows and be classified independently." = "供應商 ID 會完全按照來源送出的內容進行比對，因此看起來相關的路由仍可能顯示為不同列，並分別分類。";
+"A declaration is your classification, not a billing fact." = "這項宣告是你的分類，不是帳務事實。";
+"No provider-split usage in this range." = "這個區間沒有按供應商分列的用量。";
+"Accept all suggestions (%lld)" = "接受所有建議（%lld）";
+"Suggestions are proposals; they do not change your classification until accepted." = "建議只是提案；接受前不會改變你的分類。";
+"%@ · %@" = "%1$@ · %2$@";
+"Observed %@ tokens · %@" = "觀察到 %@ tokens · %@";
+"Classification" = "分類";
+"Unassigned" = "未指定";
+"Not a subscription" = "不是訂閱";
+"Counts toward %@" = "計入 %@";
+"Suggested: counts toward %@" = "建議：計入 %@";
+"Suggested: not a subscription" = "建議：不是訂閱";
+"Usage could not be loaded, so there is nothing to classify yet." = "無法載入用量，因此目前沒有可分類的內容。";
+"Usage breakdown is unavailable right now." = "目前無法顯示用量拆分。";
+"Unspecified provider" = "未指定供應商";
+"Classification for %@" = "%@ 的分類";
+"Could not save this classification: existing attribution data is invalid or foreign." = "無法儲存這項分類：現有的歸屬資料無效或來自其他格式。";
+"Could not save this classification: the attribution entry limit was reached." = "無法儲存這項分類：已達歸屬項目上限。";
+"Could not save this classification: the new value is too large or unsupported." = "無法儲存這項分類：新值太大或不受支援。";
 
 /* ===== 設定：選項 ===== */
 "Launch at login" = "登入時開啟";
@@ -213,6 +244,21 @@
 "Check for updates" = "檢查更新";
 "Check Now" = "立即檢查";
 "Receive beta updates" = "接收 beta 版更新";
+"Show today's usage on Discord" = "在 Discord 顯示今日用量";
+"Open Settings" = "開啟設定";
+"Not now" = "暫時不要";
+"1.2M tokens today" = "今日 1.2M token";
+"Claude Code · $10-50" = "Claude Code · $10-50";
+"Your Discord profile can show what you have been building today. Pick exactly what appears — or nothing at all — in Settings." = "你的 Discord 個人檔案可以顯示你今天在做什麼。要顯示哪些內容——或什麼都不顯示——都在設定裡挑。";
+"Off by default. Publishes what you pick below — today's tokens, a client name, a cost range or rounded figure — for whichever client you choose, and a link to TokenBar's source to your Discord profile. It updates while you work, so your active hours show too. Anyone who can see your profile can read and keep every update; switching this off stops new ones but cannot unshare what already went out. Hidden clients are never included, and a change here reaches your profile within about 15 seconds." = "預設關閉。會把你在下方勾選的內容——今日 token 數、用戶端名稱、花費級距或取整金額——依你指定的用戶端，連同一個 TokenBar 原始碼連結，發布到你的 Discord 個人檔案。工作時會持續更新，因此活動時段也會曝光。任何看得到你檔案的人都能讀取並保存每一次更新；關閉只會停止後續更新，無法收回已經送出的內容。已隱藏的用戶端不會送出；在這裡做的變更約 15 秒內反映到你的個人檔案。";
+"Include today's tokens" = "包含今日 token 數";
+"Include the client name" = "包含用戶端名稱";
+"Include cost" = "包含花費";
+"Untick everything and nothing is published at all." = "全部取消勾選就完全不發布任何內容。";
+"Show cost as a figure instead of a range" = "以金額而非級距顯示花費";
+"A range keeps you among everyone else in that band. A figure is rounded to the dollar, never cents, but still says more about you — every day. With one client named above, it becomes that tool's daily spend." = "級距讓你和同一區間裡的其他人混在一起。金額會取整到整數美元、不含分位，但仍然每天多透露一些。若上方指定了單一用戶端，它就等於那個工具的每日花費。";
+"Whichever client you used most" = "用量最高的用戶端";
+"Naming one client publishes only its usage, so the totals can differ from the menu bar, which counts every client including ones TokenBar does not recognise. The cost becomes that one tool's daily spend rather than the whole day's." = "指定單一用戶端後只會發布它的用量，因此數字可能與選單列不同——選單列會計入所有用戶端，包含 TokenBar 未收錄的。花費也會變成那一個工具的當日金額，而非整天的總額。";
 "Live preview — settings apply immediately." = "即時預覽，設定會立即套用。";
 "Takes effect the next time TokenBar starts." = "下次啟動 TokenBar 時生效。";
 "Restart TokenBar?" = "重新啟動 TokenBar？";
