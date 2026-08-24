@@ -74,6 +74,9 @@ struct SettingsPanel: View {
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
     @AppStorage("tokenbar.views.hidden") private var hiddenViewsRaw = ""
     @AppStorage(OverviewCard.hiddenKey) private var overviewHiddenRaw = ""
+    @AppStorage(OverviewCard.orderKey) private var overviewOrderRaw = ""
+    @AppStorage(QuotaCard.hiddenKey) private var quotaHiddenRaw = ""
+    @AppStorage(QuotaCard.orderKey) private var quotaOrderRaw = ""
     @AppStorage("tokenbar.limits.asUsed") private var limitsAsUsed = false
     @AppStorage("tokenbar.limits.paceMode") private var paceModeRaw = PaceMode.historical.rawValue
     @AppStorage("tokenbar.limits.layout") private var layoutRaw = LimitsLayout.full.rawValue
@@ -453,32 +456,27 @@ struct SettingsPanel: View {
         }
 
         section("Overview cards") {
-            let hiddenCards = ClientRegistry.parseIdSet(overviewHiddenRaw)
-            VStack(spacing: 1) {
-                ForEach(OverviewCard.toggleable, id: \.self) { card in
-                    HStack {
-                        Text(card.label.localized)
-                            .font(.caption)
-                        Spacer()
-                        Toggle("", isOn: Binding(
-                            get: { !hiddenCards.contains(card.rawValue) },
-                            set: { show in
-                                var hidden = hiddenCards
-                                if show { hidden.remove(card.rawValue) }
-                                else { hidden.insert(card.rawValue) }
-                                overviewHiddenRaw = hidden.sorted().joined(separator: ",")
-                            }
-                        ))
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .labelsHidden()
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                }
-            }
-            .glassCard(cornerRadius: 8)
-            hint("Which cards the Overview lens shows, in this order. The usage chart cannot be hidden — Overview is where every hidden lens falls back to, so it has to keep something. Cost and token data are unaffected.")
+            ReorderableCardList(
+                items: OverviewCard.ordered(orderRaw: overviewOrderRaw).map {
+                    ReorderableCardList.Item(
+                        id: $0.rawValue, label: $0.label,
+                        canHide: OverviewCard.toggleable.contains($0))
+                },
+                orderRaw: $overviewOrderRaw,
+                hiddenRaw: $overviewHiddenRaw,
+                dragSpace: "overview-cards-order")
+            hint("Drag to set the order the Overview lens stacks its cards in; the switch shows or hides one. The usage chart cannot be hidden — Overview is where every hidden lens falls back to, so it has to keep something. Cost and token data are unaffected.")
+        }
+
+        section("Quota cards") {
+            ReorderableCardList(
+                items: QuotaCard.ordered(orderRaw: quotaOrderRaw).map {
+                    ReorderableCardList.Item(id: $0.rawValue, label: $0.label)
+                },
+                orderRaw: $quotaOrderRaw,
+                hiddenRaw: $quotaHiddenRaw,
+                dragSpace: "quota-cards-order")
+            hint("The same for the Quota lens. One order serves both of its surfaces — the all-agent view and a single client's tab — and each shows only the cards that apply to it, so a card missing there is not one you hid.")
         }
 
         section("View tabs") {
