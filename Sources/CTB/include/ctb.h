@@ -92,7 +92,53 @@ char *tb_agent_usage(void);
 // Read-only quota curve snapshot for one series selected by the latest
 // successful agent-usage publication generation. This call performs no network
 // request; the returned JSON is released with tb_free.
-char *tb_quota_curve(const char *client_id, const char *window_key, uint64_t generation);
+// `account_key` selects which account's series to read: NULL or empty is the
+// primary account, which is every account that exists today. Passing the wrong
+// one returns another account's curve under a generation that validates, so it
+// is a parameter rather than something inferred here.
+char *tb_quota_curve(const char *client_id, const char *account_key, const char *window_key,
+                     uint64_t generation);
+
+/* PROTOTYPE - usage inside an absolute [from_ms, until_ms) window.
+ *
+ * `until_ms` is quantised to the minute for caching, so two calls sharing a
+ * `from_ms` and landing in the same minute are answered from one scan: the
+ * later call can be up to a minute short of its own end. Deliberate, and
+ * tested (`window_usage::tests::quantised_window_calls_scan_once`) — the sole
+ * consumer already serves its own scan for 30s before asking again, so exact
+ * ends would buy precision nobody reads at the cost of a 0% hit rate. */
+char *tb_window_usage(int64_t from_ms, int64_t until_ms);
+// Replace the process-wide extra-scan-paths registry used by every
+// subsequent report/parse call (no restart needed). `json` is an object of
+// `{"<public-client-id>": ["<absolute-dir-path>", ...]}`, full-replace
+// semantics ({} clears it). Success data is
+// `{"registeredCount":N,"unreadable":[{"client","path","reason"}],"rejected":[{"client","path","reason"}]}`.
+// A directory that merely can't be read right now (unmounted volume, config
+// dir not yet created) is still registered: it is listed in `unreadable` and
+// picked up automatically by the next scan, with no need to call this again.
+// `rejected` paths are NOT registered and will never contribute — because the
+// client id has no extra-root support here, or because the path cannot become
+// a scan root at all (empty, relative, or an existing non-directory). The last
+// case matters: the scanner walks any path that exists, so a transcript FILE
+// passed as a root would otherwise be ingested while being reported as merely
+// unreadable. Malformed JSON returns the normal error envelope and leaves the
+// registry untouched.
+char *tb_set_extra_scan_paths(const char *json);
+// Replace the process-wide registry of extra Claude config directories — the
+// `CLAUDE_CONFIG_DIR`-isolated accounts that each get their own quota card.
+// `json` is an array of absolute directory paths, e.g.
+// `["/Users/x/.claude-work"]`, full-replace semantics ([] clears it). Success
+// data is `{"registeredCount":N,"rejected":[{"path","reason"}]}`; a path is
+// rejected when it is empty, relative, the filesystem root, or a repeat.
+// Existence is NOT probed: whether a directory is readable right now says
+// nothing about which account its credential belongs to.
+//
+// This is not `tb_set_extra_scan_paths`. That one takes the expanded
+// `<dir>/projects` and `<dir>/transcripts` sub-roots and decides which
+// directories the usage scanner walks; this one takes the config directories
+// themselves and decides whose credential each quota card is fetched with.
+// Passing one where the other is expected fails silently in both directions.
+char *tb_set_claude_config_dirs(const char *json);
 
 // Release a string returned by any tb_* entry point.
 void tb_free(char *p);

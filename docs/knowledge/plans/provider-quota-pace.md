@@ -135,7 +135,7 @@ Antigravity local IDE 的 email 來自 authenticated `GetUserStatus`，可走 au
 | Current provider route | Frozen account evidence |
 |---|---|
 | Codex | 成功 usage response 前實際送出的 `ChatGPT-Account-Id`，缺少時使用 lineage；ID-token email 只供 presentation |
-| Claude | Current payload沒有 bound owner ID；所有 login／setup-token paths使用 lineage |
+| Claude | Current payload沒有 bound owner ID；主 config directory 的所有 login／setup-token paths 仍使用 lineage。**例外(2026-08-23)**:以 `CLAUDE_CONFIG_DIR` 隔離的額外帳號走 authoritative route,identifier 為該目錄的絕對路徑。該路徑不是「與憑證無關的本機狀態」——它**選擇**憑證,因為讀取的 Keychain service 就是 `Claude Code-credentials-<sha256(path)[..8]>`。此綁定**僅在 Keychain 那條路徑成立**:`fetch_claude_inner` 另有四條來源(env token、login-shell harvest、`TOKENBAR_*`、主目錄檔案、固定 service),皆非由目錄選出,故額外帳號的憑證若來自其中任一,**不得寫入 durable history**(fail closed,卡片仍顯示)。主目錄的推導一個位元都沒有改變 |
 | Grok | Current billing response沒有 owner ID；`auth.x.ai` entry的 email只供 presentation，history使用 lineage |
 | Antigravity local IDE | Authenticated `GetUserStatus` email；缺席時 fail closed |
 | Antigravity remote OAuth | Google credential lineage；忽略 unbound active-email state |
@@ -195,16 +195,26 @@ Installation-key 的 read／first-create／key-loss recovery與metadata的 load 
 
 #### Refresh transaction and recovery
 
-App-controlled refresh 的 cross-process lock 固定為 Application Support 的 `quota-auth-refresh-<provider>.lock`，以 owner-only mode 開啟。Lock ordering 只能是 refresh lock → metadata lock；不得在持有 metadata／v3 lock 時反向取得 refresh lock。流程固定依序：
+App-controlled refresh 的 cross-process lock 固定為 Application Support 的 `quota-auth-refresh-<provider>.lock`，以 owner-only mode 開啟。Lock ordering 只能是 refresh lock → metadata lock；不得在持有 metadata／v3 lock 時反向取得 refresh lock。Claude／Grok target-bound transaction 固定依序：
 
 1. 先在account-scope lock內讀取或recover installation-key file並釋放該lock，再取得provider refresh process／file lock；key error保留為typed unavailable，但不得阻止既有credential refresh本身。
-2. 取得 refresh lock 後重新載入 exact current auth record並計算 `F_old`。
-3. 持有 refresh lock 執行既有 refresh request，從回傳 credential 計算 `F_new`；此時不持有 metadata／v3 lock。
-4. 在 metadata transaction 內確認 `F_old` lineage 無 conflict，並把 `F_old`、`F_new` 綁到同一 lineage；persist 後立即釋放 metadata lock。
-5. 仍持有 refresh lock 時 persist provider credentials，完成後釋放 refresh lock。
-6. Quota fetch 成功後，才以已持久化 scope 寫 v3 history。
+2. 取得 refresh lock 後重新載入 exact current auth target A，發出 `RefreshCheckpoint::Reloaded`，計算 `F_old`並resolve A scope／binding。
+3. 持有 refresh lock 執行既有 refresh request，發出 `RefreshCheckpoint::NetworkReturned`，驗證response並計算 `F_new`；此時不持有 metadata／v3 lock。
+4. 在lineage transfer前重新讀取並preflight exact durable target。Missing、changed、malformed或無法可靠驗證皆terminal；不得進入metadata transfer或quota continuation。
+5. Preflight成功後，在 metadata transaction 內確認 `F_old` lineage無conflict，把 `F_old`、`F_new`綁到同一lineage，persist後立即釋放metadata lock，再發出 `RefreshCheckpoint::MetadataHandled`。
+6. 仍持有 refresh lock 時執行typed save：第二次重新讀取／比較exact target，從current root merge以保留siblings，compare成功後才嘗試encode／stage／write。Save closure回傳後一律發出 `RefreshCheckpoint::CredentialsPersisted`，再依typed result分支；這個checkpoint名稱不保證write成功。
+7. 只有success或genuine persistence fail-soft result可進入required quota continuation；success帶reusable binding，persistence failure帶fresh credential與transferred scope但`cache_binding=None`。Quota fetch成功且scope可信後，才寫v3 history。
 
-Crash before metadata save不會以 new credential寫 history；crash between metadata and credential save時 old／new fingerprints都能回到同 lineage；credential save後 crash則下一次仍可 resolve。Metadata write失敗可以讓 auth refresh繼續，但本 poll pace必須是 `unavailable(accountScope)`，不得寫 history。
+| Refresh result | Metadata／checkpoint state | Continuation policy |
+|---|---|---|
+| Preflight target-invalid | 相對已預建立A lineage的metadata baseline byte-identical；只有`Reloaded`、`NetworkReturned` | Terminal；不save、不usage |
+| Post-preflight target-invalid | Transfer已完成；save-attempt checkpoints包含`MetadataHandled`、`CredentialsPersisted`；external durable target不覆寫；new marker可留下inert A-lineage mapping | Terminal；不usage、不cache |
+| Genuine persistence failure | 第二次exact compare成功且transfer已完成；writer／encode persistence stage失敗；不rollback metadata | Fresh-but-uncacheable；exactly one required continuation；不提供reusable cache binding |
+| Success | Current siblings合併保存；persisted `F_new`重新resolve成binding | 繼續既有quota flow並可寫history |
+
+Claude File pinning以exact `claudeAiOauth` object為target；pure Keychain decision同時驗證captured account、current account與captured-account exact item，real write仍固定更新captured account。Mid-refresh mcpOAuth-only、`claudeAiOauth:null`與explicit logout都是`TargetMissing`，不套用top-level setup-token fallback。Grok只重讀captured `auth.x.ai::<client_id>` exact entry，foreign entries不作fallback並在成功merge時保留。Codex與Antigravity維持各自既有ordering／failure policy，不由本流程改寫。
+
+Compare-to-write期間仍可能有same-user external writer介入；filesystem atomic replace與Keychain `security -U`都不是CAS，credential store與lineage metadata也不是cross-resource atomic transaction。Crash after lineage transfer but before credential success可留下old／new fingerprints同lineage；該mapping在target-invalid時是inert，不授權usage。Metadata write失敗不得被當作target persistence failure，本poll pace維持`unavailable(accountScope)`且不得寫history。
 
 | Failure／restore | Required result |
 |---|---|
@@ -221,7 +231,7 @@ Crash before metadata save不會以 new credential寫 history；crash between me
 
 Retained v2 仍含 legacy raw Codex account key，因此分類為 legacy-sensitive migration data；「沒有 raw identifier」只適用新 metadata與 v3。這份 Plan保留 v2 bytes／mtime／path，不隱瞞或假稱已清除；v2 writer／evaluator 已退役，但 schema-2 檔案仍由 `agent_quota_history.rs` 的 importer 作 read-only migration input。
 
-Security fixtures必須覆蓋HMAC known vectors／domain separation、different-installation unlinkability、各credential source、refresh每一步crash injection、same-slot replacement、two-process create／transfer conflict、key exact-length／mode／symlink／non-regular／inode-replacement防護、key-loss orphan recovery、MAC／lock／atomic-write／quarantine failures、Antigravity stale active-email mismatch，以及metadata／v3 byte scan不含fixture raw values或其plain SHA-256。
+Security fixtures必須覆蓋HMAC known vectors／domain separation、different-installation unlinkability、各credential source、refresh每一步crash injection、Claude File／pure Keychain／Grok exact-entry的preflight與post-preflight四種target classification、genuine persistence fail-soft、required continuation count／binding／checkpoint／sibling preservation、same-slot replacement、two-process create／transfer conflict、key exact-length／mode／symlink／non-regular／inode-replacement防護、key-loss orphan recovery、MAC／lock／atomic-write／quarantine failures、Antigravity stale active-email mismatch，以及metadata／v3 byte scan不含fixture raw values或其plain SHA-256。
 
 現行release是ad-hoc signed，因此restrictive Keychain ACL沒有跨rebuild／update的stable code identity。未來只有在release chain採用穩定Developer ID signing後，才可另立migration plan評估升級回Keychain；migration必須匯入並驗證與現有file完全相同的32 bytes，成功前file維持source of truth，絕不能生成新key造成`accountScope`與history斷代。舊開發用Keychain item不屬於migration input。
 
@@ -406,7 +416,7 @@ Weighted median沿用v2的deterministic tie rule：依value升冪排序，累積
 
 ## Storage and migration
 
-Generic store 使用 `quota-pace-history-v3.json`，schema version 固定為 `3`。Top level 是排序後的 `series[]`；每個 `SeriesState` 保存 `providerId`、opaque `accountScope`、`windowKey`、optional `activeResetAt`、`lastActivityAt`、optional rollover state與 `samples[]`。Sample 固定包含 `resetAt`、`durationSeconds`、`durationSource`、`usedPercent`、`sampledAt` 與 `origin`（`liveV3` 或 `importedV2`）。v1 永不讀取；既有 `codex-weekly-history-v2.json` 是唯一 migration input，且 bytes、mtime 與 pathname 必須保持不變。
+Generic store 使用 `quota-pace-history-v3.json`，schema version 現為 `4`。檔名裡的 `v3` 是 store family、在 store 建立時就固定，與 schema counter 是兩個不同的號碼；升級是就地惰性的，磁碟上的檔案會維持 `"schemaVersion": 3` 直到下一次本來就要寫檔的交易。Top level 是排序後的 `series[]`；每個 `SeriesState` 保存 `providerId`、opaque `accountScope`（承載的是 `HistoryScope` 而非 `AccountScope`，欄位名為相容既有記錄而保留）、`windowKey`、optional `activeResetAt`、`lastActivityAt`、optional rollover state與 `samples[]`。Sample 固定包含 `resetAt`、`durationSeconds`、`durationSource`、`usedPercent`、`sampledAt` 與 `origin`（`liveV3` 或 `importedV2`），schema 4 另加 optional `plan`——目前恆為 `None` 且不做 backfill，也不得進入 canonical sample key。v1 永不讀取；既有 `codex-weekly-history-v2.json` 是唯一 migration input，且 bytes、mtime 與 pathname 必須保持不變。
 
 | Concern | Required behavior |
 |---|---|

@@ -1,4 +1,9 @@
-//! Schema-3 provider-neutral quota pace history transaction.
+//! Schema-4 provider-neutral quota pace history transaction.
+//!
+//! The schema counter and the `v3` in the store's filename are two different
+//! numbers: the filename names the store family and was fixed when the store
+//! was introduced, while `HISTORY_SCHEMA_VERSION` is the shape of what is
+//! inside it and is now `4`.
 //!
 //! The locked v3 transaction owns sampling, cycle-aware retention, migration,
 //! and the coherent historical evaluator. Provider adapters resolve identity
@@ -22,11 +27,27 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-pub(crate) const HISTORY_SCHEMA_VERSION: u32 = 3;
+pub(crate) const HISTORY_SCHEMA_VERSION: u32 = 4;
+/// The version this store shipped as from v1.10.0 through v1.13.3, which is
+/// every version that has written the file. `migrate_store_to_current` upgrades
+/// it in memory on load; see `load_store_at_with_mode`.
+pub(crate) const HISTORY_SCHEMA_VERSION_V3: u32 = 3;
+/// `v3` in these names is the store *family*, fixed when the file was
+/// introduced — not its schema version. The version lives in
+/// `HISTORY_SCHEMA_VERSION` and in the file's own `schemaVersion` field. A v4
+/// store is read from and written to these same paths; renaming them would
+/// strand every existing file.
 pub(crate) const HISTORY_FILE_NAME: &str = "quota-pace-history-v3.json";
 pub(crate) const HISTORY_LOCK_FILE_NAME: &str = "quota-pace-v3.lock";
 pub(crate) const LEGACY_V2_FILE_NAME: &str = "codex-weekly-history-v2.json";
+/// Floor for `phase_bucket_count`, and the count every window used to get.
 pub(crate) const PHASE_BUCKET_COUNT: usize = 48;
+/// The only factor `phase_bucket_count` may apply to the floor. Whole, so the
+/// finer grid nests inside the coarser one and no existing sample can change
+/// which cell it shares — see `phase_bucket_count`.
+pub(crate) const PHASE_BUCKET_MULTIPLE: usize = 4;
+/// Ceiling for `phase_bucket_count`, and what a long window actually gets.
+pub(crate) const MAX_PHASE_BUCKET_COUNT: usize = PHASE_BUCKET_COUNT * PHASE_BUCKET_MULTIPLE;
 pub(crate) const GRID_POINT_COUNT: usize = 169;
 pub(crate) const MAX_SERIES: usize = 512;
 pub(crate) const MAX_SAMPLES: usize = 65_536;
@@ -105,8 +126,9 @@ pub(crate) struct SeriesKey {
 impl SeriesKey {
     /// The scope argument is a `HistoryScope`, never an `AccountScope`: a key
     /// that outlives a credential rotation cannot be derived from the credential.
-    /// The persisted field name stays `accountScope` because the store's schema
-    /// is frozen at version 3.
+    /// The persisted field name stays `accountScope` because renaming it would
+    /// orphan every record already on disk, and no migration renames fields —
+    /// the version-4 upgrade adds `QuotaSample.plan` and touches nothing else.
     pub(crate) fn new(
         provider_id: impl Into<String>,
         history_scope: &HistoryScope,
@@ -154,6 +176,31 @@ pub(crate) struct QuotaSample {
     pub(crate) used_percent: f64,
     pub(crate) sampled_at: i64,
     pub(crate) origin: SampleOrigin,
+    /// The subscription plan this sample was taken under. Always `None` for
+    /// now: the field exists so the schema bump and its migration land once,
+    /// ahead of the contract that decides where a plan value may be read from.
+    /// `None` means "not recorded", never "no plan" — nothing may infer a
+    /// value for a sample taken before this field existed, because a plan
+    /// change in the user's past would be recorded as a fact that never
+    /// happened, and no downstream check could tell.
+    ///
+    /// `default` covers v3 samples, which carry no key. Deliberately not
+    /// `skip_serializing_if`: writing `"plan": null` is what makes a v4 file
+    /// unreadable by a v3 build's `deny_unknown_fields`, which is a property
+    /// the downgrade test pins rather than papers over.
+    ///
+    /// **This field must never enter `sample_key`.** Anything that changes
+    /// that key's range is a data migration even when it looks like a
+    /// constant: two samples the old range separated can collide under the
+    /// new one, a duplicate key makes `validate_series` call the series
+    /// corrupt, and the remedy is quarantining the whole file. A per-sample
+    /// flaw then destroys every series. That is not hypothetical — it
+    /// happened on this store when the phase-bucket count moved from a fixed
+    /// 48 to a per-duration value, and 168 is not a multiple of 48 (see
+    /// `PHASE_BUCKET_MULTIPLE`). Pooling by plan belongs in the consumer, not
+    /// in the identity of a stored sample.
+    #[serde(default)]
+    pub(crate) plan: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -631,6 +678,7 @@ fn migrate_codex_v2_at_paths_with_clock_and_mode(
             used_percent: sample.used_percent,
             sampled_at: sample.sampled_at,
             origin: SampleOrigin::ImportedV2,
+            plan: None,
         });
     }
     if candidates.is_empty() {
@@ -1327,9 +1375,20 @@ fn add_sample_if_new(
     used_percent: f64,
     sampled_at: i64,
 ) -> bool {
+    // `0.0 <=`, not `0.0 <`. A fresh window reads 0% used, and rejecting it
+    // meant no cycle ever recorded its own start: the first stored sample was
+    // always after some consumption, so `usedPercent` — the span between the
+    // lowest and highest reading — understated every cycle by whatever had been
+    // spent before the app first saw a non-zero number.
+    //
+    // Zero is not a "no data" sentinel here. By the time `enrich_snapshot_with`
+    // builds an observation it has already dropped `PaceState::Unavailable`,
+    // an unparseable reset and any non-finite reading, and its own range check
+    // is `(0.0..=100.0)` — inclusive. The store was the only layer treating a
+    // measured zero as an absence.
     if !(valid_duration(duration_seconds)
         && used_percent.is_finite()
-        && 0.0 < used_percent
+        && 0.0 <= used_percent
         && used_percent <= 100.0)
     {
         return false;
@@ -1342,6 +1401,7 @@ fn add_sample_if_new(
         used_percent,
         sampled_at,
         origin: SampleOrigin::LiveV3,
+        plan: None,
     };
     if !validate_sample(&candidate) {
         return false;
@@ -1353,6 +1413,22 @@ fn add_sample_if_new(
         .position(|sample| sample_key(sample) == candidate_key)
     {
         let existing = &series.samples[index];
+        // A cycle's own zero is never replaced. Admitting it (see the range
+        // check above) bought nothing while this path could overwrite it: a
+        // window that moves a point before its first bucket closes puts the
+        // later reading in the same bucket, and the replacement guards below
+        // all pass — later timestamp, larger value — so the stored cycle began
+        // at a nonzero minimum again and `usedPercent`, the span between the
+        // lowest and highest reading, understated it by exactly the amount the
+        // zero was recorded to capture.
+        //
+        // Only the zero. Every other bucket keeps "newest wins", because
+        // elsewhere the latest level is what the profile wants; at the start of
+        // a cycle the BASELINE is, and there is only one sample that can carry
+        // it.
+        if existing.used_percent == 0.0 && used_percent > 0.0 {
+            return false;
+        }
         if (used_percent - existing.used_percent).abs() < 1.0
             || sampled_at < existing.sampled_at
             || (sampled_at == existing.sampled_at && used_percent <= existing.used_percent)
@@ -1370,7 +1446,7 @@ fn add_sample_if_new(
             normalize_reset(sample.reset_at, sample.duration_seconds) == normalized_reset
         })
         .count();
-    if cycle_count >= MAX_SAMPLES_PER_CYCLE {
+    if cycle_count >= phase_bucket_count(duration_seconds) {
         return false;
     }
     series.samples.push(candidate);
@@ -1457,10 +1533,49 @@ fn phase(sample: &QuotaSample) -> f64 {
     (1.0 - remaining as f64 / sample.duration_seconds as f64).clamp(0.0, 1.0)
 }
 
+/// How many phase buckets a cycle of this length is divided into.
+///
+/// Derived from the duration rather than fixed, because a fixed count divides
+/// every window into the same NUMBER of buckets and therefore gives long
+/// windows coarse ones: at 48, a 5-hour session window buckets every six
+/// minutes and a 7-day weekly window every 3.5 hours. A freshly reset weekly
+/// window then holds one sample for its first 3.5 hours no matter how often
+/// the app polls, because a second sample in the same bucket replaces the
+/// first rather than joining it.
+///
+/// A WHOLE MULTIPLE of the floor, never an arbitrary hourly count. This is the
+/// part that cannot be relaxed, and it cost a real store to learn: bucket
+/// boundaries sit at `k / count` of the cycle, so a count that is not a
+/// multiple of the previous one produces a grid that does not NEST inside it,
+/// and two samples separated by the old grid can land in one new cell.
+///
+/// The first attempt was `duration / 1 hour`, which gives 168 for a weekly
+/// window — and 168/48 is 3.5. On this author's own store that merged three
+/// pairs of samples that 48 buckets had kept apart. `validate_series` treats a
+/// duplicate sample key as corruption, and the response to a corrupt store is
+/// quarantine, so a resolution change silently became a history wipe. The data
+/// survived in the `.corrupt-*` file, which is the only reason this is a story
+/// rather than a loss.
+///
+/// So: 48, or 4x that. A 7-day window at 192 buckets is 52.5 minutes each —
+/// past the "one per hour" this was asked for — and a monthly one lands at
+/// 3.75 hours. Short windows keep 48 and are byte-identical: five hours at 48
+/// is already finer than the 60-second poll can fill.
+pub(crate) fn phase_bucket_count(duration_seconds: i64) -> usize {
+    // Above two days. A 48-hour window already buckets at one hour with the
+    // floor, so nothing shorter has anything to gain.
+    if duration_seconds > 2 * 86_400 {
+        PHASE_BUCKET_COUNT * PHASE_BUCKET_MULTIPLE
+    } else {
+        PHASE_BUCKET_COUNT
+    }
+}
+
 fn phase_bucket(reset_at: i64, duration_seconds: i64, sampled_at: i64) -> usize {
+    let count = phase_bucket_count(duration_seconds);
     let remaining = reset_at.saturating_sub(sampled_at);
     let u = (1.0 - remaining as f64 / duration_seconds.max(1) as f64).clamp(0.0, 1.0);
-    ((u * PHASE_BUCKET_COUNT as f64).floor() as usize).min(PHASE_BUCKET_COUNT - 1)
+    ((u * count as f64).floor() as usize).min(count - 1)
 }
 
 fn validate_sample(sample: &QuotaSample) -> bool {
@@ -1471,7 +1586,10 @@ fn validate_sample(sample: &QuotaSample) -> bool {
         && cycle_started_at <= sample.sampled_at
         && sample.sampled_at <= sample.reset_at
         && sample.used_percent.is_finite()
-        && (0.0 < sample.used_percent && sample.used_percent <= 100.0)
+        // Inclusive of zero — see the admission rule in `admit`. `QuotaCurve`'s
+        // Swift decoder mirrors this function exactly and must widen with it,
+        // or a store containing a legitimate 0 would decode as corrupt.
+        && (0.0 <= sample.used_percent && sample.used_percent <= 100.0)
 }
 
 fn validate_series(series: &SeriesState) -> bool {
@@ -1485,7 +1603,11 @@ fn validate_series(series: &SeriesState) -> bool {
         let reset = normalize_reset(sample.reset_at, sample.duration_seconds);
         let count = cycle_counts.entry(reset).or_default();
         *count += 1;
-        *count <= MAX_SAMPLES_PER_CYCLE
+        // Same duration-derived cap `admit` enforces. A fixed one here would
+        // call a store the writer legitimately produced corrupt — a weekly
+        // cycle now holds up to 168 samples — and quarantine would then delete
+        // the history this cap exists to bound.
+        *count <= phase_bucket_count(sample.duration_seconds)
     });
     let rollover_valid = series.rollover.as_ref().is_none_or(|rollover| {
         if !agent_quota_duration::validate_observed_state(rollover) {
@@ -1578,6 +1700,48 @@ fn rollover_activity_at(rollover: &ObservedState) -> i64 {
 /// that broke it could produce a clamped `last_activity_at` above the ceiling,
 /// which the post-body `validate_store_at` would reject, failing the whole
 /// transaction for every provider rather than just one series.
+/// Forget samples this build cannot place, keeping everything it can.
+///
+/// The three sample-level invariants `validate_series` enforces — each sample
+/// individually valid, no two sharing a `sample_key`, and no cycle over its
+/// bucket cap — are all statements about ONE sample being unusable. Failing the
+/// store on them means one unusable sample discards every usable one beside it,
+/// and the pace history's whole value is that it accumulates over weeks.
+///
+/// The newest sample wins a key collision, matching `admit`, which replaces
+/// within a bucket rather than appending. Order is preserved otherwise, so a
+/// store that needed no repair comes out byte-identical.
+fn drop_unplaceable_samples(mut store: Store) -> Store {
+    for series in &mut store.series {
+        let mut seen: BTreeMap<(i64, usize), usize> = BTreeMap::new();
+        let mut per_cycle: BTreeMap<i64, usize> = BTreeMap::new();
+        let mut kept: Vec<QuotaSample> = Vec::with_capacity(series.samples.len());
+        for sample in series.samples.drain(..) {
+            if !validate_sample(&sample) {
+                continue;
+            }
+            let key = sample_key(&sample);
+            if let Some(index) = seen.get(&key).copied() {
+                // Same bucket: keep the newer reading, as `admit` would.
+                if sample.sampled_at > kept[index].sampled_at {
+                    kept[index] = sample;
+                }
+                continue;
+            }
+            let reset = normalize_reset(sample.reset_at, sample.duration_seconds);
+            let count = per_cycle.entry(reset).or_default();
+            if *count >= phase_bucket_count(sample.duration_seconds) {
+                continue;
+            }
+            *count += 1;
+            seen.insert(key, kept.len());
+            kept.push(sample);
+        }
+        series.samples = kept;
+    }
+    store
+}
+
 fn repair_store_at(mut store: Store, upper_bound: i64, observation_now: i64) -> Store {
     debug_assert!(
         observation_now <= upper_bound,
@@ -1796,7 +1960,16 @@ fn retention_cycles(series: &SeriesState, now: i64) -> Vec<RetentionCycleDescrip
         .collect()
 }
 
-fn is_active_group_sample(active_reset_at: i64, sample: &QuotaSample) -> bool {
+/// Whether a stored sample belongs to the cycle the window is still inside.
+///
+/// Both sides are normalized, and that is the whole point. `series.active_reset_at`
+/// holds the RAW provider value while every stored sample holds
+/// `normalize_sample_reset(...)`, so an exact comparison between them fails
+/// whenever the provider's reset is not already on the quantum — which is the
+/// ordinary case, not the exotic one (codex was off by 62s, grok by 19s). This
+/// predicate is the producer's own answer and is published per point so no
+/// consumer has to re-derive a quantization rule across the FFI boundary.
+pub(crate) fn is_active_group_sample(active_reset_at: i64, sample: &QuotaSample) -> bool {
     validate_sample(sample)
         && normalize_reset(sample.reset_at, sample.duration_seconds)
             == normalize_reset(active_reset_at, sample.duration_seconds)
@@ -2930,6 +3103,58 @@ fn load_store(path: &Path, now: i64) -> Result<LoadedStore, HistoryError> {
     load_store_at_with_mode(StorageMode::Generic, path, now, now)
 }
 
+/// Upgrade a store deserialized from disk to `HISTORY_SCHEMA_VERSION`.
+///
+/// v3 → v4 adds `QuotaSample::plan`, which `#[serde(default)]` has already
+/// filled with `None` by the time this runs. Nothing else differs, so the
+/// upgrade is the version stamp alone — and deliberately nothing more. Reading
+/// a plan for samples taken before the field existed would turn a known
+/// unknown into an unknown error: the user's history contains a real plan
+/// change, and a backfilled value would be wrong for one side of it while
+/// every downstream check kept working on the wrong answer.
+///
+/// **Placed between deserialization and `validate_store`, and the version
+/// equality inside `validate_store` is left exactly as strict.** That check
+/// demands an exact version match
+/// and is also the gate `validate_store_at` applies before a transaction
+/// writes (`save_store_atomic_with_mode`). Relaxing it there would let a store
+/// still stamped `3` reach the writer and produce a file whose version field
+/// says 3 while its samples carry `plan` — a shape no version of this code can
+/// read back, written irreversibly.
+///
+/// **The upgrade is lazy, and that is the chosen semantics.** The transaction
+/// snapshots `before` from the value this function returns and writes only when
+/// the store actually changed, so a bare version bump does not dirty it and
+/// does not trigger a write; `read_series_at_path_with_mode` never writes at
+/// all. The file therefore stays `"schemaVersion": 3` on disk until the next
+/// transaction that had a reason to write anyway, re-upgrading in memory on
+/// every load until then. Chosen over an eager upgrade because writing is the
+/// only irreversible act here, and because a file still stamped 3 is one an
+/// older build can still read — the downgrade window closes when the file is
+/// rewritten, not when this code ships. The cost is that the on-disk format
+/// converts at an unpredictable moment, which is why it is documented here,
+/// in `architecture.md`, and in `verification.md`: someone inspecting the file
+/// and finding `3` would otherwise read it as a failed migration.
+///
+/// A store at any other version is returned untouched for `validate_store` to
+/// reject, which quarantines it. That covers a file written by a future build.
+///
+/// **Ordering against `drop_unplaceable_samples`** (PR #227, which occupies
+/// this same position): the upgrade runs first. The two are commutative today
+/// — that pass reads only `series.samples` and this one writes only
+/// `schema_version` — so the order is chosen for the case where they stop
+/// being commutative. A migration that ever rewrites samples must run before
+/// the pass that judges whether a sample is placeable, or the judging happens
+/// against the shape the previous version wrote. Version first, samples
+/// second, and a future migration inherits the order rather than re-deciding
+/// it under merge pressure.
+fn migrate_store_to_current(mut store: Store) -> Store {
+    if store.schema_version == HISTORY_SCHEMA_VERSION_V3 {
+        store.schema_version = HISTORY_SCHEMA_VERSION;
+    }
+    store
+}
+
 fn load_store_at_with_mode(
     mode: StorageMode,
     path: &Path,
@@ -2943,8 +3168,31 @@ fn load_store_at_with_mode(
         });
     };
 
+    // Drop offending SAMPLES before condemning the FILE. A duplicate sample key
+    // and a cycle over its bucket cap are per-sample facts, and quarantine is
+    // per-store: a resolution change once turned three bad keys out of 2,775
+    // samples into 31 series moved aside and every window back to "learning
+    // history". Nothing about that file was untrustworthy — 99.9% of it was the
+    // same data it had been a minute earlier.
+    //
+    // Quarantine stays for what it was for: bytes that will not parse, a
+    // schema version this build does not speak, series out of order — things
+    // that say the file did not come from here. A sample this build cannot
+    // place is a sample to forget, not a history to burn.
     let parsed = serde_json::from_slice::<Store>(&bytes)
         .ok()
+        // Version before samples, and the reason is not one you can observe
+        // here. `drop_unplaceable_samples` judges every sample against the
+        // CURRENT bucket rules and per-cycle cap, so a migration that rewrites
+        // `sampled_at`, `reset_at`, or `duration_seconds` must run before it —
+        // otherwise its output is judged by coordinates it was in the middle
+        // of changing. v3→v4 rewrites none of those (it stamps the version and
+        // relies on `serde(default)` for `plan`), so these two commute today:
+        // read and write sets are disjoint. The constraint is prospective, and
+        // it is written down now because the migration that needs it will not
+        // be able to add it retroactively.
+        .map(migrate_store_to_current)
+        .map(drop_unplaceable_samples)
         .filter(|store| validate_store(store));
     if let Some(store) = parsed {
         let store = if validate_store_at(&store, validation_now) {
@@ -3910,6 +4158,7 @@ mod tests {
             used_percent,
             sampled_at,
             origin,
+            plan: None,
         }
     }
 
@@ -5016,8 +5265,295 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Rewrite an on-disk v4 store into the exact shape a v3 build wrote:
+    /// version stamp back to 3, `plan` key gone from every sample.
+    ///
+    /// Derived from a real file rather than hand-written JSON so it cannot
+    /// drift out of sync with the rest of the schema, and it asserts the key
+    /// was actually there to remove — otherwise a regression that stopped
+    /// serializing `plan` would quietly turn this into a v4-loads-v4 test.
+    fn downgrade_file_to_v3(path: &Path) -> usize {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["schemaVersion"], HISTORY_SCHEMA_VERSION);
+        value["schemaVersion"] = serde_json::json!(HISTORY_SCHEMA_VERSION_V3);
+        let mut samples = 0;
+        for series in value["series"].as_array_mut().unwrap() {
+            for sample in series["samples"].as_array_mut().unwrap() {
+                assert!(
+                    sample.as_object_mut().unwrap().remove("plan").is_some(),
+                    "the fixture must start from a file that serializes `plan`"
+                );
+                samples += 1;
+            }
+        }
+        assert!(samples > 0, "an empty fixture makes every later claim vacuous");
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        samples
+    }
+
+    /// V1a, V1b and V2 in one function, because the order is load-bearing and
+    /// invisible in the code: if the v3 store were quarantined instead of
+    /// upgraded, the store would be empty and "every sample's plan is None"
+    /// would pass on the empty set. The sample count is asserted first and
+    /// carried forward so that cannot happen silently.
     #[test]
-    fn writes_schema_three_sorted_series_and_exact_sample_fields() {
+    fn a_v3_store_upgrades_in_memory_keeps_every_sample_and_converts_on_disk_only_when_written() {
+        let (directory, path) = temp_path("v3-upgrade");
+        let now = 1_000_000;
+        let reset = now + 7 * DAY;
+
+        // Build a real multi-series, multi-sample store through the shipping
+        // write path, then take it back to v3.
+        // Offsets are spaced by more than one phase bucket. A 7-day window is
+        // split into `phase_bucket_count(7 * DAY)` buckets — 192, since
+        // anything over two days takes the `PHASE_BUCKET_MULTIPLE` step — so a
+        // bucket is 52.5 minutes and 4h apart is comfortably clear. Samples
+        // inside one bucket replace each other, which would leave a fixture far
+        // smaller than it reads as; the spacing is deliberately loose enough to
+        // survive another change to the bucket count.
+        for (account, offset, used) in [
+            ("a", 0, 10.0),
+            ("a", 4 * HOUR, 20.0),
+            ("a", 8 * HOUR, 30.0),
+            ("b", 0, 15.0),
+            ("b", 4 * HOUR, 25.0),
+        ] {
+            assert!(matches!(
+                record(
+                    &path,
+                    account,
+                    Some(reset),
+                    used,
+                    now + offset,
+                    provider(reset, 7 * DAY),
+                    None
+                ),
+                HistoryOutcome::Ready { sampled: true, .. }
+            ));
+        }
+        let before = read_store(&path);
+        let series_count = before.series.len();
+        assert_eq!(series_count, 2);
+        let sample_count = downgrade_file_to_v3(&path);
+        assert_eq!(sample_count, 5);
+
+        // V1a — the upgrade happens on load, loses nothing, and does not
+        // quarantine.
+        let loaded =
+            load_store_at_with_mode(StorageMode::System, &path, now + 12 * HOUR, now + 12 * HOUR)
+                .unwrap();
+        assert!(!loaded.quarantined, "a v3 store was quarantined instead of upgraded");
+        assert_eq!(loaded.store.schema_version, HISTORY_SCHEMA_VERSION);
+        assert_eq!(loaded.store.series.len(), series_count);
+        assert_eq!(
+            loaded
+                .store
+                .series
+                .iter()
+                .map(|series| series.samples.len())
+                .sum::<usize>(),
+            sample_count
+        );
+        assert_eq!(loaded.store, before, "the upgrade changed something other than the version");
+
+        // V1b — the upgrade is lazy. Loading is not a reason to write, so the
+        // file is still stamped 3 and still carries no `plan` key.
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["schemaVersion"], HISTORY_SCHEMA_VERSION_V3,
+            "loading rewrote the file, so the eager-upgrade risk this slice avoids is present"
+        );
+        assert!(
+            on_disk["series"][0]["samples"][0]
+                .as_object()
+                .unwrap()
+                .get("plan")
+                .is_none()
+        );
+
+        // V2 — a transaction that had a reason to write converts the file, and
+        // every sample it writes, old and new, has no plan.
+        assert!(matches!(
+            record(
+                &path,
+                "a",
+                Some(reset),
+                40.0,
+                now + 12 * HOUR,
+                provider(reset, 7 * DAY),
+                None
+            ),
+            HistoryOutcome::Ready { sampled: true, .. }
+        ));
+        let after = read_store(&path);
+        assert_eq!(after.schema_version, HISTORY_SCHEMA_VERSION);
+        assert_eq!(
+            after
+                .series
+                .iter()
+                .map(|series| series.samples.len())
+                .sum::<usize>(),
+            sample_count + 1
+        );
+        assert!(
+            after
+                .series
+                .iter()
+                .flat_map(|series| series.samples.iter())
+                .all(|sample| sample.plan.is_none()),
+            "a plan value was written, and nothing in this slice has one to write"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// V5. The hermetic fixture above proves the upgrade on a store this test
+    /// file built; this one proves it on a store the shipping app actually
+    /// wrote, which is the only kind that exists on a user's disk.
+    ///
+    /// **The operator supplies a copy.** Point
+    /// `TOKENBAR_QUOTA_STORE_COPY_SOURCE` at a file you copied out yourself:
+    ///
+    /// ```text
+    /// cp "$HOME/Library/Application Support/com.nyanako.tokenbar/quota-pace-history-v3.json" /tmp/store-copy.json
+    /// TOKENBAR_QUOTA_STORE_COPY_SOURCE=/tmp/store-copy.json cargo test -p tb_core_ffi -- --ignored real_store
+    /// ```
+    ///
+    /// A source inside the application-data directory is refused by this
+    /// function, not by how it is invoked. `#[ignore]` and an unset variable
+    /// are properties of the caller and decay differently from the body:
+    /// `cargo test -- --ignored` is a normal thing to run, and a variable
+    /// exported once into a shell profile is a normal thing to forget. A check
+    /// here cannot be un-set by either.
+    ///
+    /// Byte-equality at the end would only prove this test did not modify the
+    /// source. It proves nothing about a panic between the copy and the
+    /// assertion, and nothing at all if the process is killed. Not opening the
+    /// live file is the only guarantee that survives those.
+    #[test]
+    #[ignore = "needs a store copy the operator made; see the doc comment"]
+    fn a_real_store_upgrades_without_losing_series_or_samples() {
+        let source = std::env::var("TOKENBAR_QUOTA_STORE_COPY_SOURCE")
+            .expect("set TOKENBAR_QUOTA_STORE_COPY_SOURCE to a copy you made");
+        let source = Path::new(&source);
+        // Resolve first: a symlink into the data directory is the same file.
+        let resolved = fs::canonicalize(source).expect("resolve the source path");
+        if let Some(home) = crate::user_home_dir() {
+            let protected = home.join("Library/Application Support");
+            assert!(
+                !resolved.starts_with(&protected),
+                "refusing to open {} — it is inside the application-data directory. \
+                 Copy the store out and point the variable at the copy.",
+                resolved.display()
+            );
+        }
+        let original = fs::read(&resolved).expect("read the store copy");
+
+        let (directory, path) = temp_path("real-store-copy");
+        fs::write(&path, &original).unwrap();
+
+        let raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let series_before = raw["series"].as_array().unwrap().len();
+        let samples_before: usize = raw["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|series| series["samples"].as_array().unwrap().len())
+            .sum();
+        assert!(samples_before > 0, "an empty source proves nothing");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let loaded = load_store_at_with_mode(StorageMode::System, &path, now, now).unwrap();
+
+        assert!(!loaded.quarantined, "the real store was quarantined");
+        assert_eq!(loaded.store.schema_version, HISTORY_SCHEMA_VERSION);
+        assert_eq!(loaded.store.series.len(), series_before);
+        // Two passes run between deserialization and this assertion: the
+        // upgrade, and `drop_unplaceable_samples`. A healthy store should lose
+        // nothing to either, so a drop here is worth failing on whichever one
+        // caused it — but read the failure carefully before assuming it was
+        // the migration.
+        assert_eq!(
+            loaded
+                .store
+                .series
+                .iter()
+                .map(|series| series.samples.len())
+                .sum::<usize>(),
+            samples_before,
+            "a real store lost samples on load — either the migration or \
+             `drop_unplaceable_samples` rejected data this build should place"
+        );
+        assert!(
+            loaded
+                .store
+                .series
+                .iter()
+                .flat_map(|series| series.samples.iter())
+                .all(|sample| sample.plan.is_none()),
+            "a plan value appeared on a sample that predates the field"
+        );
+
+        assert_eq!(fs::read(&resolved).unwrap(), original, "the source was modified");
+        assert_eq!(fs::read(&path).unwrap(), original, "the copy was rewritten on load");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// V3. Uses a `Some` value even though nothing writes one yet: with only
+    /// `None` in play, a field that was dropped from the wire entirely would
+    /// still round-trip.
+    #[test]
+    fn the_plan_field_round_trips_through_the_wire_format() {
+        let sample = quota_sample(2_000_000, 7 * DAY, 0.5, 42.0, SampleOrigin::LiveV3);
+        let with_plan = QuotaSample {
+            plan: Some("pro".to_string()),
+            ..sample.clone()
+        };
+        for original in [sample, with_plan] {
+            let bytes = serde_json::to_vec(&original).unwrap();
+            let restored = serde_json::from_slice::<QuotaSample>(&bytes).unwrap();
+            assert_eq!(restored, original);
+        }
+    }
+
+    /// V6. Makes the one-way nature of the conversion falsifiable rather than
+    /// asserted in prose: a build that predates `plan` rejects a v4 file, so a
+    /// user who downgrades after their file has been rewritten loses the
+    /// history to quarantine. That is the cost the lazy upgrade defers — it
+    /// does not remove it.
+    #[test]
+    fn a_v3_reader_cannot_parse_a_v4_store() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct V3Sample {
+            reset_at: i64,
+            duration_seconds: i64,
+            duration_source: DurationSource,
+            used_percent: f64,
+            sampled_at: i64,
+            origin: SampleOrigin,
+        }
+
+        let v4 = serde_json::to_vec(&QuotaSample {
+            plan: None,
+            ..quota_sample(2_000_000, 7 * DAY, 0.5, 42.0, SampleOrigin::LiveV3)
+        })
+        .unwrap();
+        assert!(
+            serde_json::from_slice::<V3Sample>(&v4).is_err(),
+            "a v3 reader accepted a v4 sample, so this test proves nothing about the downgrade"
+        );
+    }
+
+    #[test]
+    fn writes_current_schema_sorted_series_and_exact_sample_fields() {
         let (directory, path) = temp_path("schema");
         let now = 1_000_000;
         let reset = now + 7 * DAY;
@@ -5773,6 +6309,176 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A fresh window reads 0% used, and the store used to reject it, so no
+    /// cycle ever recorded its own start: the first stored sample was always
+    /// after some consumption, and the span between the lowest and highest
+    /// reading understated every cycle by whatever had been spent before the
+    /// app first saw a non-zero number.
+    ///
+    /// Zero is a reading, not an absence. `enrich_snapshot_with` has already
+    /// dropped `PaceState::Unavailable`, an unparseable reset and any
+    /// non-finite value before it builds an observation, and its own range
+    /// check is inclusive — the store was the only layer disagreeing.
+    #[test]
+    fn a_fresh_window_records_its_own_zero() {
+        let (directory, path) = temp_path("zero-start");
+        let reset = 9_000_000 + 7 * DAY;
+        // Provider duration evidence, so the series is ready on the first poll
+        // rather than spending it learning the window length — which is the
+        // production case for every window that reports its own reset.
+        let provider = Some(DurationEvidence::provider(reset, 7 * DAY));
+        record(&path, "acct", Some(reset), 0.0, reset - 7 * DAY + 60, provider, None);
+        let store = read_store(&path);
+        assert_eq!(store.series[0].samples.len(), 1);
+        assert_eq!(store.series[0].samples[0].used_percent, 0.0);
+        // And the cycle's span now starts where the cycle did: a later reading
+        // makes the difference the full 30 points, not 30 minus whatever was
+        // spent before the first non-zero sample landed.
+        record(&path, "acct", Some(reset), 30.0, reset - 3 * DAY, provider, None);
+        let grown = read_store(&path);
+        let used: Vec<f64> = grown.series[0]
+            .samples
+            .iter()
+            .map(|sample| sample.used_percent)
+            .collect();
+        assert!(used.contains(&0.0) && used.contains(&30.0));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A fixed bucket count gives long windows coarse buckets: at 48, a 7-day
+    /// cycle buckets every 3.5 hours, so readings an hour apart replaced each
+    /// other and a freshly reset weekly window held one sample for hours while
+    /// its headline moved. The count now follows the duration — one bucket per
+    /// hour, floored at 48 so short windows are untouched and capped at 168.
+    /// Admitting the zero bought nothing while the in-bucket replacement could
+    /// overwrite it: a window that moves a point before its first bucket closes
+    /// puts the later reading in the same bucket, every replacement guard
+    /// passes, and the cycle starts at a nonzero minimum again — understating
+    /// `usedPercent` by exactly the amount the zero was recorded to capture.
+    #[test]
+    fn a_cycles_zero_survives_a_later_reading_in_its_bucket() {
+        let (directory, path) = temp_path("zero-not-replaced");
+        let reset = 9_000_000 + 5 * HOUR;
+        let provider = Some(DurationEvidence::provider(reset, 5 * HOUR));
+        let start = reset - 5 * HOUR;
+        record(&path, "acct", Some(reset), 0.0, start + 60, provider, None);
+        // Same bucket (5h / 48 = 6.25 minutes), later, and far enough above to
+        // clear the one-point replacement threshold.
+        record(&path, "acct", Some(reset), 4.0, start + 240, provider, None);
+        let store = read_store(&path);
+        let used: Vec<f64> = store.series[0]
+            .samples
+            .iter()
+            .map(|sample| sample.used_percent)
+            .collect();
+        assert_eq!(
+            used,
+            vec![0.0],
+            "the zero is kept, and the later reading in its bucket does not replace it"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn long_windows_bucket_by_the_hour() {
+        assert_eq!(phase_bucket_count(5 * HOUR), 48, "short windows unchanged");
+        assert_eq!(phase_bucket_count(7 * DAY), 192, "a weekly window is sub-hourly");
+        assert_eq!(phase_bucket_count(30 * DAY), 192, "and a monthly one is capped");
+        // The invariant that matters more than any of those numbers: every
+        // count is a whole multiple of the floor, so each grid NESTS inside the
+        // coarser one. A count that is not — 168, which is 3.5x — puts samples
+        // that 48 buckets separated into one cell, and `validate_series` reads
+        // a duplicate sample key as corruption, which quarantines the store.
+        // A resolution change then becomes a history wipe.
+        for seconds in [HOUR, 5 * HOUR, DAY, 2 * DAY, 7 * DAY, 30 * DAY, 400 * DAY] {
+            let count = phase_bucket_count(seconds);
+            assert_eq!(
+                count % PHASE_BUCKET_COUNT,
+                0,
+                "bucket count for {seconds}s must be a whole multiple of the floor"
+            );
+            assert!(count <= MAX_PHASE_BUCKET_COUNT);
+        }
+
+        // The behaviour the count exists for: two readings an hour apart inside
+        // a weekly cycle are two samples, not one replacing the other.
+        let (directory, path) = temp_path("hourly-buckets");
+        let reset = 9_000_000 + 7 * DAY;
+        let provider = Some(DurationEvidence::provider(reset, 7 * DAY));
+        record(&path, "acct", Some(reset), 10.0, reset - 5 * DAY, provider, None);
+        record(
+            &path,
+            "acct",
+            Some(reset),
+            12.0,
+            // An hour and a minute, not exactly an hour: a bucket boundary
+            // falls on every hour here, and `1 - 428400/604800` evaluates to
+            // 48.99999999999999 rather than 49, so a sample landing exactly on
+            // one is a knife-edge that says nothing about the rule. Real polls
+            // are a minute apart and never sit on the boundary.
+            reset - 5 * DAY + HOUR + 60,
+            provider,
+            None,
+        );
+        let store = read_store(&path);
+        assert_eq!(
+            store.series[0].samples.len(),
+            2,
+            "an hour apart is two buckets in a weekly cycle"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A duplicate sample key is one unusable SAMPLE, and quarantine discards
+    /// the whole FILE. Changing the bucket resolution once produced three
+    /// duplicates out of 2,775 samples and cost 31 series — every window back
+    /// to "learning history" — for data that was 99.9% intact.
+    #[test]
+    fn one_unplaceable_sample_does_not_discard_the_rest() {
+        let (directory, path) = temp_path("repair-not-quarantine");
+        let reset = 9_000_000 + 7 * DAY;
+        let duration = 7 * DAY;
+        let mut series = SeriesState::new(&key("acct"), reset - duration);
+        // Two readings the CURRENT bucket rule puts in one cell, which is what a
+        // resolution change produces from a store written under the old one.
+        // 0.100 and 0.101 of a 7-day cycle are ten minutes apart and share one
+        // 52.5-minute bucket, so they collide while still having an order —
+        // which is what makes "the newer one wins" testable at all.
+        series.samples = vec![
+            quota_sample(reset, duration, 0.100, 10.0, SampleOrigin::LiveV3),
+            quota_sample(reset, duration, 0.101, 11.0, SampleOrigin::LiveV3),
+            quota_sample(reset, duration, 0.500, 40.0, SampleOrigin::LiveV3),
+        ];
+        series.last_activity_at = reset - 60;
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series],
+        };
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        let loaded = load_store_at_with_mode(
+            StorageMode::System,
+            &path,
+            reset,
+            reset,
+        )
+        .unwrap();
+        assert!(
+            !loaded.quarantined,
+            "one unplaceable sample must not condemn the file"
+        );
+        let kept = &loaded.store.series[0].samples;
+        assert_eq!(kept.len(), 2, "the collision is dropped, the rest survives");
+        assert!(
+            kept.iter().any(|sample| sample.used_percent == 40.0),
+            "the sample in its own bucket is untouched"
+        );
+        // The newer reading wins the collision, matching `admit`'s replacement.
+        assert!(kept.iter().any(|sample| sample.used_percent == 11.0));
+        assert!(!path.with_extension("corrupt").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn copilot_calendar_contract_accepts_exact_month_boundaries() {
         let (directory, path) = temp_path("copilot-calendar");
@@ -5925,6 +6631,7 @@ mod tests {
             used_percent: 10.0,
             sampled_at: sample_reset,
             origin: SampleOrigin::LiveV3,
+            plan: None,
         }];
         assert!(!validate_series(&series));
         series.last_activity_at = sample_reset + 60;
@@ -6003,6 +6710,7 @@ mod tests {
             used_percent: 10.0,
             sampled_at: now,
             origin: SampleOrigin::LiveV3,
+            plan: None,
         };
         let store = Store {
             schema_version: HISTORY_SCHEMA_VERSION,
@@ -6239,6 +6947,7 @@ mod tests {
             used_percent: 40.0,
             sampled_at: upper_bound + 5,
             origin: SampleOrigin::LiveV3,
+            plan: None,
         };
         let tainted = SeriesState {
             provider_id: "claude".into(),
@@ -6384,6 +7093,7 @@ mod tests {
             // updating this one in place.
             sampled_at: observation_now - 50_000,
             origin: SampleOrigin::LiveV3,
+            plan: None,
         };
         let series = SeriesState {
             provider_id: "copilot".into(),
@@ -6449,6 +7159,7 @@ mod tests {
             used_percent: 10.0,
             sampled_at: 80, // strictly between observation_now and upper_bound
             origin: SampleOrigin::LiveV3,
+            plan: None,
         };
         let series = SeriesState {
             provider_id: "claude".into(),
@@ -6474,12 +7185,13 @@ mod tests {
     }
 
     #[test]
-    fn repair_floor_binds_for_a_surviving_rollover() {
-        let upper_bound = 200;
-        let observation_now = 50;
-        let rollover_activity = 150; // strictly between observation_now and upper_bound
-        let far_reset = upper_bound + 10 * DAY; // a normal rollover's reset_at sits far beyond upper_bound
-        let series = SeriesState {
+    fn clock_repair_loader_ignores_future_rollover_boundary() {
+        let (directory, path) = temp_path("clock-rollover-boundary");
+        let upper_bound = 32_000_000;
+        let observation_now = upper_bound - 100;
+        let rollover_activity = upper_bound - 50;
+        let far_reset = upper_bound + 10 * DAY;
+        let trigger = SeriesState {
             provider_id: "claude".into(),
             account_scope: "acct".into(),
             window_key: "weekly.v1".into(),
@@ -6492,22 +7204,65 @@ mod tests {
             )),
             samples: Vec::new(),
         };
-        let store = Store {
-            schema_version: HISTORY_SCHEMA_VERSION,
-            series: vec![series],
+        let sibling = SeriesState {
+            provider_id: "copilot".into(),
+            account_scope: "acct".into(),
+            window_key: "premium_interactions.v1".into(),
+            active_reset_at: None,
+            last_activity_at: upper_bound - 10,
+            rollover: None,
+            samples: Vec::new(),
         };
+        let sibling_only = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![sibling.clone()],
+        };
+        assert!(validate_store_at(&sibling_only, upper_bound));
 
-        let repaired = repair_store_at(store, upper_bound, observation_now);
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![trigger.clone(), sibling.clone()],
+        };
+        store.series.sort_by(series_order);
+        assert!(validate_store(&store));
         assert!(
-            repaired.series[0].rollover.is_some(),
-            "the rollover itself survives detection"
+            !validate_store_at(&store, upper_bound),
+            "the trigger's observed activity must force the loader through repair"
         );
+        let original_bytes = serde_json::to_vec_pretty(&store).unwrap();
+        fs::write(&path, &original_bytes).unwrap();
+
+        reset_save_call_count();
+        let loaded =
+            load_store_at_with_mode(StorageMode::Generic, &path, upper_bound, observation_now)
+                .unwrap();
+        assert!(!loaded.quarantined);
+
+        let mut expected_trigger = trigger;
+        expected_trigger.last_activity_at = rollover_activity;
+        let mut expected = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![expected_trigger, sibling],
+        };
+        expected.series.sort_by(series_order);
         assert_eq!(
-            repaired.series[0].last_activity_at, rollover_activity,
-            "floor must include the surviving rollover's activity timestamp"
+            loaded.store, expected,
+            "repair must retain a rollover whose activity is trusted even when its reset boundary is in the future"
         );
-        assert!(validate_series(&repaired.series[0]));
-        assert!(validate_store_at(&repaired, upper_bound));
+        assert!(validate_store_at(&loaded.store, upper_bound));
+        assert_eq!(save_call_count(), 0, "loader repair must remain zero-save");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original_bytes,
+            "loader repair must not rewrite fixture bytes"
+        );
+        assert!(!directory
+            .join(format!(
+                "quota-pace-history-v3.corrupt-{observation_now}.json"
+            ))
+            .exists());
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -6570,48 +7325,78 @@ mod tests {
     }
 
     #[test]
-    fn repair_gate_is_load_bearing_inside_repair_store_at() {
-        // The fixture above proves the end-to-end "no save" outcome, but for
-        // a *single-series* store that outcome holds even without the gate:
-        // load_store_at_with_mode only calls repair_store_at when
-        // validate_store_at already failed, which for one series means that
-        // series' own last_activity_at was the thing leading upper_bound.
-        //
-        // The gate is NOT dead code. In a multi-series store — the reported
-        // shape in #144, and any real store — series A can lead upper_bound
-        // and force the repair while sibling B sits in the healthy band
-        // (observation_now, upper_bound] left by a faster concurrent writer.
-        // Without the gate the loader lowers B's last_activity_at to
-        // observation_now, discarding a timestamp another writer committed:
-        // a lost update on the production path. Verified by driving a
-        // two-series store through load_store_at_with_mode with the gate
-        // removed. Do not delete it as unreachable.
-        //
-        // This test calls repair_store_at directly, which production never
-        // does for an already-healthy
-        // series, specifically to pin the internal gate: removing it must
-        // make this test fail even though no real load path currently can.
+    fn clock_repair_loader_preserves_sibling_at_upper_bound() {
+        let (directory, path) = temp_path("clock-gate-loader");
         let upper_bound = 31_000_000;
         let observation_now = upper_bound - 100;
-        let series = SeriesState {
+        let trigger = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "session.v1".into(),
+            active_reset_at: None,
+            last_activity_at: upper_bound + 50,
+            rollover: None,
+            samples: Vec::new(),
+        };
+        let sibling = SeriesState {
             provider_id: "copilot".into(),
             account_scope: "acct".into(),
             window_key: "premium_interactions.v1".into(),
             active_reset_at: None,
-            last_activity_at: observation_now + 50, // within (observation_now, upper_bound]
+            last_activity_at: upper_bound,
             rollover: None,
             samples: Vec::new(),
         };
-        let store = Store {
+        let sibling_only = Store {
             schema_version: HISTORY_SCHEMA_VERSION,
-            series: vec![series.clone()],
+            series: vec![sibling.clone()],
         };
+        assert!(validate_store_at(&sibling_only, upper_bound));
 
-        let repaired = repair_store_at(store, upper_bound, observation_now);
-        assert_eq!(
-            repaired.series[0], series,
-            "a series at or below the ceiling must be returned untouched, field for field"
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![trigger.clone(), sibling.clone()],
+        };
+        store.series.sort_by(series_order);
+        assert!(validate_store(&store));
+        assert!(
+            !validate_store_at(&store, upper_bound),
+            "the trigger must force the loader through repair"
         );
+        let original_bytes = serde_json::to_vec_pretty(&store).unwrap();
+        fs::write(&path, &original_bytes).unwrap();
+
+        reset_save_call_count();
+        let loaded =
+            load_store_at_with_mode(StorageMode::Generic, &path, upper_bound, observation_now)
+                .unwrap();
+        assert!(!loaded.quarantined);
+
+        let mut expected_trigger = trigger;
+        expected_trigger.last_activity_at = observation_now;
+        let mut expected = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![expected_trigger, sibling],
+        };
+        expected.series.sort_by(series_order);
+        assert_eq!(
+            loaded.store, expected,
+            "repair must not lower a sibling timestamp at the inclusive ceiling"
+        );
+        assert!(validate_store_at(&loaded.store, upper_bound));
+        assert_eq!(save_call_count(), 0, "loader repair must remain zero-save");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original_bytes,
+            "loader repair must not rewrite fixture bytes"
+        );
+        assert!(!directory
+            .join(format!(
+                "quota-pace-history-v3.corrupt-{observation_now}.json"
+            ))
+            .exists());
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -6630,6 +7415,7 @@ mod tests {
             used_percent: 8.0,
             sampled_at: upper_bound - 20,
             origin: SampleOrigin::LiveV3,
+            plan: None,
         };
         let series = SeriesState {
             provider_id: "claude".into(),
@@ -7234,6 +8020,7 @@ mod tests {
             used_percent: 10.0,
             sampled_at,
             origin: SampleOrigin::LiveV3,
+            plan: None,
         };
         assert!(validate_sample(&sample(reset - DAY)));
         assert!(validate_sample(&sample(reset - 1)));
@@ -7500,6 +8287,7 @@ mod tests {
                     used_percent: 10.0,
                     sampled_at: now - DAY,
                     origin: SampleOrigin::LiveV3,
+                    plan: None,
                 }],
             });
         }

@@ -67,6 +67,7 @@ struct SettingsWindowView: View {
     @AppStorage(ClientRegistry.tabOrderKey) private var tabsOrderRaw = ""
     @AppStorage(TrayAnimator.quotaSourceKey) private var quotaSourceRaw = QuotaResolver.auto
     @AppStorage(ClientRegistry.limitsHiddenKey) private var limitsHiddenRaw = ""
+    @AppStorage(ClaudeExtraRoots.generationKey) private var extraRootsGeneration = 0
 
     /// The user's hidden client set, parsed from the observed raw string.
     private var hiddenClients: Set<String> {
@@ -184,7 +185,9 @@ struct SettingsWindowView: View {
         .task(id: model.committedSliceKey) {
             await model.ensureModelData(for: .stats)
         }
-        .task { await model.pollAgentUsage() }
+        // See `PopoverView`: keyed so removing an account takes its card away
+        // in the same turn rather than at the poll's convenience.
+        .task(id: extraRootsGeneration) { await model.pollAgentUsage() }
         .task(id: quotaReconciliationID) {
             guard let payload = model.agentUsage else { return }
             let defaults = UsageDataSources.current.allowsQuotaCachePersistence
@@ -201,6 +204,31 @@ struct SettingsWindowView: View {
         // Key the rate poll on the hidden raw so a hide toggle restarts it and
         // re-fetches the filtered rate immediately, instead of lagging ≤10s.
         .task(id: tabsHiddenRaw) { await pollTokensPerMin() }
+        // The preview card's Chart layout needs quota curves, and nothing here
+        // was asking for them — so picking Chart changed the radio button and
+        // nothing else, which reads as a broken setting rather than a setting
+        // whose data is absent.
+        //
+        // Curves only. `windowUsageClient` stays nil deliberately: that is what
+        // gates the message scan, and a Settings window must not start a
+        // multi-second scan to render a thumbnail. Each curve is a ~2ms read of
+        // an already-persisted file.
+        //
+        // The identity carries the client list because the closure reads it and
+        // it arrives with the graph, after this view first appears.
+        .task(id: "\(tabsHiddenRaw)|\(tabsOrderRaw)|"
+              + previewClients.joined(separator: ",")) {
+            model.windowCardClients = previewClients
+            model.refreshWindowQuotaHalves()
+        }
+    }
+
+    /// Clients the preview card renders, derived exactly as the card itself
+    /// derives them so the curve set and the rows cannot disagree.
+    private var previewClients: [String] {
+        ClientRegistry.displayClients(
+            present: model.stats?.presentClients ?? [],
+            hiddenRaw: tabsHiddenRaw, orderRaw: tabsOrderRaw)
     }
 
     /// Whether either initial request is still in flight. Keyed on request
@@ -300,13 +328,10 @@ struct SettingsWindowView: View {
 
             if limitsEnabled {
                 section("Agent limits card") {
-                    let displayClients = ClientRegistry.displayClients(
-                        present: model.stats?.presentClients ?? [],
-                        hiddenRaw: tabsHiddenRaw, orderRaw: tabsOrderRaw)
                     AgentLimitsCard(
-                        clients: displayClients,
+                        clients: previewClients,
                         trace: model.trace, agentUsage: model.agentUsage,
-                        reorderable: true)
+                        reorderable: true, curves: model.windowCurves)
                 }
             }
 

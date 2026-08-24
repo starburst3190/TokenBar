@@ -53,6 +53,45 @@ struct TBEnvelope<T: Decodable>: Decodable {
     }
 }
 
+/// A single extra scan path with a note attached: `client`/`path` identify
+/// it, `reason` explains why it's in this list.
+public struct ScanPathNote: Decodable, Equatable, Sendable {
+    public let client: String
+    public let path: String
+    public let reason: String
+}
+
+/// Result of `tb_set_extra_scan_paths`.
+public struct ExtraScanPathsResult: Decodable, Equatable, Sendable {
+    /// Paths actually entered into the scan registry, including ones
+    /// currently listed in `unreadable`.
+    public let registeredCount: Int
+    /// Registered, but `read_dir` failed for it right now (unmounted volume,
+    /// not-yet-created config dir). Retried automatically on the next scan —
+    /// no action needed from the user beyond fixing the underlying cause.
+    public let unreadable: [ScanPathNote]
+    /// NOT registered, and never will be without the user acting: either the
+    /// client id has no extra-root support here, or the path cannot be a scan
+    /// root at all (empty, relative, or something that exists but isn't a
+    /// directory). Unlike `unreadable`, waiting does not fix these.
+    public let rejected: [ScanPathNote]
+}
+
+/// One directory `tb_set_claude_config_dirs` refused, and why. Unlike an
+/// unreadable scan root, nothing here fixes itself by waiting: the path is
+/// empty, relative, the filesystem root, or a repeat of one already listed.
+public struct RejectedConfigDir: Decodable, Equatable, Sendable {
+    public let path: String
+    public let reason: String
+}
+
+/// Result of `tb_set_claude_config_dirs`.
+public struct ClaudeConfigDirsResult: Decodable, Equatable, Sendable {
+    /// Directories now fetched as their own Claude quota card.
+    public let registeredCount: Int
+    public let rejected: [RejectedConfigDir]
+}
+
 /// Thin Swift facade over the tb_core_ffi staticlib. All calls are blocking;
 /// invoke from a background thread/actor in app code. `agentUsage()` is also
 /// network-bound.
@@ -225,12 +264,37 @@ public enum TBCore {
     /// serving a curve.
     ///
     /// Returns nil when the series exists but has no stored history yet.
+    /// PROTOTYPE — usage inside an absolute [from, until) window.
+    public static func windowUsage(from: Int64, until: Int64) throws -> WindowUsage {
+        try unwrap(tb_window_usage(from, until))
+    }
+
+    /// `accountKey` selects which account's series to read. `nil` is the
+    /// primary account, which is every account that exists today; an extra
+    /// Claude account passes the config directory its binding was published
+    /// under.
+    ///
+    /// It is a parameter rather than something the core infers, because the
+    /// failure it prevents is silent: with one account per client the binding
+    /// map used to be keyed on `(client, window)`, and a second account
+    /// publishing the same window would replace the first. The call would then
+    /// answer with the other account's curve under a generation that
+    /// validates — nothing on either side of the FFI could tell.
+    // No default: a caller that omits this reads the primary account's curve
+    // and nothing reports the mistake, so the argument is required.
     public static func quotaCurve(
-        clientId: String, windowKey: String, generation: UInt64
+        clientId: String, accountKey: String?, windowKey: String, generation: UInt64
     ) throws -> QuotaCurve? {
         let curve: QuotaCurve? = try clientId.withCString { client in
             try windowKey.withCString { window in
-                try unwrapOptional(tb_quota_curve(client, window, generation))
+                // `withCString` on an Optional would bind a temporary that dies
+                // before the call; the nil case has to pass a real NULL.
+                if let accountKey {
+                    return try accountKey.withCString { account in
+                        try unwrapOptional(tb_quota_curve(client, account, window, generation))
+                    }
+                }
+                return try unwrapOptional(tb_quota_curve(client, nil, window, generation))
             }
         }
         try requireAnswering(curve, request: generation)
@@ -256,6 +320,33 @@ public enum TBCore {
     public static func tokensPerMin() throws -> Double {
         let payload: TokensPerMin = try unwrap(tb_tokens_per_min())
         return payload.tokensPerMin
+    }
+
+    /// Replace the process-wide extra-scan-paths registry. `json` is an object
+    /// of `{"<public-client-id>": ["<absolute-dir-path>", ...]}`; full-replace
+    /// semantics — passing `{}` clears every configured root. Takes effect on
+    /// the very next report/parse call, no restart needed. A directory that
+    /// merely can't be read right now is still registered — `unreadable` lists
+    /// those, and the next scan retries them automatically with no further
+    /// action. `rejected` lists paths that are NOT registered: an unsupported
+    /// client id, or a path that can never be a scan root (empty, relative, or
+    /// an existing non-directory).
+    public static func setExtraScanPaths(json: String) throws -> ExtraScanPathsResult {
+        try unwrap(json.withCString { tb_set_extra_scan_paths($0) })
+    }
+
+    /// Replace the process-wide registry of extra Claude config directories.
+    /// `json` is an array of absolute directory paths; full-replace semantics
+    /// — `[]` clears it. Each registered directory is fetched as its own Claude
+    /// quota card, using the Keychain item that directory selects.
+    ///
+    /// Distinct from `setExtraScanPaths`, which takes the expanded
+    /// `<dir>/projects` and `<dir>/transcripts` sub-roots and answers which
+    /// directories the usage scanner walks. This one answers whose credential
+    /// a quota card is fetched with, so it takes the config directories the
+    /// user configured — not the scan subset the core accepted.
+    public static func setClaudeConfigDirs(json: String) throws -> ClaudeConfigDirsResult {
+        try unwrap(json.withCString { tb_set_claude_config_dirs($0) })
     }
 
     /// OAuth quota cards for codex/claude/antigravity/copilot/grok. Network-bound;
@@ -416,11 +507,12 @@ public enum TBCore {
         func point(
             sampledAt: Int64 = 1_000, usedPercent: String = "10.0", resetAt: Int64 = 1_500,
             durationSeconds: Int64 = 1_000, durationSource: String = "contract",
-            origin: String = "liveV3"
+            origin: String = "liveV3", isActiveGroup: String? = "false"
         ) -> String {
-            #"{"sampledAt":\#(sampledAt),"usedPercent":\#(usedPercent),"resetAt":\#(resetAt),"#
+            let active = isActiveGroup.map { #","isActiveGroup":\#($0)"# } ?? ""
+            return #"{"sampledAt":\#(sampledAt),"usedPercent":\#(usedPercent),"resetAt":\#(resetAt),"#
                 + #""durationSeconds":\#(durationSeconds),"durationSource":"\#(durationSource)","#
-                + #""origin":"\#(origin)"}"#
+                + #""origin":"\#(origin)"\#(active)}"#
         }
 
         func curve(
@@ -505,8 +597,25 @@ public enum TBCore {
                     sampledAt: 1_000, resetAt: 1_500,
                     durationSeconds: QuotaCurve.validDurationSeconds.upperBound + 1)]))
         rejects(
-            "a usedPercent outside (0, 100] is rejected",
-            curve(points: [point(usedPercent: "0.0")]))
+            "a usedPercent outside [0, 100] is rejected",
+            curve(points: [point(usedPercent: "-0.1")]))
+        rejects(
+            "a usedPercent above 100 is rejected",
+            curve(points: [point(usedPercent: "100.1")]))
+        // Zero is a READING, not an absence: a fresh window is 0% used, and
+        // rejecting it meant no cycle recorded its own start, so the span
+        // between the lowest and highest reading understated every cycle by
+        // whatever was spent before the app first saw a non-zero number. This
+        // guard mirrors the store's admission and had to widen with it.
+        do {
+            let zero = try JSONDecoder().decode(
+                QuotaCurve.self, from: curve(points: [point(usedPercent: "0.0")]))
+            check("a usedPercent of exactly 0 is accepted — a fresh window's own start",
+                  zero.points.first?.usedPercent == 0)
+        } catch {
+            check("a usedPercent of exactly 0 is accepted — a fresh window's own start",
+                  false)
+        }
         // Rejected by JSON number parsing rather than by the `isFinite` guard,
         // which no JSON input can reach. Kept because it pins that a payload
         // cannot smuggle an unrepresentable number past this boundary.
@@ -528,6 +637,13 @@ public enum TBCore {
         rejects(
             "a curve missing the activeResetAt key is rejected",
             curve(points: [point()], activeResetAt: nil))
+        // Same rule, one level down. Rust always emits `isActiveGroup`, so an
+        // absent key is ABI drift; defaulting it to false would render every
+        // point as finished history — the exact misreading the field was added
+        // to remove, arriving silently rather than as a decode failure.
+        rejects(
+            "a curve point missing the isActiveGroup key is rejected",
+            curve(points: [point(isActiveGroup: nil)]))
 
         // The fixture's generation is 7, which is also what the payload claims,
         // so these two cases differ only in what the caller asked for.

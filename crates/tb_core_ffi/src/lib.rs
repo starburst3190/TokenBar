@@ -24,8 +24,11 @@ mod agent_quota_history;
 mod agent_storage_windows;
 mod agent_usage;
 mod agents_report;
+mod claude_config_dirs;
+mod extra_scan_paths;
 mod filter_parity_probe;
 mod hourly_report;
+mod window_usage;
 mod model_report;
 mod opencode_integrations;
 mod usage_graph;
@@ -34,6 +37,7 @@ mod usage_tail;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_char, CStr, CString};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -90,6 +94,10 @@ impl LocalSourceContext {
             use_env_roots: true,
             year,
             clients,
+            scanner_settings: tokscale_core::scanner::ScannerSettings {
+                extra_scan_paths: extra_scan_paths::snapshot(),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -107,6 +115,10 @@ impl LocalSourceContext {
             use_env_roots: true,
             year,
             clients,
+            scanner_settings: tokscale_core::scanner::ScannerSettings {
+                extra_scan_paths: extra_scan_paths::snapshot(),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -142,10 +154,20 @@ struct PublicationGenerationExhausted;
 static AGENT_USAGE_PUBLICATION_GATE: LazyLock<Mutex<PublicationGate>> =
     LazyLock::new(|| Mutex::new(PublicationGate::default()));
 
+/// Binding lookup key. The middle element is the account, `None` for the
+/// primary — which is every account that exists today.
+///
+/// Without it two accounts of one client publishing the same window collide on
+/// `(provider, window)`, and the survivor is whichever was inserted last.
+/// `tb_quota_curve` would then answer with the other account's curve under a
+/// generation that validates, so nothing on either side of the FFI can tell
+/// the answer is the wrong account's.
+type QuotaCurveBindingKey = (String, Option<String>, String);
+
 #[derive(Debug, Clone, Default)]
 struct QuotaCurveBindingState {
     generation: u64,
-    series: BTreeMap<(String, String), agent_quota_history::SeriesKey>,
+    series: BTreeMap<QuotaCurveBindingKey, agent_quota_history::SeriesKey>,
 }
 
 static QUOTA_CURVE_BINDINGS: LazyLock<RwLock<QuotaCurveBindingState>> =
@@ -177,13 +199,25 @@ fn with_agent_usage_publication_gate<T>(
     with_publication_gate(&AGENT_USAGE_PUBLICATION_GATE, body)
 }
 
+/// `series` pairs each key with the account it belongs to — `None` for the
+/// primary, an extra Claude account's config directory for its own keys.
 fn replace_quota_curve_bindings(
     generation: u64,
-    series: impl IntoIterator<Item = agent_quota_history::SeriesKey>,
+    series: impl IntoIterator<Item = (Option<String>, agent_quota_history::SeriesKey)>,
 ) {
     let series = series
         .into_iter()
-        .map(|key| ((key.provider_id.clone(), key.window_key.clone()), key))
+        .map(|(account, key)| {
+            (
+                (
+                    key.provider_id.clone(),
+                    crate::agent_usage::account_key_component(account.as_deref())
+                        .map(str::to_string),
+                    key.window_key.clone(),
+                ),
+                key,
+            )
+        })
         .collect();
     let mut state = QUOTA_CURVE_BINDINGS
         .write()
@@ -193,13 +227,15 @@ fn replace_quota_curve_bindings(
 
 fn serialize_agent_usage_with_bindings<F>(
     generation: u64,
-    bindings: Vec<agent_quota_history::SeriesKey>,
+    bindings: Vec<(Option<String>, agent_quota_history::SeriesKey)>,
     serialize: F,
 ) -> Result<serde_json::Value, String>
 where
     F: FnOnce() -> Result<serde_json::Value, String>,
 {
     let value = serialize()?;
+    // The account each key was published under travels with it, so two Claude
+    // accounts serving the same window keys keep separate bindings.
     replace_quota_curve_bindings(generation, bindings);
     Ok(value)
 }
@@ -235,6 +271,33 @@ static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
 type GraphCacheEntry = (Instant, u64, serde_json::Value);
 static GRAPH_CACHE: LazyLock<Mutex<HashMap<String, GraphCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+pub(crate) static WINDOW_USAGE_CACHE: LazyLock<
+    Mutex<HashMap<window_usage::CacheKey, window_usage::CacheEntry>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Bumped every time the extra-scan-paths registry is replaced. A scan reads
+/// the root set when it builds its options — `report_options`/`parse_options`
+/// call `extra_scan_paths::snapshot()` — and publishes minutes of work later,
+/// so clearing the caches is not enough on its own: the in-flight scan would
+/// insert its old-root result *after* the clear and the next reader would
+/// serve it. Every publisher records the generation it started under and
+/// drops its result if the registry moved underneath it.
+///
+/// Where that snapshot is taken is load-bearing and this comment used to state
+/// it wrongly, saying the roots were captured with `LocalSourceContext::current()`
+/// at the top of the call. They are not: `LocalSourceContext` carries only
+/// `home_dir`, which no registry replace touches. A reviewer reading the old
+/// wording concluded that a caller queued behind `window_usage::COMPUTE` would
+/// scan with a stale root set while reading a fresh generation. It cannot: the
+/// generation is read after the lock and the roots after that, so a replace
+/// while queued is seen by both, and a replace between them moves the
+/// generation and `publish` refuses. The guard is fail-closed BECAUSE the
+/// snapshot is late, which is the opposite of what the old sentence implied.
+///
+/// Checked inside the lock that guards the thing being published, and bumped
+/// before either clear, so "check the generation" and "publish" cannot be
+/// split by a replace landing between them.
+static ROOT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static TAILER: LazyLock<UsageTailer> = LazyLock::new(UsageTailer::new);
 /// Live-tail tick bookkeeping. `last` is the completion time of the most recent
@@ -304,6 +367,15 @@ struct QuotaCurvePoint {
     duration_seconds: i64,
     duration_source: agent_quota_duration::DurationSource,
     origin: agent_quota_history::SampleOrigin,
+    /// Whether this point belongs to the cycle still running.
+    ///
+    /// Answered here rather than left to the consumer. `active_reset_at` below
+    /// is the RAW provider value and every sample's `reset_at` is normalized,
+    /// so comparing the two exactly — which is what the Swift fold did — fails
+    /// to exclude the running cycle whenever the provider's reset is not
+    /// already on the quantum. That cycle was then drawn under "past windows"
+    /// and counted toward the equivalence threshold while still filling.
+    is_active_group: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -352,6 +424,12 @@ fn quota_curve_payload(
             duration_seconds: sample.duration_seconds,
             duration_source: sample.duration_source,
             origin: sample.origin,
+            // The store's own predicate, not a re-derivation: it normalizes
+            // both sides with the sample's own duration, which is the only
+            // comparison that identifies the group correctly.
+            is_active_group: series.active_reset_at.is_some_and(|active| {
+                agent_quota_history::is_active_group_sample(active, &sample)
+            }),
         })
         .collect::<Vec<_>>();
     serde_json::to_value(QuotaCurvePayload {
@@ -377,6 +455,7 @@ fn history_error_message(error: agent_quota_history::HistoryError) -> String {
 /// serialization blocks, and only something running in there can observe it.
 fn quota_curve_result_with_reader<R, H, S>(
     client_id: &str,
+    account_key: Option<&str>,
     window_key: &str,
     generation: u64,
     before_history: H,
@@ -409,7 +488,11 @@ where
         }
         state
             .series
-            .get(&(client_id.to_string(), window_key.to_string()))
+            .get(&(
+                client_id.to_string(),
+                crate::agent_usage::account_key_component(account_key).map(str::to_string),
+                window_key.to_string(),
+            ))
             .cloned()
             .ok_or_else(|| "quota curve binding is unavailable".to_string())
     };
@@ -439,10 +522,11 @@ where
     if state.generation != 0 && state.generation != generation {
         return Err("quota curve generation is expired".to_string());
     }
-    if state
-        .series
-        .get(&(client_id.to_string(), window_key.to_string()))
-        != Some(&key)
+    if state.series.get(&(
+        client_id.to_string(),
+        crate::agent_usage::account_key_component(account_key).map(str::to_string),
+        window_key.to_string(),
+    )) != Some(&key)
     {
         return Err("quota curve generation is expired".to_string());
     }
@@ -460,6 +544,7 @@ where
 
 fn quota_curve_result(
     client_id: &str,
+    account_key: Option<&str>,
     window_key: &str,
     generation: u64,
 ) -> Result<serde_json::Value, String> {
@@ -471,6 +556,7 @@ fn quota_curve_result(
     {
         return quota_curve_result_with_reader(
             client_id,
+            account_key,
             window_key,
             generation,
             || {},
@@ -483,12 +569,25 @@ fn quota_curve_result(
 
     quota_curve_result_with_reader(
         client_id,
+        account_key,
         window_key,
         generation,
         || {},
         || {},
         |key| agent_quota_history::read_series(key, chrono::Utc::now().timestamp()),
     )
+}
+
+/// NULL is a legitimate value meaning "not supplied", unlike
+/// `required_string_from` where NULL is a caller error.
+unsafe fn optional_string_from(value: *const c_char) -> Result<Option<String>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .map(|value| Some(value.to_string()))
+        .map_err(|_| "account_key is not valid UTF-8".to_string())
 }
 
 unsafe fn required_string_from(value: *const c_char, name: &str) -> Result<String, String> {
@@ -574,15 +673,48 @@ fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
     // mid-compute changes the token, so the next aged-out read recomputes
     // rather than serving a graph that missed it. Keep the same context for
     // both paths so the probe and report scan observe identical source roots.
+    let generation = ROOT_GENERATION.load(Ordering::SeqCst);
     let context = LocalSourceContext::current();
     let token =
         tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap_or(0);
     let data = usage_graph::run(&context, year)?;
-    GRAPH_CACHE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(year.to_string(), (Instant::now(), token, data.clone()));
+    // The caller still gets this payload even when `publish_graph` refuses it.
+    // It answers a request made before the roots changed, and the next call
+    // recomputes rather than serving it again.
+    publish_graph(year, generation, (Instant::now(), token, data.clone()));
     Ok(data)
+}
+
+/// Cache a freshly computed graph unless the root registry moved while it was
+/// being computed.
+///
+/// The generation is re-read inside the lock `invalidate_scan_caches` clears
+/// under. Reading it outside would let a replace land between the check and
+/// the insert — the exact interleaving this guard exists for, and one that
+/// leaves the stale entry in place until it ages out.
+///
+/// Returns whether the entry was published, which is what the tests assert on.
+fn publish_graph(year: &str, generation: u64, entry: GraphCacheEntry) -> bool {
+    let mut cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if ROOT_GENERATION.load(Ordering::SeqCst) != generation {
+        return false;
+    }
+    cache.insert(year.to_string(), entry);
+    true
+}
+
+/// Stamp the live tail as freshly ticked unless the root registry moved during
+/// the tick. Leaving it unstamped makes the next call tick again, which is what
+/// re-reads the new roots; stamping would hide them for `TAIL_TICK_SECS`.
+///
+/// Same lock discipline as `publish_graph`, for the same reason.
+fn stamp_tick_if_current(generation: u64) -> bool {
+    let mut st = lock_tick();
+    if ROOT_GENERATION.load(Ordering::SeqCst) != generation {
+        return false;
+    }
+    st.last = Some(Instant::now());
+    true
 }
 
 fn lock_tick() -> std::sync::MutexGuard<'static, TickState> {
@@ -626,9 +758,10 @@ fn tail_tick_if_stale() {
         }
     };
     if claimed {
+        let generation = ROOT_GENERATION.load(Ordering::SeqCst);
         let _guard = TickGuard; // clears in_flight on drop (success or panic)
         TAILER.tick();
-        lock_tick().last = Some(Instant::now()); // success only — panic skips this
+        stamp_tick_if_current(generation); // success only — panic skips this
     }
 }
 
@@ -815,16 +948,150 @@ pub extern "C" fn tb_agent_usage() -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn tb_quota_curve(
     client_id: *const c_char,
+    account_key: *const c_char,
     window_key: *const c_char,
     generation: u64,
 ) -> *mut c_char {
     guarded("tb_quota_curve", || {
+        // NULL and empty both mean the primary account. Swift passes NULL for
+        // every account that exists today; an extra Claude account passes its
+        // config directory, which is what its binding was published under.
+        let account = match unsafe { optional_string_from(account_key) } {
+            Ok(account) => account,
+            Err(message) => return envelope(Err::<serde_json::Value, String>(message)),
+        };
         let result = unsafe { required_string_from(client_id, "client_id") }.and_then(|client| {
-            unsafe { required_string_from(window_key, "window_key") }
-                .and_then(|window| quota_curve_result(&client, &window, generation))
+            unsafe { required_string_from(window_key, "window_key") }.and_then(|window| {
+                quota_curve_result(&client, account.as_deref(), &window, generation)
+            })
         });
         envelope(result)
     })
+}
+
+/// Replace the process-wide extra-scan-paths registry (see the
+/// `extra_scan_paths` module doc). `json` is an object of
+/// `{"<public-client-id>": ["<absolute-dir-path>", ...]}`, e.g.
+/// `{"claude":["/Users/x/.claude-work/projects","/Users/x/.claude-work/transcripts"]}`.
+/// Full-replace: passing `{}` (or every client's list empty) clears the
+/// registry. Every subsequent report/parse call picks up the new roots
+/// immediately — no restart required. `data` on success is
+/// `{"registeredCount":N,"unreadable":[{"client","path","reason"}],"rejected":[{"client","path","reason"}]}`.
+/// A path whose client id is supported is always registered, even when it
+/// can't be read right now (unmounted volume, not-yet-created config dir) —
+/// such a path is listed in `unreadable` and is retried automatically by the
+/// next scan, with no need to call this setter again. A path is only ever
+/// left out of the registry (`rejected`) when its client id is not one this
+/// consumer wires extra-root support for. Malformed JSON returns
+/// `{"ok":false,...}` and leaves the registry untouched.
+///
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_set_extra_scan_paths(json: *const c_char) -> *mut c_char {
+    guarded("tb_set_extra_scan_paths", || {
+        envelope(unsafe { set_extra_scan_paths_from_c(json) })
+    })
+}
+
+/// Replace the process-wide registry of extra Claude config directories (see
+/// the `claude_config_dirs` module doc). `json` is an array of absolute
+/// directory paths, e.g. `["/Users/x/.claude-work"]`; full-replace semantics
+/// (`[]` clears it). Each one is fetched as its own Claude quota card, using
+/// the Keychain item that directory selects. Success data is
+/// `{"registeredCount":N,"rejected":[{"path","reason"}]}`; a path is rejected
+/// when it is empty, relative, the filesystem root, or a repeat of one already
+/// in the list. Existence is not probed — whether the directory is readable
+/// right now says nothing about which account its credential belongs to.
+///
+/// This is NOT `tb_set_extra_scan_paths`. That one takes the expanded
+/// `<dir>/projects` and `<dir>/transcripts` sub-roots and decides what the
+/// scanner walks; this one takes the config directories and decides whose
+/// credential a quota card is fetched with.
+///
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_set_claude_config_dirs(json: *const c_char) -> *mut c_char {
+    guarded("tb_set_claude_config_dirs", || {
+        envelope(unsafe { set_claude_config_dirs_from_c(json) })
+    })
+}
+
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+unsafe fn set_claude_config_dirs_from_c(json: *const c_char) -> Result<serde_json::Value, String> {
+    if json.is_null() {
+        return Err("Claude config dirs payload must not be NULL".to_string());
+    }
+    let raw = unsafe { CStr::from_ptr(json) }
+        .to_str()
+        .map_err(|_| "Claude config dirs payload is not valid UTF-8".to_string())?;
+    claude_config_dirs::set_from_json(raw)
+}
+
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+unsafe fn set_extra_scan_paths_from_c(json: *const c_char) -> Result<serde_json::Value, String> {
+    if json.is_null() {
+        return Err("extra scan paths payload must not be NULL".to_string());
+    }
+    let raw = unsafe { CStr::from_ptr(json) }
+        .to_str()
+        .map_err(|_| "extra scan paths payload is not valid UTF-8".to_string())?;
+    let result = extra_scan_paths::set_from_json(raw)?;
+    invalidate_scan_caches();
+    Ok(result)
+}
+
+/// Drop everything that could answer a scan question from before the root set
+/// changed. Called only after a successful registry replace.
+///
+/// The setter's contract is that the next report picks up the new roots, and
+/// three caches sit in front of that. `graph_cached` returns any entry younger
+/// than `ONESHOT_MAX_AGE_SECS` outright — it only probes the source token
+/// *after* aging out — so a graph computed seconds before a Settings edit
+/// would keep reporting a removed account's usage, or keep omitting a
+/// just-added one. `tail_tick_if_stale` holds its event window for
+/// `TAIL_TICK_SECS` the same way. Both self-heal once their timer expires,
+/// because a changed root set changes the source token; clearing here is what
+/// makes "immediately" true rather than "within half a minute".
+///
+/// Clearing unconditionally is deliberate: the setter runs at launch (empty
+/// cache, no-op) and on Settings edits (rare). Comparing old and new registries
+/// to skip a no-op replace would cost more than the recompute it saves.
+///
+/// Clearing alone would still lose to a scan already running: it snapshots its
+/// roots at the top and publishes after, so its old-root result would land
+/// after the clear. `ROOT_GENERATION` is bumped first, before either clear,
+/// and both publishers re-read it inside the same lock they publish under —
+/// so a scan that started earlier either publishes before the clear (and gets
+/// cleared) or sees the new generation and drops its result.
+/// The root-registry generation, for publishers outside this module.
+pub(crate) fn root_generation() -> u64 {
+    ROOT_GENERATION.load(Ordering::SeqCst)
+}
+
+fn invalidate_scan_caches() {
+    // Bump first. Both clears below release their locks, and a publisher that
+    // acquires one afterwards has to observe the new generation for its check
+    // to mean anything.
+    ROOT_GENERATION.fetch_add(1, Ordering::SeqCst);
+    GRAPH_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+    // Third cache, same reason as the graph: `window_usage::cached` serves any
+    // entry younger than `ONESHOT_MAX_AGE_SECS` without probing the token, so
+    // the quota lens would keep folding a removed root's messages for up to
+    // half a minute after the edit.
+    WINDOW_USAGE_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+    // Unstamping is enough to force the next tick; `in_flight` still guards
+    // against a second parse starting while one is running.
+    lock_tick().last = None;
 }
 
 /// Release a string returned by any tb_* entry point.
@@ -849,6 +1116,160 @@ mod tests {
     use usage_tail::UsageTailer;
 
     static QUOTA_CURVE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Clearing the caches loses to a scan that was already running: it
+    /// snapshots its roots at the top and publishes after the clear, putting
+    /// an old-root result back where the next reader finds it. Both publishers
+    /// carry the generation they started under and drop their result when the
+    /// registry moved.
+    ///
+    /// Moves the generation with the real `extern "C"` setter rather than
+    /// bumping the counter directly, so the test fails if the setter ever
+    /// stops bumping it.
+    #[test]
+    fn a_scan_that_started_before_a_root_change_does_not_publish_its_result() {
+        let _g = extra_scan_paths::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // What an in-flight scan captured before the user touched Settings.
+        let generation_at_scan_start = ROOT_GENERATION.load(Ordering::SeqCst);
+        let stale = (
+            Instant::now(),
+            1234,
+            serde_json::json!({"from": "old roots"}),
+        );
+
+        let payload = CString::new("{}").expect("payload has no interior NUL");
+        let raw = unsafe { tb_set_extra_scan_paths(payload.as_ptr()) };
+        assert!(!raw.is_null(), "setter returned NULL");
+        unsafe { tb_free(raw) };
+
+        assert!(
+            !publish_graph("2026", generation_at_scan_start, stale),
+            "a graph computed under the old roots was cached anyway"
+        );
+        assert!(
+            GRAPH_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("2026")
+                .is_none(),
+            "the old-root graph landed in the cache after the replace"
+        );
+        assert!(
+            !window_usage::publish(
+                (0, 60_000),
+                generation_at_scan_start,
+                (Instant::now(), 1234, serde_json::json!({"from": "old roots"})),
+            ),
+            "a window scanned under the old roots was cached anyway"
+        );
+        assert!(
+            WINDOW_USAGE_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "the old-root window landed in the cache after the replace"
+        );
+        assert!(
+            !stamp_tick_if_current(generation_at_scan_start),
+            "a tick that parsed the old roots stamped the tail as fresh"
+        );
+        assert!(
+            lock_tick().last.is_none(),
+            "the tail is stamped, so the next call would skip the reparse that \
+             would pick up the new roots"
+        );
+
+        // Control: a scan starting after the replace publishes normally —
+        // without this the guard could refuse everything and still pass above.
+        let current = ROOT_GENERATION.load(Ordering::SeqCst);
+        assert!(
+            publish_graph("2026", current, (Instant::now(), 5678, serde_json::json!({"from": "new roots"}))),
+            "a graph computed under the current roots was refused"
+        );
+        assert!(
+            window_usage::publish(
+                (0, 60_000),
+                current,
+                (Instant::now(), 5678, serde_json::json!({"from": "new roots"})),
+            ),
+            "a window scanned under the current roots was refused"
+        );
+        assert!(
+            stamp_tick_if_current(current),
+            "a tick under the current roots failed to stamp"
+        );
+
+        // Leave no state behind for the other tests sharing these statics.
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        lock_tick().last = None;
+    }
+
+    /// The setter promises the next report sees the new roots. Two caches can
+    /// answer a report without rescanning, so replacing the registry has to
+    /// drop both — otherwise a Settings edit is invisible until they age out
+    /// on their own (30s for the graph, 10s for the live tail).
+    ///
+    /// Drives the real `extern "C"` entry point rather than `set_from_json`,
+    /// because the invalidation hangs off the FFI wrapper: calling the inner
+    /// function would pass with the fix removed.
+    #[test]
+    fn setting_extra_scan_paths_drops_the_caches_that_could_answer_from_the_old_roots() {
+        let _g = extra_scan_paths::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                "2026".to_string(),
+                (Instant::now(), 1234, serde_json::json!({"from": "old roots"})),
+            );
+        lock_tick().last = Some(Instant::now());
+        WINDOW_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                (0, 60_000),
+                (Instant::now(), 1234, serde_json::json!({"from": "old roots"})),
+            );
+
+        let payload = CString::new("{}").expect("payload has no interior NUL");
+        let raw = unsafe { tb_set_extra_scan_paths(payload.as_ptr()) };
+        assert!(!raw.is_null(), "setter returned NULL");
+        let reply = unsafe { CStr::from_ptr(raw) }
+            .to_str()
+            .expect("reply is UTF-8")
+            .to_string();
+        unsafe { tb_free(raw) };
+        assert!(reply.contains("\"ok\":true"), "setter failed: {reply}");
+
+        assert!(
+            GRAPH_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "graph cache still holds an entry computed under the old root set"
+        );
+        assert!(
+            lock_tick().last.is_none(),
+            "live tail is still stamped fresh, so the next tick would skip the reparse"
+        );
+        assert!(
+            WINDOW_USAGE_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "window-usage cache still holds a scan of the old root set, and it is \
+             served without a token probe for ONESHOT_MAX_AGE_SECS"
+        );
+    }
 
     #[test]
     fn select_user_home_prefers_non_empty_home() {
@@ -927,6 +1348,104 @@ mod tests {
         )
     }
 
+    /// G7. Two accounts of one client publishing the same window must not
+    /// collide in the binding map.
+    ///
+    /// Keyed on `(provider, window)` alone the second insert replaces the
+    /// first, and `tb_quota_curve` then answers with the surviving account's
+    /// series under a generation that validates — the caller gets a curve, the
+    /// generation check passes, and nothing on either side of the FFI can tell
+    /// it belongs to the other account. That is why the account is a lookup
+    /// parameter rather than something inferred here.
+    #[test]
+    fn g7_two_accounts_of_one_client_keep_separate_curve_bindings() {
+        let _guard = QUOTA_CURVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let primary = agent_quota_history::SeriesKey::new(
+            "claude",
+            &agent_account_scope::HistoryScope::for_test("scope-primary"),
+            "session.v1",
+        );
+        let second = agent_quota_history::SeriesKey::new(
+            "claude",
+            &agent_account_scope::HistoryScope::for_test("scope-second"),
+            "session.v1",
+        );
+        assert_ne!(primary, second, "the fixture's two series are the same key");
+
+        let dir = "/Users/someone/.claude-work";
+        replace_quota_curve_bindings(
+            9,
+            vec![(None, primary.clone()), (Some(dir.to_string()), second.clone())],
+        );
+
+        let state = QUOTA_CURVE_BINDINGS
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            state.series.len(),
+            2,
+            "the two accounts collapsed onto one binding, so one of them is unreachable"
+        );
+        assert_eq!(
+            state
+                .series
+                .get(&("claude".to_string(), None, "session.v1".to_string())),
+            Some(&primary),
+            "the primary's binding was replaced by the second account's"
+        );
+        assert_eq!(
+            state.series.get(&(
+                "claude".to_string(),
+                Some(dir.to_string()),
+                "session.v1".to_string()
+            )),
+            Some(&second)
+        );
+        drop(state);
+
+        // G7b. Two directories differing only in trailing whitespace are two
+        // accounts, and the binding table is the sixth place that has to agree.
+        //
+        // Collapsed, the later publication overwrites the earlier one and both
+        // ABI lookups answer with the surviving account's curve under a
+        // generation that validates — the same undetectable failure the account
+        // parameter exists to prevent, reached by normalizing the parameter
+        // instead of by omitting it.
+        let spaced = "/Users/someone/claude dir ";
+        let trimmed = "/Users/someone/claude dir";
+        replace_quota_curve_bindings(
+            11,
+            vec![
+                (Some(spaced.to_string()), primary.clone()),
+                (Some(trimmed.to_string()), second.clone()),
+            ],
+        );
+        let state = QUOTA_CURVE_BINDINGS
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            state.series.len(),
+            2,
+            "the trailing space was normalized away, so one account's binding \
+             overwrote the other's"
+        );
+        assert_eq!(
+            state.series.get(&(
+                "claude".to_string(),
+                Some(spaced.to_string()),
+                "session.v1".to_string()
+            )),
+            Some(&primary),
+            "the exact path no longer addresses the binding it published"
+        );
+        drop(state);
+
+        replace_quota_curve_bindings(0, Vec::new());
+    }
+
     fn quota_curve_temp_path(label: &str) -> (PathBuf, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -975,6 +1494,7 @@ mod tests {
     ) -> Result<serde_json::Value, String> {
         quota_curve_result_with_reader(
             client_id,
+            None,
             window_key,
             generation,
             || {},
@@ -1002,7 +1522,7 @@ mod tests {
         let (directory, path) = quota_curve_temp_path("unbound-generation");
         let now = 9_400_000;
         record_quota_curve_sample(&path, quota_curve_key("account-a"), now + 96, 10.0, now, 96);
-        replace_quota_curve_bindings(4, vec![quota_curve_key("account-a")]);
+        replace_quota_curve_bindings(4, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
 
         assert_eq!(
             quota_curve_value_at_path(&path, "__smoke__", "__smoke__", 4, now).unwrap_err(),
@@ -1077,6 +1597,7 @@ mod tests {
                     // exact-equality assertions below could not see one.
                     sampled_at: 999_907,
                     origin: agent_quota_history::SampleOrigin::LiveV3,
+                    plan: None,
                 },
                 agent_quota_history::QuotaSample {
                     reset_at: 1_000_000,
@@ -1085,6 +1606,7 @@ mod tests {
                     used_percent: 55.0,
                     sampled_at: 999_945,
                     origin: agent_quota_history::SampleOrigin::ImportedV2,
+                    plan: None,
                 },
                 agent_quota_history::QuotaSample {
                     reset_at: 1_000_500,
@@ -1093,12 +1615,26 @@ mod tests {
                     used_percent: 3.0,
                     sampled_at: 1_000_405,
                     origin: agent_quota_history::SampleOrigin::LiveV3,
+                    plan: None,
                 },
             ],
         };
 
         let value = quota_curve_payload(&series, 7).expect("serialize curve payload");
         let object = value.as_object().expect("curve payload object");
+        // The running group is marked on the POINT. `active_reset_at` here is
+        // 1_000_500 and the third sample's stored `reset_at` is exactly that, so
+        // this case alone would also pass under the equality the consumer used
+        // to do; the off-quantum case below is the one that separates them.
+        assert_eq!(
+            value["points"]
+                .as_array()
+                .expect("points array")
+                .iter()
+                .map(|point| point["isActiveGroup"].as_bool().expect("isActiveGroup"))
+                .collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
         assert_eq!(
             object
                 .keys()
@@ -1153,6 +1689,7 @@ mod tests {
                 [
                     "durationSeconds",
                     "durationSource",
+                    "isActiveGroup",
                     "origin",
                     "resetAt",
                     "sampledAt",
@@ -1165,6 +1702,53 @@ mod tests {
         }
     }
 
+    /// The case the consumer could not decide for itself.
+    ///
+    /// `active_reset_at` is the RAW provider value; every stored sample carries
+    /// `normalize_sample_reset(...)`. When the provider's reset is not already
+    /// on the quantum the two are DIFFERENT numbers for the same cycle, so an
+    /// equality between them — which is what the Swift fold did — leaves the
+    /// running cycle in the history: drawn under "past windows", standing
+    /// beside completed spans, and counting toward the equivalence threshold
+    /// while still filling.
+    #[test]
+    fn an_off_quantum_active_reset_still_marks_its_own_points() {
+        let _test_guard = quota_curve_test_guard();
+        // 604_800s window: quantum is clamp(6048, 60, 300) = 300. A reset 137s
+        // past a multiple of 300 normalizes DOWN to that multiple, so the
+        // stored `reset_at` and `active_reset_at` differ by 137.
+        let raw_reset = 1_767_600_000 + 137;
+        let normalized = 1_767_600_000;
+        let series = agent_quota_history::SeriesState {
+            provider_id: "codex".to_string(),
+            account_scope: "opaque-account".to_string(),
+            window_key: "weekly.v1".to_string(),
+            active_reset_at: Some(raw_reset),
+            last_activity_at: raw_reset - 1_000,
+            rollover: None,
+            samples: vec![agent_quota_history::QuotaSample {
+                reset_at: normalized,
+                duration_seconds: 604_800,
+                duration_source: agent_quota_duration::DurationSource::Provider,
+                used_percent: 40.0,
+                sampled_at: normalized - 1_000,
+                origin: agent_quota_history::SampleOrigin::LiveV3,
+                plan: None,
+            }],
+        };
+
+        // The premise, asserted rather than assumed: if these were equal the
+        // case would prove nothing, and a later change to the quantum could
+        // make them equal without failing anything else here.
+        assert_ne!(
+            series.samples[0].reset_at,
+            series.active_reset_at.unwrap(),
+            "the fixture must actually be off-quantum"
+        );
+        let value = quota_curve_payload(&series, 7).expect("serialize curve payload");
+        assert_eq!(value["points"][0]["isActiveGroup"], true);
+    }
+
     #[test]
     fn quota_curve_binding_selects_each_account_without_store_scanning() {
         let _test_guard = quota_curve_test_guard();
@@ -1175,12 +1759,12 @@ mod tests {
         record_quota_curve_sample(&path, quota_curve_key("account-a"), reset_at, 10.0, now, 96);
         record_quota_curve_sample(&path, quota_curve_key("account-b"), reset_at, 80.0, now, 96);
 
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")]);
+        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
         let account_a = quota_curve_value_at_path(&path, "codex", "weekly.v1", 1, now)
             .expect("account A curve");
         assert_eq!(account_a["points"][0]["usedPercent"], 10.0);
 
-        replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")]);
+        replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
         let account_b = quota_curve_value_at_path(&path, "codex", "weekly.v1", 2, now)
             .expect("account B curve");
         assert_eq!(account_b["points"][0]["usedPercent"], 80.0);
@@ -1202,12 +1786,12 @@ mod tests {
         let account_b = quota_curve_key("account-b");
         record_quota_curve_sample(&path, account_a.clone(), reset_at, 10.0, now, 96);
         record_quota_curve_sample(&path, account_b, reset_at, 20.0, now, 96);
-        replace_quota_curve_bindings(1, vec![account_a.clone()]);
+        replace_quota_curve_bindings(1, vec![account_a.clone()].into_iter().map(|k| (None, k)));
         let before = quota_curve_value_at_path(&path, "codex", "weekly.v1", 1, now)
             .expect("previous tuple remains available");
 
         let serialization =
-            serialize_agent_usage_with_bindings(2, vec![quota_curve_key("account-b")], || {
+            serialize_agent_usage_with_bindings(2, vec![(None, quota_curve_key("account-b"))], || {
                 Err("injected serialization failure".to_string())
             });
         assert_eq!(
@@ -1258,7 +1842,7 @@ mod tests {
         let reset_at = now + 96;
         let key = quota_curve_key("account-a");
         record_quota_curve_sample(&path, key.clone(), reset_at, 10.0, now, 96);
-        replace_quota_curve_bindings(1, vec![key]);
+        replace_quota_curve_bindings(1, vec![key].into_iter().map(|k| (None, k)));
         let (paused_tx, paused_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let (committed_tx, committed_rx) = mpsc::channel();
@@ -1266,6 +1850,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             quota_curve_result_with_reader(
                 "codex",
+                None,
                 "weekly.v1",
                 1,
                 || {
@@ -1278,7 +1863,7 @@ mod tests {
         });
         paused_rx.recv().expect("reader reached history boundary");
         let writer = std::thread::spawn(move || {
-            replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")]);
+            replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
             committed_tx.send(()).expect("commit binding tuple");
         });
         committed_rx
@@ -1311,7 +1896,7 @@ mod tests {
         let now = 9_500_000;
         let key = quota_curve_key("account-a");
         record_quota_curve_sample(&path, key.clone(), now + 96, 10.0, now, 96);
-        replace_quota_curve_bindings(1, vec![key]);
+        replace_quota_curve_bindings(1, vec![key].into_iter().map(|k| (None, k)));
 
         let (inside_tx, inside_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1320,6 +1905,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             quota_curve_result_with_reader(
                 "codex",
+                None,
                 "weekly.v1",
                 1,
                 || {},
@@ -1333,7 +1919,7 @@ mod tests {
         inside_rx.recv().expect("reader entered the guarded window");
 
         let writer = std::thread::spawn(move || {
-            replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")]);
+            replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
             committed_tx.send(()).expect("commit binding tuple");
         });
         // The publication must NOT complete while the reader holds the guard.
@@ -1373,7 +1959,7 @@ mod tests {
         let reset_at = now + 96;
         record_quota_curve_sample(&path, quota_curve_key("account-a"), reset_at, 10.0, now, 96);
         record_quota_curve_sample(&path, quota_curve_key("account-b"), reset_at, 80.0, now, 96);
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")]);
+        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
 
         let (paused_tx, paused_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1381,6 +1967,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             quota_curve_result_with_reader(
                 "codex",
+                None,
                 "weekly.v1",
                 1,
                 || {
@@ -1392,7 +1979,7 @@ mod tests {
             )
         });
         paused_rx.recv().expect("reader reached history boundary");
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-b")]);
+        replace_quota_curve_bindings(1, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
         release_tx.send(()).expect("release history reader");
 
         assert_eq!(
@@ -1413,11 +2000,11 @@ mod tests {
     fn quota_curve_binding_tuple_is_atomically_visible() {
         let _test_guard = quota_curve_test_guard();
         reset_quota_curve_bindings();
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")]);
+        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
         let (start_tx, start_rx) = mpsc::channel();
         let writer = std::thread::spawn(move || {
             start_rx.recv().expect("start tuple replacement");
-            replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")]);
+            replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
         });
         // Without requiring generation 2 to actually be observed, every read can
         // land on generation 1 and the loop proves nothing about the interval
@@ -1434,14 +2021,14 @@ mod tests {
                 1 => assert_eq!(
                     state
                         .series
-                        .get(&("codex".to_string(), "weekly.v1".to_string()))
+                        .get(&("codex".to_string(), None, "weekly.v1".to_string()))
                         .map(|key| key.account_scope.as_str()),
                     Some("account-a")
                 ),
                 2 => assert_eq!(
                     state
                         .series
-                        .get(&("codex".to_string(), "weekly.v1".to_string()))
+                        .get(&("codex".to_string(), None, "weekly.v1".to_string()))
                         .map(|key| key.account_scope.as_str()),
                     Some("account-b")
                 ),
@@ -1463,7 +2050,7 @@ mod tests {
                 assert_eq!(
                     state
                         .series
-                        .get(&("codex".to_string(), "weekly.v1".to_string()))
+                        .get(&("codex".to_string(), None, "weekly.v1".to_string()))
                         .map(|key| key.account_scope.as_str()),
                     Some("account-b")
                 );
@@ -1483,7 +2070,7 @@ mod tests {
         record_quota_curve_sample(&path, key.clone(), reset_at, 10.0, now, 96);
         let before_bytes = fs::read(&path).expect("read fixture bytes");
         agent_quota_history::reset_save_call_count();
-        replace_quota_curve_bindings(1, vec![key]);
+        replace_quota_curve_bindings(1, vec![key].into_iter().map(|k| (None, k)));
         quota_curve_value_at_path(&path, "codex", "weekly.v1", 1, now).expect("read quota curve");
         assert_eq!(agent_quota_history::save_call_count(), 0);
         assert_eq!(
@@ -1500,7 +2087,7 @@ mod tests {
         let (directory, path) = quota_curve_temp_path("errors");
         let now = 9_400_000;
         let key = quota_curve_key("account-a");
-        replace_quota_curve_bindings(1, vec![key]);
+        replace_quota_curve_bindings(1, vec![key].into_iter().map(|k| (None, k)));
         assert_eq!(
             quota_curve_value_at_path(&path, "codex", "weekly.v1", 1, now)
                 .expect("missing history is a successful empty result"),
@@ -1539,32 +2126,33 @@ mod tests {
         let now = 9_500_000;
         let reset_at = now + 96;
         record_quota_curve_sample(&path, quota_curve_key("account-a"), reset_at, 10.0, now, 96);
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")]);
+        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
         let (empty_directory, empty_path) = quota_curve_temp_path("c-abi-empty");
         set_test_quota_curve_history_path(Some(empty_path));
         let client = CString::new("codex").expect("client id");
         let window = CString::new("weekly.v1").expect("window key");
-        let no_history = unsafe { take(tb_quota_curve(client.as_ptr(), window.as_ptr(), 1)) };
+        let no_history = unsafe { take(tb_quota_curve(client.as_ptr(), std::ptr::null(), window.as_ptr(), 1)) };
         let no_history_json: serde_json::Value =
             serde_json::from_str(&no_history).expect("decode C ABI no-history result");
         assert_eq!(no_history_json["ok"], true);
         assert!(no_history_json["data"].is_null());
 
         set_test_quota_curve_history_path(Some(path.clone()));
-        let success = unsafe { take(tb_quota_curve(client.as_ptr(), window.as_ptr(), 1)) };
+        let success = unsafe { take(tb_quota_curve(client.as_ptr(), std::ptr::null(), window.as_ptr(), 1)) };
         let success_json: serde_json::Value =
             serde_json::from_str(&success).expect("decode C ABI success");
         assert_eq!(success_json["ok"], true);
         assert_eq!(success_json["data"]["points"][0]["usedPercent"], 10.0);
 
-        let expired = unsafe { take(tb_quota_curve(client.as_ptr(), window.as_ptr(), 0)) };
+        let expired = unsafe { take(tb_quota_curve(client.as_ptr(), std::ptr::null(), window.as_ptr(), 0)) };
         assert!(expired.contains("quota curve generation is expired"));
-        let null_client = unsafe { take(tb_quota_curve(std::ptr::null(), window.as_ptr(), 1)) };
+        let null_client = unsafe { take(tb_quota_curve(std::ptr::null(), std::ptr::null(), window.as_ptr(), 1)) };
         assert!(null_client.contains("client_id is required"));
         let invalid_client = [0xff_u8, 0];
         let invalid_utf8 = unsafe {
             take(tb_quota_curve(
                 invalid_client.as_ptr().cast(),
+                std::ptr::null(),
                 window.as_ptr(),
                 1,
             ))
@@ -1623,7 +2211,7 @@ mod tests {
             .sum();
         assert_eq!(store_sample_count, 6_192);
 
-        replace_quota_curve_bindings(1, vec![key]);
+        replace_quota_curve_bindings(1, vec![key].into_iter().map(|k| (None, k)));
         let payload = quota_curve_value_at_path(&path, "codex", "weekly.v1", 1, now)
             .expect("read complete retained sequence");
         assert_eq!(
@@ -1888,4 +2476,18 @@ mod tests {
         // A pathological window must saturate, not panic/overflow.
         assert!(tail.trace(i64::MAX).is_empty());
     }
+}
+
+/// Usage inside an absolute [from_ms, until_ms) window.
+///
+/// `until_ms` is quantised to the minute by `window_usage::cache_key`, so the
+/// answer can be up to a minute short of the requested end when an earlier call
+/// in the same minute already scanned. See the header for why that is the
+/// deliberate trade.
+#[no_mangle]
+pub extern "C" fn tb_window_usage(from_ms: i64, until_ms: i64) -> *mut c_char {
+    guarded("tb_window_usage", || {
+        let context = LocalSourceContext::current();
+        envelope(window_usage::cached(&context, from_ms, until_ms))
+    })
 }

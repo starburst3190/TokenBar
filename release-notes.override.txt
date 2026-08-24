@@ -1,10 +1,2 @@
-Note:
-- Pace history restarts once with this update. A card returns to "Learning history" and rebuilds unless its provider gives TokenBar a stable account identifier, which today means Codex with an account ID on its credential, and the Antigravity IDE. This is the cost of the identity fix below and it happens only once.
-
 Fixes:
-- Pace history no longer restarts every time another app refreshes a shared login. Providers without a stable account identifier kept losing their learned usage curve whenever the Claude CLI or a sibling tool rotated the credential they share, so Historical pace could never accumulate.
-- A pace marker in deficit is now highlighted whether it came from the historical curve or the linear estimate. Previously only a historical result was coloured, so the warning appeared and disappeared as the fit requalified while the deficit itself never moved.
-- A clock disagreement no longer discards the whole quota history. A single forward jump of the system clock, from a time sync or a sleep and wake, could leave one window with a timestamp ahead of the next read, which quarantined every provider's history at once. It is now repaired in place, and only genuinely unverifiable data is dropped.
-
-Improved:
-- Updater: the bundled Sparkle framework is now compiled from source as part of the build.
+- The quota equivalence counted fewer tokens than it priced. The estimate under a quota window, and the heatmap tooltip that scales from it, print a token count beside a dollar amount as two descriptions of the same work. The count left out cache reads while the amount included their cost, so dividing one by the other gave a price several times higher than any model's list rate: one reading showed 72 quota points as 4.8M tokens and $172.25, which works out to $36 per million. Cache reads are most of the volume in a Claude Code session, so most of the tokens were missing from the count while all of their cost stayed in the price. The count now covers everything the price covers. The dollar figure does not change; the token figure grows, and the implied rate falls back to something near list.
