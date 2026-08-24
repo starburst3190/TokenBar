@@ -52,8 +52,9 @@ final class SettingsWindowController {
         window.makeKeyAndOrderFront(nil)
         // Dead-center on open (but never yank an already-open window).
         // NSWindow.center() sits noticeably above center, so place by hand.
-        // The frame is final here: the plain titled style has no
-        // .fullSizeContentView safe-area inflation to wait out.
+        // The frame is final here because `makeWindow` sized it to include the
+        // title bar — see there for why sizing it any other way left this
+        // centring half a title bar off.
         if firstShow {
             center(window)
         }
@@ -68,31 +69,55 @@ final class SettingsWindowController {
             y: visible.midY - window.frame.height / 2))
     }
 
-    /// Match the window's content size to the scaled SwiftUI frame (the title
-    /// bar lives outside the content rect, so no compensation is needed) and
-    /// keep the window centered where it was rather than growing off one edge.
-    private func applyScale() {
-        guard let window else { return }
+    /// The area the SwiftUI content asks for at the current scale — the
+    /// `contentLayoutRect`, i.e. what is left of the frame once the title bar
+    /// has taken its band.
+    private static func scaledContentSize() -> NSSize {
         let scale = PopoverScale.current.factor
-        let newSize = NSSize(
+        return NSSize(
             width: (SettingsWindowMetrics.width * scale).rounded(),
             height: (SettingsWindowMetrics.height * scale).rounded())
-        guard window.contentView?.frame.size != newSize else { return }
-        let center = NSPoint(x: window.frame.midX, y: window.frame.midY)
-        window.setContentSize(newSize)
-        window.setFrameOrigin(NSPoint(
-            x: (center.x - window.frame.width / 2).rounded(),
-            y: (center.y - window.frame.height / 2).rounded()))
+    }
+
+    /// Height the title bar takes out of the frame. Measured rather than
+    /// assumed: it is a system metric, and it is zero before the style mask
+    /// says the window is titled.
+    private static func titleBarHeight(_ window: NSWindow) -> CGFloat {
+        window.frame.height - window.contentLayoutRect.height
+    }
+
+    /// Resize the window to the scaled content and keep its centre where it
+    /// was, rather than growing off one edge.
+    private func applyScale() {
+        guard let window else { return }
+        let target = Self.scaledContentSize()
+        // Measured against `contentLayoutRect`, NOT `contentView.frame`. Under
+        // `.fullSizeContentView` the content VIEW is inflated to run under the
+        // title bar (580 -> 612 at 1x), so it never equalled a target
+        // expressed in content terms and this guard never once held. Every
+        // `UserDefaults` change — the app writes them while it polls — then
+        // resized and re-placed the window, and each pass lost half a title
+        // bar: the settings window walked down the screen on its own.
+        guard window.contentLayoutRect.size != target else { return }
+        let centre = NSPoint(x: window.frame.midX, y: window.frame.midY)
+        // One `setFrame` to the final geometry instead of `setContentSize` plus
+        // a re-origin: sizing in two steps leaves the window briefly a title
+        // bar short, and AppKit anchors a resize to the top-left, so the
+        // intermediate state moves the window before the second step measures
+        // it.
+        let height = target.height + Self.titleBarHeight(window)
+        window.setFrame(
+            NSRect(
+                x: (centre.x - target.width / 2).rounded(),
+                y: (centre.y - height / 2).rounded(),
+                width: target.width, height: height),
+            display: true)
     }
 
     private func makeWindow(destination: Destination? = nil) -> NSWindow {
         let host = NSHostingController(rootView: AnyView(SettingsWindowView(destination: destination)))
         self.host = host
         let window = NSWindow(contentViewController: host)
-        // NSWindow(contentViewController:) sizes lazily (the frame is still
-        // 1x0 at show time, which broke the centering math) — force the
-        // SwiftUI fitting size up front.
-        window.setContentSize(host.view.fittingSize)
         window.title = "TokenBar Settings".localized
         window.styleMask = [.titled, .closable, .miniaturizable, .fullSizeContentView]
         // The glass backdrop runs under the title bar (the popover look);
@@ -105,6 +130,26 @@ final class SettingsWindowController {
         // stays set for Mission Control and the Window menu.
         window.titleVisibility = .hidden
         window.isReleasedWhenClosed = false
+        // Sized here, AFTER the style mask, and from the metrics rather than
+        // `host.view.fittingSize`. Two reasons, both learned from this window
+        // opening a half title bar low:
+        //
+        // `NSWindow(contentViewController:)` sizes lazily, so the fitting size
+        // read before the window has a title bar is the bare content — and
+        // under `.fullSizeContentView` the content rect IS the frame, so
+        // passing that bare height leaves the SwiftUI content a title bar
+        // short. It then inflated the window on its first layout pass, after
+        // `show()` had already centred the smaller frame, and AppKit anchors
+        // that growth to the top-left — so the finished window sat half a
+        // title bar below centre.
+        //
+        // Adding the measured title bar up front means the frame `show()`
+        // centres is the frame the content wants, and no layout pass resizes
+        // it afterwards.
+        let content = Self.scaledContentSize()
+        window.setContentSize(content)
+        window.setContentSize(NSSize(
+            width: content.width, height: content.height + Self.titleBarHeight(window)))
         // Swap the live UI for a static, same-size placeholder when the window
         // closes so its preview timelines + polling .tasks are torn down (a
         // kept-alive closed window otherwise keeps rendering in the

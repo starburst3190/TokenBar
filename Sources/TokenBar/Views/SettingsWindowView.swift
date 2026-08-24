@@ -168,9 +168,9 @@ struct SettingsWindowView: View {
             .scrollIndicators(.never)
             .frame(width: 330)
         }
-        .frame(width: SettingsWindowMetrics.width, height: SettingsWindowMetrics.height)
+        .frame(width: Self.contentSize.width, height: Self.contentSize.height)
         .modifier(PopoverScaleModifier(
-            baseWidth: SettingsWindowMetrics.width, baseHeight: SettingsWindowMetrics.height,
+            baseWidth: Self.contentSize.width, baseHeight: Self.contentSize.height,
             scale: (PopoverScale(rawValue: popoverScaleRaw) ?? .default).factor))
         .background(PopoverBackdrop().ignoresSafeArea())
         .task { await model.load() }
