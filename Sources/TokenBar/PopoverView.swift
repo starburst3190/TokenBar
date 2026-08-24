@@ -30,6 +30,12 @@ struct PopoverView: View {
     @State private var keyMonitor: Any?
     @State private var flagsMonitor: Any?
     @State private var cmdHintTask: Task<Void, Never>?
+    @AppStorage(PopoverScale.storageKey) private var popoverScaleRaw = PopoverScale.default.rawValue
+
+    /// Geometric factor the PopoverScaleModifier applies to the whole body.
+    private var popoverScale: CGFloat {
+        (PopoverScale(rawValue: popoverScaleRaw) ?? .default).factor
+    }
     // Round 6 audit 2: matches the sibling `activeViewRaw` default below —
     // `ChartView.bars.rawValue`, not the bare "2d" literal this used to
     // duplicate.
@@ -207,8 +213,17 @@ struct PopoverView: View {
         // AppKit owns the live drag size. Filling the hosting view avoids
         // publishing a new environment-object height — and rebuilding this
         // entire view tree — for every pointer event.
+        //
+        // The scale factor cannot come from `chrome.height` here: a live drag
+        // resizes the AppKit window through `onResize` WITHOUT publishing
+        // `rawHeight` (see PopoverChrome.setHeight's `live` branch), so a
+        // content height derived from the model lags the window for the whole
+        // drag and leaves the backdrop showing under the footer. Scale against
+        // the host's real height instead, which is correct at every frame of
+        // the drag and at rest.
         .frame(width: chrome.width)
         .frame(maxHeight: .infinity)
+        .modifier(PopoverScaleModifier(baseWidth: chrome.width, scale: popoverScale))
         .animation(.easeOut(duration: 0.16), value: activeViewRaw)
         .animation(.easeOut(duration: 0.16), value: activeTab)
         .background(PopoverBackdrop().ignoresSafeArea())
@@ -811,7 +826,9 @@ struct PopoverView: View {
     /// Bottom-edge grabber: drag to set the popover height. Lives in the empty
     /// center of the footer strip (the buttons hug the edges) so it never
     /// steals their clicks. Global coordinate space keeps the drag stable as
-    /// the popover grows under the pointer.
+    /// the popover grows under the pointer. The translation arrives in screen
+    /// points while chrome.height is in unscaled content points — divide by
+    /// the scale factor or the window (height × scale) outruns the cursor.
     private var resizeHandle: some View {
         Capsule()
             .fill(Color.primary.opacity(0.18))
@@ -824,12 +841,14 @@ struct PopoverView: View {
                         let base = dragBase ?? chrome.height
                         dragBase = base
                         chrome.setHeight(
-                            base + value.translation.height, persist: false, live: true)
+                            base + value.translation.height / popoverScale,
+                            persist: false, live: true)
                     }
                     .onEnded { value in
                         let base = dragBase ?? chrome.height
                         chrome.setHeight(
-                            base + value.translation.height, persist: true, live: false)
+                            base + value.translation.height / popoverScale,
+                            persist: true, live: false)
                         dragBase = nil
                     }
             )

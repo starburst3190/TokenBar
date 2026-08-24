@@ -14,6 +14,7 @@ final class SettingsWindowController {
     // AnyView so the live UI can be swapped for a static placeholder on close.
     private var host: NSHostingController<AnyView>?
     private var closeObserver: NSObjectProtocol?
+    private var scaleObserver: NSObjectProtocol?
 
     /// A place in Settings a caller wants brought into view. The intro card
     /// uses it so "Open Settings" lands on the section it just described
@@ -50,11 +51,9 @@ final class SettingsWindowController {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         // Dead-center on open (but never yank an already-open window).
-        // NSWindow.center() sits noticeably above center, so place by hand —
-        // and only after ordering front: the hosting view inflates the frame
-        // by the title-bar safe area (580 -> 612) on its first layout, so
-        // centering the pre-show frame sat ~16pt low. The move lands in the
-        // same runloop turn, before the window is on screen.
+        // NSWindow.center() sits noticeably above center, so place by hand.
+        // The frame is final here: the plain titled style has no
+        // .fullSizeContentView safe-area inflation to wait out.
         if firstShow {
             center(window)
         }
@@ -67,6 +66,23 @@ final class SettingsWindowController {
         window.setFrameOrigin(NSPoint(
             x: visible.midX - window.frame.width / 2,
             y: visible.midY - window.frame.height / 2))
+    }
+
+    /// Match the window's content size to the scaled SwiftUI frame (the title
+    /// bar lives outside the content rect, so no compensation is needed) and
+    /// keep the window centered where it was rather than growing off one edge.
+    private func applyScale() {
+        guard let window else { return }
+        let scale = PopoverScale.current.factor
+        let newSize = NSSize(
+            width: (SettingsWindowMetrics.width * scale).rounded(),
+            height: (SettingsWindowMetrics.height * scale).rounded())
+        guard window.contentView?.frame.size != newSize else { return }
+        let center = NSPoint(x: window.frame.midX, y: window.frame.midY)
+        window.setContentSize(newSize)
+        window.setFrameOrigin(NSPoint(
+            x: (center.x - window.frame.width / 2).rounded(),
+            y: (center.y - window.frame.height / 2).rounded()))
     }
 
     private func makeWindow(destination: Destination? = nil) -> NSWindow {
@@ -97,25 +113,22 @@ final class SettingsWindowController {
             forName: NSWindow.willCloseNotification, object: window, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.host?.rootView = AnyView(
-                    Color.clear.frame(
-                        width: SettingsWindowView.contentSize.width,
-                        height: SettingsWindowView.contentSize.height))
+                self?.host?.rootView = AnyView(Color.clear.frame(
+                    width: SettingsWindowMetrics.width, height: SettingsWindowMetrics.height))
             }
         }
-        // The hosting view inflates the frame by the title-bar safe area
-        // (580 -> 612) in a layout pass after the first order-front that no
-        // amount of layoutIfNeeded forces early — re-center once when it
-        // lands so the first open sits dead-center (one-shot; later opens
-        // start from the final size and never resize again).
-        var token: NSObjectProtocol?
-        token = NotificationCenter.default.addObserver(
-            forName: NSWindow.didResizeNotification, object: window, queue: .main
-        ) { [weak self] notification in
-            if let token { NotificationCenter.default.removeObserver(token) }
-            guard let window = notification.object as? NSWindow else { return }
-            MainActor.assumeIsolated { self?.center(window) }
+        scaleObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.applyScale() }
+            }
         }
+        // No didResize re-center one-shot here: it existed for the
+        // .fullSizeContentView title-bar inflation (580 -> 612) that this
+        // window's plain titled style no longer produces — with the content
+        // rect final at creation, a resize observer would only misfire when
+        // applyScale() legitimately resizes the window later.
         return window
     }
 }
