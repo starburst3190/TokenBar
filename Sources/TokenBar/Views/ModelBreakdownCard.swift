@@ -32,18 +32,9 @@ struct ModelBreakdownCard: View {
     var loading = false
 
     @State private var expanded = false
-    @State private var hover: HoverState?
-    @State private var tooltipSize: CGSize = .zero
-    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
-
-    private struct HoverState {
-        let entry: ModelReportEntry
-        /// Cursor location in the rows container's coordinate space.
-        let point: CGPoint
-    }
+    @Environment(TooltipHost.self) private var tooltipHost
 
     private static let maxRows = 8
-    private static let rowsSpace = "model-rows"
 
     /// Token-category palette (matches the Tauri .model-seg-* CSS classes).
     private static let picks: [(ModelReportEntry) -> Int64] = [
@@ -93,27 +84,6 @@ struct ModelBreakdownCard: View {
                         row(entry)
                     }
                 }
-                .coordinateSpace(name: Self.rowsSpace)
-                .overlay(alignment: .topLeading) {
-                    if let hover {
-                        GeometryReader { geo in
-                            let measuredSize = tooltipSize == .zero
-                                ? CGSize(width: ModelUsageTooltip.width, height: 120)
-                                : tooltipSize
-                            let offset = PopoverTooltipPlacement.offset(
-                                anchor: hover.point,
-                                tooltipSize: measuredSize,
-                                containerFrame: geo.frame(in: .global),
-                                viewport: popoverScrollViewport)
-                            tooltip(hover.entry)
-                                .offset(offset ?? .zero)
-                        }
-                        // GeometryReader fills the rows; keep hits on the rows
-                        // so continuous hover does not end while the tooltip
-                        // is up.
-                        .allowsHitTesting(false)
-                    }
-                }
                 let hidden = rows.count - min(rows.count, Self.maxRows)
                 if hidden > 0 {
                     let title = expanded
@@ -128,7 +98,6 @@ struct ModelBreakdownCard: View {
                 }
             }
         }
-        .zIndex(hover == nil ? 0 : 1)
     }
 
     private var legend: some View {
@@ -147,7 +116,7 @@ struct ModelBreakdownCard: View {
     }
 
     private func row(_ entry: ModelReportEntry) -> some View {
-        let isHovered = hover?.entry.rowID == entry.rowID
+        let isHovered = tooltipHost.isActive(owner: entry.rowID)
         return HStack(spacing: 8) {
             Circle()
                 .fill(Color(hex: colors.color(entry.provider, entry.model)))
@@ -189,19 +158,31 @@ struct ModelBreakdownCard: View {
         }
         // Float the rich tooltip near the cursor anywhere on the row — the
         // web card tracks just the bar, but a 6pt-tall hover target is too
-        // fiddly with a real pointer.
+        // fiddly with a real pointer. Report the cursor in the viewport space
+        // so the root layer can place the panel over the whole popover.
         .contentShape(Rectangle())
-        .onContinuousHover(coordinateSpace: .named(Self.rowsSpace)) { phase in
+        .onContinuousHover(coordinateSpace: .named(PopoverViewport.space)) { phase in
             switch phase {
             case let .active(point):
-                hover = HoverState(entry: entry, point: point)
+                // Build the panel once on row entry; afterwards only re-anchor.
+                if tooltipHost.isActive(owner: entry.rowID) {
+                    tooltipHost.move(owner: entry.rowID, to: point)
+                } else {
+                    tooltipHost.show(owner: entry.rowID, at: point) { tooltip(entry) }
+                }
             case .ended:
-                hover = nil
+                tooltipHost.hide(owner: entry.rowID)
             }
         }
+        // A row can vanish without an `.ended` (data refresh drops it from the
+        // ForEach, "Show less" collapses it, the tab switches the card out) —
+        // take the panel down with it or it floats over stale content.
+        .onDisappear { tooltipHost.hide(owner: entry.rowID) }
     }
 
-    /// sqrt-scaled stacked category bar.
+    /// sqrt-scaled stacked category bar. Widths carry a guaranteed minimum so a
+    /// tiny category still shows a sliver; the hovered row gets a matching
+    /// outline so bar and legend dot read as one selection.
     private func segmentBar(_ entry: ModelReportEntry, isHovered: Bool) -> some View {
         let segments = Self.tokenKinds
             .map { (color: $0.color, value: $0.pick(entry)) }
@@ -230,7 +211,8 @@ struct ModelBreakdownCard: View {
     // MARK: - Hover tooltip
 
     /// True token counts and linear shares per category — the bar itself is
-    /// sqrt-scaled, so this is where the real numbers live.
+    /// sqrt-scaled, so this is where the real numbers live. Placement and
+    /// clamping are handled by the root HoverTooltipLayer.
     private func tooltip(_ entry: ModelReportEntry) -> some View {
         ModelUsageTooltip(
             model: entry.model,
@@ -244,11 +226,13 @@ struct ModelBreakdownCard: View {
             reasoning: entry.reasoning,
             total: entry.total,
             cost: entry.cost,
-            costRatio: entry.implausibleCostRatio,
-            measuredSize: $tooltipSize)
+            costRatio: entry.implausibleCostRatio)
     }
 }
 
+/// Rich per-model token breakdown panel, shared by the Models card and the
+/// Daily/Monthly drill-downs. Pure content: the root `HoverTooltipLayer`
+/// measures it and manages placement and hit-testing.
 struct ModelUsageTooltip: View {
     static let width: CGFloat = 210
 
@@ -266,7 +250,6 @@ struct ModelUsageTooltip: View {
     /// See `ModelReportEntry.implausibleCostRatio`. Defaults to nil so the day/month
     /// slice callers, which have no pricing comparison, need not pass it.
     var costRatio: Double? = nil
-    @Binding var measuredSize: CGSize
 
     private var kinds: [(label: String, color: String, value: Int64)] {
         zip(TokenKindPalette.all, [input, output, cacheRead, cacheWrite, reasoning])
@@ -312,7 +295,7 @@ struct ModelUsageTooltip: View {
             }
             Text([context, provider].compactMap { $0 }.joined(separator: " · "))
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
             HStack {
                 Text("%@ tokens".localized(Format.compactTokens(total)))
                 Spacer()
@@ -344,10 +327,7 @@ struct ModelUsageTooltip: View {
         }
         .padding(8)
         .frame(width: Self.width, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
-        .onGeometryChange(for: CGSize.self) { $0.size } action: { measuredSize = $0 }
-        .allowsHitTesting(false)
+        .tooltipSurface()
     }
 }
 

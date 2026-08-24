@@ -188,7 +188,10 @@ struct ModelsView: View {
             reasoning: entry.reasoning,
             total: entry.total,
             cost: entry.cost,
-            costRatio: entry.implausibleCostRatio,
-            measuredSize: $tooltipSize)
+            costRatio: entry.implausibleCostRatio)
+        // Measured here rather than inside the panel: `ModelUsageTooltip` is
+        // now also rendered by the shared HoverTooltipLayer, which measures for
+        // itself, so the size binding belongs to this legacy call site.
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { tooltipSize = $0 }
     }
 }
