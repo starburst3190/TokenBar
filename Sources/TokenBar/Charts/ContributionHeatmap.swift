@@ -133,15 +133,19 @@ struct ContributionHeatmap: View {
     /// 2D bar chart — keeps the tooltip's numbers current instead of frozen
     /// at whatever they were the instant hovering began.
     @State private var hoverIndex: Int?
-    @State private var tooltipSize: CGSize = .zero
     /// The scrolling content's on-screen origin, tracked so the tooltip
     /// (rendered in an overlay *outside* the horizontal ScrollView, see
     /// `body`) can find a hovered cell's true screen position instead of one
     /// pinned to the clipped, scrolled-past content frame.
     @State private var contentOrigin: CGPoint = .zero
-    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
+    /// The popover-wide hover tooltip. This grid reports its hovered cell and
+    /// that cell's position in `PopoverViewport.space`; the root
+    /// `HoverTooltipLayer` renders and places the panel, exactly as the bar
+    /// chart on the other side of this card's Bars/Heatmap switch does.
+    @Environment(TooltipHost.self) private var tooltipHost
 
     private static let tooltipWidth: CGFloat = 170
+    private static let tooltipOwner = "usage-heatmap"
     private static let contentID = "heatmap-content"
 
     // MARK: - Pure per-metric data (no Calendar/TimeZone/Date — ISODay only)
@@ -354,8 +358,12 @@ struct ContributionHeatmap: View {
     /// for the same reason: cheap, and consistent with `cellAt` treating
     /// them as the one live judgment call for "does this cell count".
     private func hoverCell(_ state: RenderState) -> GridCell? {
-        guard let hoverIndex, grid.cells.indices.contains(hoverIndex) else { return nil }
-        let cell = grid.cells[hoverIndex]
+        cell(at: hoverIndex, state: state)
+    }
+
+    private func cell(at index: Int?, state: RenderState) -> GridCell? {
+        guard let index, grid.cells.indices.contains(index) else { return nil }
+        let cell = grid.cells[index]
         guard Self.isRenderable(cell, cutoff: state.cutoff), Self.hasData(cell, metric: metric) else { return nil }
         return cell
     }
@@ -396,7 +404,7 @@ struct ContributionHeatmap: View {
                 GeometryReader { outerGeo in
                     ScrollViewReader { proxy in
                         ScrollView(.horizontal, showsIndicators: false) {
-                            canvasBody(state)
+                            canvasBody(state, outerGeo: outerGeo)
                                 .id(Self.contentID)
                         }
                         // Round 2, item 3(b): land on the most recent columns
@@ -415,43 +423,22 @@ struct ContributionHeatmap: View {
                             proxy.scrollTo(Self.contentID, anchor: .trailing)
                         }
                     }
-                    // Tooltip lives in the ScrollView's overlay, not its
-                    // content — an overlay isn't clipped by the view it
-                    // decorates, so this is what stops the tooltip being cut
-                    // off at the heatmap's edge (round 2, item 1).
-                    .overlay(alignment: .topLeading) {
-                        if let cell = hoverCell(state) {
-                            let anchor = Self.tooltipAnchor(
-                                cellCenter: cellCenter(cell), contentOrigin: contentOrigin)
-                            let measuredSize = tooltipSize == .zero
-                                ? CGSize(width: Self.tooltipWidth, height: 60)
-                                : tooltipSize
-                            // Still `.global` here (unrelated to the
-                            // scroll-perf fix above): `containerFrame` only
-                            // needs to match `popoverScrollViewport`'s space
-                            // for the viewport-clamp math, and reading it
-                            // fresh at render time — rather than storing it
-                            // via `@State`/`onGeometryChange` — costs nothing
-                            // extra; it's not what was driving the
-                            // re-render cascade.
-                            let offset = PopoverTooltipPlacement.offset(
-                                anchor: anchor,
-                                tooltipSize: measuredSize,
-                                containerFrame: outerGeo.frame(in: .global),
-                                viewport: popoverScrollViewport)
-                            tooltip(cell)
-                                .offset(offset ?? .zero)
-                        }
-                    }
                 }
                 .coordinateSpace(name: Self.coordinateSpaceName)
                 .frame(height: contentHeight)
+                // The heatmap can be switched out from under the cursor (the
+                // Bars/3D toggle, a tab change) with no `.ended` to clean up
+                // the shared panel.
+                .onDisappear {
+                    hoverIndex = nil
+                    tooltipHost.hide(owner: Self.tooltipOwner)
+                }
             }
             Spacer(minLength: 0)
         }
     }
 
-    private func canvasBody(_ state: RenderState) -> some View {
+    private func canvasBody(_ state: RenderState, outerGeo: GeometryProxy) -> some View {
         ZStack(alignment: .topLeading) {
             Canvas { context, _ in
                 for (col, label) in state.monthLabelCols {
@@ -495,9 +482,18 @@ struct ContributionHeatmap: View {
         .onContinuousHover { phase in
             switch phase {
             case let .active(point):
-                hoverIndex = Self.cellAt(point, grid: grid, visibleCols: state.visibleCols)
+                let index = Self.cellAt(point, grid: grid, visibleCols: state.visibleCols)
+                // Continuous hover fires per pixel; within one cell there is
+                // nothing to re-anchor (the panel hangs off the cell's centre,
+                // not the cursor), so only a crossing — or a panel cleared out
+                // from under a still-hovering cursor by a refresh — does work.
+                guard index != hoverIndex || !tooltipHost.isActive(owner: Self.tooltipOwner)
+                else { break }
+                hoverIndex = index
+                showTooltip(for: index, state: state, container: outerGeo)
             case .ended:
                 hoverIndex = nil
+                tooltipHost.hide(owner: Self.tooltipOwner)
             }
         }
         // Round 7: clear the hover the instant the content's origin
@@ -516,6 +512,7 @@ struct ContributionHeatmap: View {
         ) { newOrigin in
             if Self.shouldClearHoverOnOriginChange(old: contentOrigin, new: newOrigin) {
                 hoverIndex = nil
+                tooltipHost.hide(owner: Self.tooltipOwner)
             }
             contentOrigin = newOrigin
         }
@@ -570,6 +567,25 @@ struct ContributionHeatmap: View {
 
     // MARK: - Tooltip
 
+    /// Publish the hovered cell to the shared host, in the popover viewport's
+    /// coordinate space. The cell's centre goes through `tooltipAnchor` to land
+    /// in the container's space (undoing this grid's own horizontal scroll),
+    /// then through the container's own frame to reach the viewport.
+    private func showTooltip(for index: Int?, state: RenderState, container: GeometryProxy) {
+        guard let cell = cell(at: index, state: state) else {
+            tooltipHost.hide(owner: Self.tooltipOwner)
+            return
+        }
+        let inContainer = Self.tooltipAnchor(
+            cellCenter: cellCenter(cell), contentOrigin: contentOrigin)
+        let containerFrame = container.frame(in: .named(PopoverViewport.space))
+        let anchor = CGPoint(
+            x: containerFrame.minX + inContainer.x,
+            y: containerFrame.minY + inContainer.y)
+        tooltipHost.show(owner: Self.tooltipOwner, at: anchor) { tooltip(cell) }
+    }
+
+    /// Placement and clamping are handled by the root HoverTooltipLayer.
     private func tooltip(_ cell: GridCell) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(Format.monthDay(cell.date)).font(.caption.weight(.semibold))
@@ -580,11 +596,8 @@ struct ContributionHeatmap: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
-        .padding(6)
+        .padding(8)
         .frame(width: Self.tooltipWidth, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
-        .onGeometryChange(for: CGSize.self) { $0.size } action: { tooltipSize = $0 }
-        .allowsHitTesting(false)
+        .tooltipSurface()
     }
 }
