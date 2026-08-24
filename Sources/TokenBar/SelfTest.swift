@@ -14414,6 +14414,46 @@ enum SelfTest {
                 + "data silently overwriting the other's under a shared "
                 + "\"clientId|cardId\" key")
 
+        // MARK: - Card order & Quota composition (CO; append-only)
+        //
+        // Ordering is a preference now, so the two failure modes worth pinning
+        // are an upgrade that silently reshuffles a lens nobody touched, and a
+        // saved order written before a card existed quietly dropping it.
+        expect(OverviewCard.orderKey == "tokenbar.overview.order"
+                && QuotaCard.orderKey == "tokenbar.quota.order"
+                && QuotaCard.hiddenKey == "tokenbar.quota.hidden",
+               "CO1 each key is declared once, on the type that owns it")
+        expect(OverviewCard.ordered(orderRaw: "") == OverviewCard.allCases
+                && QuotaCard.ordered(orderRaw: "") == QuotaCard.allCases,
+               "CO2 no saved order leaves declaration order in charge, so an upgrade moves nothing")
+        expect(QuotaCard.allCases.map(\.rawValue)
+                == ["windowUsage", "trend", "historyStrip", "heatmap", "limits", "history"],
+               "CO3 the default order is the one both Quota surfaces shipped with")
+        expect(QuotaCard.ordered(orderRaw: "limits") == [.limits, .windowUsage, .trend,
+                                                         .historyStrip, .heatmap, .history],
+               "CO4 pulling one card to the front leaves the rest in declaration order behind it")
+        expect(QuotaCard.ordered(orderRaw: "history,limits,windowUsage,heatmap,historyStrip,trend")
+                == [.history, .limits, .windowUsage, .heatmap, .historyStrip, .trend],
+               "CO4 a fully specified order is honoured exactly")
+        expect(QuotaCard.ordered(orderRaw: "limits,inventedCard,history").count == QuotaCard.allCases.count
+                && QuotaCard.ordered(orderRaw: "limits,inventedCard,history").first == .limits,
+               "CO5 an id naming no card is ignored rather than dropping a real one")
+        // The upgrade case: an order string saved before `heatmap` existed.
+        expect(QuotaCard.ordered(orderRaw: "history,limits,windowUsage,historyStrip,trend")
+                .contains(.heatmap),
+               "CO5 a card the saved order predates still appears instead of vanishing")
+        expect(QuotaCard.visible(hiddenRaw: "trend,heatmap", orderRaw: "limits")
+                == [.limits, .windowUsage, .historyStrip, .history],
+               "CO6 hidden and order compose: hiding removes, ordering rearranges the rest")
+        expect(QuotaCard.visible(
+                hiddenRaw: QuotaCard.allCases.map(\.rawValue).joined(separator: ","),
+                orderRaw: "").isEmpty,
+               "CO7 every quota card may be hidden — QuotaView renders its own empty state, "
+                + "unlike Overview, which is a fallback lens and keeps an anchor")
+        expect(OverviewCard.visible(hiddenRaw: "chart", orderRaw: "streaks,chart").first == .streaks
+                && OverviewCard.visible(hiddenRaw: "chart", orderRaw: "streaks,chart").contains(.chart),
+               "CO8 the Overview anchor survives a tampered hidden set at its dragged position")
+
         if failures > 0 {
             print("\(failures) selftest check(s) failed")
             exit(1)

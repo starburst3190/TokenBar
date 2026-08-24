@@ -39,6 +39,7 @@ struct OverviewView: View {
     var agentUsage: AgentUsagePayload?
 
     @AppStorage(OverviewCard.hiddenKey) private var hiddenCardsRaw = ""
+    @AppStorage(OverviewCard.orderKey) private var cardOrderRaw = ""
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
 
     var body: some View {
@@ -47,7 +48,10 @@ struct OverviewView: View {
             // and the Agent-limits card answer the same question at two scales,
             // and having them here while the window history lived elsewhere
             // split one subject across two lenses. Overview keeps usage.
-            ForEach(OverviewCard.visible(hiddenRaw: hiddenCardsRaw), id: \.self) { card in
+            ForEach(
+                OverviewCard.visible(hiddenRaw: hiddenCardsRaw, orderRaw: cardOrderRaw),
+                id: \.self
+            ) { card in
                 self.card(card)
             }
         }

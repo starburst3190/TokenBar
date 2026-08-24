@@ -37,9 +37,27 @@ public enum OverviewCard: String, CaseIterable, Sendable {
     /// do: a hand-edited preference must not be able to produce a surface with
     /// no way out.
     public static func visible(hiddenRaw: String) -> [OverviewCard] {
+        visible(hiddenRaw: hiddenRaw, orderRaw: "")
+    }
+
+    /// The same, in the order the user dragged the cards into. An empty
+    /// `orderRaw` means "never reordered", which is what every install starts
+    /// as and what leaves declaration order in charge.
+    public static func visible(hiddenRaw: String, orderRaw: String) -> [OverviewCard] {
         let hidden = ClientRegistry.parseIdSet(hiddenRaw)
-        return allCases.filter { !toggleable.contains($0) || !hidden.contains($0.rawValue) }
+        return ordered(orderRaw: orderRaw)
+            .filter { !toggleable.contains($0) || !hidden.contains($0.rawValue) }
+    }
+
+    /// All cards in the user's saved order, with any card the saved order does
+    /// not mention appended in declaration order — so a card added by a later
+    /// release appears rather than vanishing because an old preference never
+    /// heard of it. Ids in the saved order that name nothing are dropped.
+    public static func ordered(orderRaw: String) -> [OverviewCard] {
+        ClientRegistry.orderedClients(allCases.map(\.rawValue), orderRaw: orderRaw)
+            .compactMap(OverviewCard.init(rawValue:))
     }
 
     public static let hiddenKey = "tokenbar.overview.hidden"
+    public static let orderKey = "tokenbar.overview.order"
 }
