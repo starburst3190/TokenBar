@@ -1,13 +1,43 @@
+## Before you update
+
+**The "10% of quota ~ …" line will read lower on some windows, and that is the fix.** [#260](https://github.com/Nanako0129/TokenBar/pull/260)
+
+That line divides the usage recorded during a window by how much quota the window consumed, and it was measuring that consumption two different ways depending on where the line appeared. The single-window row took the distance between the first and the last reading. The pooled historical estimate took the gap between the highest and the lowest. When a reading goes down — a reset, or the provider correcting a number it reported earlier — the first collapses, while the second stops at whatever the highest reading happened to be. The usage above the line still counts everything on both sides of the drop either way.
+
+Both now count the distance the readings actually travelled. On one real window that is 95 points, against 10 by the old single-window measure and 85 by the old pooled one. So the single-window row was dividing a full window of usage by 10 and reading several thousand dollars, while the pooled estimate was only slightly high and moves by about a tenth.
+
+Only windows whose readings went down at some point are affected. Where the readings only rose, the two measurements are the same number and nothing changes.
+
+Nothing was lost and nothing needs rebuilding.
+
+## Features
+
+- **The menu-bar text color is configurable.** [#265](https://github.com/Nanako0129/TokenBar/pull/265) — thanks @Agugu-official
+
+  Settings gains a Font color section under Menu bar, offering Automatic and Custom. Automatic is unchanged: quota remaining keeps the built-in green / amber / red, and other titles keep the system color. Custom sets three colors of your own against the thresholds the gauge already uses — above 25% remaining, above 10% through 25%, and 10% or below — with 16 presets and a `#RRGGBB` field. Each individual client item uses its own remaining value, so they can differ from one another.
+
+  Switching back to Automatic keeps all three colors for later.
+
+- **A reported cost the local pricing table cannot justify is now flagged.** [#264](https://github.com/Nanako0129/TokenBar/pull/264)
+
+  Some clients record their own per-message cost, and TokenBar ships those figures as reported rather than pricing the tokens itself. That is the right default — the client knows its own billing contract — but it means a unit error upstream reaches the screen with nothing in between. One report showed a model at $8,647 for 74M tokens.
+
+  Such a row now carries an amber warning beside the cost, and the tooltip names the multiple it is of the local estimate. The figure itself is not corrected: the app cannot know your real rate, only that this one is far from any price it can justify. The threshold is 50x, so a normal row cannot reach it, and a model the table cannot price produces no flag rather than a false one.
+
 ## Fixes
 
-- **The quota equivalence counted fewer tokens than it priced.** [#238](https://github.com/Nanako0129/TokenBar/pull/238)
+- **With a second Claude account, each account's usage was counted against every account's quota.** [#261](https://github.com/Nanako0129/TokenBar/pull/261)
 
-  The estimate under a quota window — and the heatmap tooltip that scales from it — print a token count beside a dollar amount as two descriptions of the same work. A reader divides them. The count excluded cache reads while the amount included their cost, so the quotient came out several times any model's list rate.
+  Every quota-window surface folded both accounts' transcripts into whichever account's allowance it was dividing by. Measured against a reporting store, the primary account's figures ran 1.40x high and the second account's 3.51x — the smaller account is hit harder, because it receives the same numerator against much less quota movement.
 
-  Reported from a live reading: `72 quota points ~ 4.8M · $172.25`, which is **$36 per million**. Cache reads are most of the volume in a Claude Code session, so most of the tokens were missing from the count while all of their cost remained in the price.
+  Each account is now scanned separately, against its own registered root. Single-account installs are unaffected, and no stored data changes format.
 
-  The count now covers what the price covers. **The dollar figure does not move** — it was never the wrong half. The token figure grows, and the implied per-million rate falls back near list.
+  Two limits are left in place rather than papered over. A transcript sitting under both accounts' roots is counted for both, because nothing in it says which account produced it — measured at 2 messages in 10,389 on the machine this was built against. And usage you attributed to Claude from another client stays with the primary account: an attribution names a client, a provider and a model, and carries no account for it to follow.
 
-  The direction was forced rather than chosen: a message carries one cost, not one per token class, so the price cannot be narrowed to match a smaller count. Widening the count was the only consistent pairing available.
+- **Consumption measured across a drop now has to clear the estimate's bar once per rise.** [#260](https://github.com/Nanako0129/TokenBar/pull/260)
 
-  Both surfaces are corrected together. The estimate is computed in two places — once for the live window and once for the pooled history, rendered one above the other — and fixing only the second would have put the old number and the new one on screen at the same time. [#237](https://github.com/Nanako0129/TokenBar/issues/237)
+  The other half of the same correction. Usage summed across a drop is several separate measurements added together, each carrying its own rounding, so the quoted ± is now one rounding step per rise over the whole consumption rather than one step over the displacement. It can come out either narrower or wider than the figure you saw before, depending on which of the two moved more. A window with enough movement still gets its estimate; one that no longer clears the bar reads "too little to estimate" instead of a confident number.
+
+- **The Models list now shows the same detailed hover tooltip as the other cards.** [#264](https://github.com/Nanako0129/TokenBar/pull/264)
+
+  It already had a plain one naming the model and its client. The shared tooltip adds the token breakdown and the cost, and it is where the warning above names its multiple.

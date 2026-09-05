@@ -482,7 +482,7 @@ struct ContributionHeatmap: View {
         .onContinuousHover { phase in
             switch phase {
             case let .active(point):
-                let index = cellAt(point, visibleCols: state.visibleCols)
+                let index = Self.cellAt(point, grid: grid, visibleCols: state.visibleCols)
                 // Continuous hover fires per pixel; within one cell there is
                 // nothing to re-anchor (the panel hangs off the cell's centre,
                 // not the cursor), so only a crossing — or a panel cleared out
@@ -534,7 +534,10 @@ struct ContributionHeatmap: View {
     /// `grid.cells` is laid out `col * 7 + row` by `buildGrid` (Grid.swift's
     /// nested col/row loop), so direct indexing avoids a lookup dictionary;
     /// the col/row re-check guards against that ordering ever changing.
-    private func cellAt(_ point: CGPoint, visibleCols: Int) -> Int? {
+    /// Static (not `private`) so SelfTest can exercise the exact production
+    /// resolver directly (FLAT-HEATMAP contract C3) instead of a hand-rebuilt
+    /// copy of this coordinate math.
+    static func cellAt(_ point: CGPoint, grid: TokenBarCore.GridLayout, visibleCols: Int) -> Int? {
         guard point.x >= HeatmapLayout.gridLeading, point.y >= HeatmapLayout.gridTop
         else { return nil }
         let localX = point.x - HeatmapLayout.gridLeading

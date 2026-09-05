@@ -434,6 +434,13 @@ private final class WindowScanCountingSource: UsageDataSource, @unchecked Sendab
     private let inner = DashboardModelTestSource(failingGraphYear: "")
     private let payload: AgentUsagePayload
     var scans = 0
+    /// Which account each scan asked for, in order. `SC1` only needs the count;
+    /// the per-account cases need to see that the right accounts were asked.
+    var scannedAccounts: [String?] = []
+    /// Rows served per account, keyed the way the model keys its scans (the
+    /// empty string is the primary). Empty means "no messages", which is the
+    /// pre-existing behaviour every other case relies on.
+    var messagesByAccount: [String: [WindowMessage]] = [:]
     /// Served for every window, so a case about the strip summaries has
     /// something to summarise. Nil keeps the pre-existing behaviour.
     var curve: QuotaCurve?
@@ -489,9 +496,22 @@ private final class WindowScanCountingSource: UsageDataSource, @unchecked Sendab
         try await inner.usageTrace(windowSecs: windowSecs)
     }
     func tokensPerMin() async throws -> Double { try await inner.tokensPerMin() }
-    func windowUsage(from: Int64, until: Int64) async throws -> WindowUsage {
+    /// Counts a scan per ACCOUNT, because the shipping code now issues one
+    /// call per account rather than one call for all of them.
+    ///
+    /// The signature has to track the protocol's exactly. An outdated one still
+    /// compiles — the conformance falls through to the extension's default,
+    /// which returns empty and counts nothing — and the counter then reads zero
+    /// for a model that scanned. That is how this double stopped observing
+    /// anything while `SC1` still ran.
+    func windowUsage(
+        accountKey: String?, from: Int64, until: Int64
+    ) async throws -> WindowUsage {
         scans += 1
-        return WindowUsage(messages: [], undatedCount: 0, processingTimeMs: 0)
+        scannedAccounts.append(accountKey)
+        return WindowUsage(
+            messages: messagesByAccount[accountKey ?? ""] ?? [],
+            undatedCount: 0, processingTimeMs: 0)
     }
 }
 
@@ -564,7 +584,9 @@ private final class RegistryRaceSource: UsageDataSource, @unchecked Sendable {
         try await inner.usageTrace(windowSecs: windowSecs)
     }
     func tokensPerMin() async throws -> Double { try await inner.tokensPerMin() }
-    func windowUsage(from: Int64, until: Int64) async throws -> WindowUsage {
+    func windowUsage(
+        accountKey: String?, from: Int64, until: Int64
+    ) async throws -> WindowUsage {
         WindowUsage(messages: [], undatedCount: 0, processingTimeMs: 0)
     }
 }
@@ -876,6 +898,68 @@ enum SelfTest {
             return try? box.result?.get()
         }
 
+        // Per-level overrides survive reopening; Automatic restores the
+        // original quota/native policy without discarding any saved colors.
+        let textColorSuite = "com.tokenbar.selftest.menu-bar-text-color"
+        if let defaults = UserDefaults(suiteName: textColorSuite) {
+            defaults.removePersistentDomain(forName: textColorSuite)
+            defer { defaults.removePersistentDomain(forName: textColorSuite) }
+            let automatic = TrayIcons.gaugeColor(remaining: 8)
+            expect(MenuBarTextColor.resolve(automatic: automatic, quotaRemaining: 8, defaults: defaults) == automatic,
+                "menu bar font defaults preserve quota warning colors")
+            expect(MenuBarTextColor.resolve(automatic: nil, defaults: defaults) == nil,
+                "menu bar font defaults preserve native text")
+            defaults.set("custom", forKey: MenuBarTextColor.storageKey)
+            defaults.set("#B35CFF", forKey: MenuBarTextColor.customColorKey)
+            let reopened = UserDefaults(suiteName: textColorSuite)!
+            let custom = MenuBarTextColor.resolve(automatic: nil, quotaRemaining: 80, defaults: reopened)
+            expect(custom.flatMap { MenuBarTextColor.hex(color: $0) } == "#B35CFF",
+                "the existing custom font color persists as the normal color")
+            expect(MenuBarTextColor.resolve(automatic: nil, defaults: reopened) == custom,
+                "non-quota and unavailable text use the normal custom color")
+            expect(MenuBarTextColor.resolve(automatic: automatic, quotaRemaining: 20, defaults: reopened)
+                    .flatMap { MenuBarTextColor.hex(color: $0) } == "#F59E0B"
+                && MenuBarTextColor.resolve(automatic: automatic, quotaRemaining: 8, defaults: reopened)
+                    .flatMap { MenuBarTextColor.hex(color: $0) } == "#EF4444",
+                "new warning and critical preferences have separate defaults")
+            defaults.set("#123456", forKey: MenuBarTextColor.warningColorKey)
+            defaults.set("#FF0066", forKey: MenuBarTextColor.criticalColorKey)
+            for (remaining, expectedHex) in [
+                (100.0, "#B35CFF"), (25.01, "#B35CFF"),
+                (25.0, "#123456"), (10.01, "#123456"),
+                (10.0, "#FF0066"), (0.0, "#FF0066"),
+            ] {
+                let resolved = MenuBarTextColor.resolve(
+                    automatic: nil, quotaRemaining: remaining, defaults: reopened)
+                expect(resolved.flatMap { MenuBarTextColor.hex(color: $0) } == expectedHex,
+                    "custom quota text selects the saved level at \(remaining)%")
+            }
+            expect(TrayIcons.gaugeColor(remaining: 25.01)
+                    == NSColor(srgbRed: 0.13, green: 0.77, blue: 0.37, alpha: 1)
+                && TrayIcons.gaugeColor(remaining: 25)
+                    == NSColor(srgbRed: 0.96, green: 0.62, blue: 0.04, alpha: 1)
+                && TrayIcons.gaugeColor(remaining: 10)
+                    == NSColor(srgbRed: 0.94, green: 0.27, blue: 0.27, alpha: 1),
+                "shared quota levels preserve the automatic palette and thresholds")
+            defaults.set("invalid", forKey: MenuBarTextColor.warningColorKey)
+            expect(MenuBarTextColor.resolve(automatic: automatic, quotaRemaining: 20, defaults: defaults) == automatic
+                && MenuBarTextColor.resolve(automatic: nil, quotaRemaining: 8, defaults: defaults)
+                    .flatMap { MenuBarTextColor.hex(color: $0) } == "#FF0066",
+                "an invalid saved level falls back without affecting other levels")
+            defaults.set("automatic", forKey: MenuBarTextColor.storageKey)
+            expect(MenuBarTextColor.resolve(automatic: automatic, quotaRemaining: 8, defaults: defaults) == automatic
+                && MenuBarTextColor.resolve(automatic: nil, defaults: defaults) == nil
+                && defaults.string(forKey: MenuBarTextColor.customColorKey) == "#B35CFF"
+                && defaults.string(forKey: MenuBarTextColor.criticalColorKey) == "#FF0066",
+                "automatic restores quota and native colors while retaining the custom palette")
+            defaults.set("custom", forKey: MenuBarTextColor.storageKey)
+            defaults.set("#notRGB", forKey: MenuBarTextColor.customColorKey)
+            expect(MenuBarTextColor.resolve(automatic: automatic, defaults: defaults) == automatic,
+                "malformed saved font colors fall back to automatic")
+        } else {
+            expect(false, "menu bar text-color defaults suite")
+        }
+
         // THROTTLE. Three independent callers fetch the OAuth quota payload
         // fetch-first, and the popover's loop is remounted by a `.task` on every
         // reopen — so opening and closing ten times issued ten requests, which
@@ -1118,6 +1202,86 @@ enum SelfTest {
         expect(
             modelLevelEntries.first { $0.model == "shared-model" }?.msPer1kTokens == nil,
             "provider-split model fold omits unrecomputable throughput")
+
+        // Implausible self-reported cost. A client that records its own cost
+        // (OpenCode, MiMo Code) has it taken verbatim by tokscale-core and
+        // never priced, so this comparison against the local estimate is the
+        // only thing between a unit error upstream and the number on screen.
+        func costEntry(_ cost: Double, _ estimate: Double?, provider: String = "p") -> String {
+            """
+            {"client":"c","model":"m","provider":"\(provider)",
+             "input":1,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+             "total":1,"messageCount":1,"cost":\(cost),"msPer1kTokens":null,
+             "costEstimate":\(estimate.map { "\($0)" } ?? "null")}
+            """
+        }
+        func costReport(_ entries: [String]) -> ModelReport {
+            let json = """
+            {"entries":[\(entries.joined(separator: ","))],
+             "totalInput":1,"totalOutput":0,"totalCacheRead":0,"totalCacheWrite":0,
+             "totalMessages":\(entries.count),"totalCost":0.0}
+            """
+            return try! JSONDecoder().decode(ModelReport.self, from: Data(json.utf8))
+        }
+        func onlyRow(_ entries: [String]) -> ModelReportEntry {
+            costReport(entries).modelLevelEntries[0]
+        }
+
+        expect(
+            onlyRow([costEntry(1000, 1)]).implausibleCostRatio == 1000,
+            "a cost 1000x the local estimate is flagged, with that multiple — the shape of "
+                + "the user report where a per-1K rate was billed per-token")
+        expect(
+            onlyRow([costEntry(CostPlausibility.threshold, 1)]).implausibleCostRatio == nil
+                && onlyRow([costEntry(CostPlausibility.threshold + 0.5, 1)])
+                    .implausibleCostRatio != nil,
+            "the threshold is pinned from both sides, so a comparison flipped to >= or < "
+                + "cannot pass this pair")
+        expect(
+            onlyRow([costEntry(0.3, 1)]).implausibleCostRatio == nil,
+            "a row costing LESS than the estimate is never flagged — every healthy row "
+                + "measured on real data sits at 0.1-0.3x, so a two-sided check would flag "
+                + "all of them forever")
+        expect(
+            onlyRow([costEntry(0, 1)]).implausibleCostRatio == nil,
+            "a genuinely free model reports 0.0 against a positive estimate and must stay quiet")
+        expect(
+            onlyRow([costEntry(99_999, nil)]).implausibleCostRatio == nil,
+            "no estimate means the table cannot price these tokens at all, which is not "
+                + "evidence about the reported cost — and must not divide by nil")
+        expect(
+            onlyRow([costEntry(99_999, 0)]).implausibleCostRatio == nil,
+            "a zero estimate is not a usable denominator")
+
+        // The fold is where a pre-fold ratio would go wrong (PR #264 review):
+        // one broken component merged with a larger healthy row is NOT the
+        // component's multiple. 100/1 + 1000/1000 = 1100/1001 = 1.1x.
+        let mergedMostlyHealthy = onlyRow([
+            costEntry(100, 1, provider: "a"), costEntry(1000, 1000, provider: "b"),
+        ])
+        expect(
+            mergedMostlyHealthy.cost == 1100 && mergedMostlyHealthy.costEstimate == 1001,
+            "the fold sums cost and estimate together, so the ratio describes the merged row")
+        expect(
+            mergedMostlyHealthy.implausibleCostRatio == nil,
+            "a merged row at 1.1x is not flagged, even though one component alone was 100x — "
+                + "carrying the component's ratio onto the aggregate would be materially false")
+        expect(
+            onlyRow([costEntry(100_000, 1, provider: "a"), costEntry(1000, 1000, provider: "b")])
+                .implausibleCostRatio != nil,
+            "a component broken badly enough to distort the merged total still flags after "
+                + "the fold — the warning is not lost by summing")
+        expect(
+            onlyRow([costEntry(100_000, nil, provider: "a"), costEntry(1, 1, provider: "b")])
+                .costEstimate == nil,
+            "one unpriceable component makes the merged estimate a partial denominator, "
+                + "which would overstate the ratio — the merged row reports no estimate instead")
+        expect(
+            CostPlausibility.warningText(308.4).contains("308")
+                && !CostPlausibility.warningText(308.4).contains("308.4"),
+            "the warning names the multiple as a whole number — one wording shared by the "
+                + "tooltip line and the icon's accessibility label, which is the only channel "
+                + "a VoiceOver user has because the tooltip is pointer-only")
 
         // Usage attribution: declarations are explicit, provider-level by
         // default, and model overrides are more specific. Suggestions never
@@ -3812,242 +3976,219 @@ enum SelfTest {
         let clientDefaultsName = "TokenBar.SelfTest.ClientTray.\(UUID().uuidString)"
         if let clientDefaults = UserDefaults(suiteName: clientDefaultsName) {
             defer { clientDefaults.removePersistentDomain(forName: clientDefaultsName) }
-            expect(ClientTray.enabled(defaults: clientDefaults).isEmpty, "individual trays default off")
-            expect(
-                ClientTray.canonicalEnabledRaw(["codex", "claude"]) == "claude,codex",
-                "enabled clients serialize as deterministic sorted CSV")
-            expect(
-                ClientTray.enabledRaw(
-                    updating: "claude", clientId: "codex", enabled: true)
-                    == "claude,codex"
-                    && ClientTray.enabledRaw(
-                        updating: "claude,codex", clientId: "codex", enabled: false)
-                        == "claude",
-                "Settings can commit enabled state through its observed AppStorage raw")
 
-            func boundedClientID(_ index: Int, length: Int) -> String {
-                let prefix = "c\(index)_"
-                return prefix + String(repeating: "a", count: length - prefix.utf8.count)
+            func trayPaddedID(_ i: Int, _ n: Int) -> String {
+                let p = "c\(i)_"
+                return p + String(repeating: "a", count: n - p.utf8.count)
             }
-            var boundaryEnabledIDs = (0 ..< 64).map { boundedClientID($0, length: 127) }
-            boundaryEnabledIDs[0] = boundedClientID(0, length: 128)
-            let boundaryEnabledRaw = ClientTray.canonicalEnabledRaw(Set(boundaryEnabledIDs))
-            expect(
-                boundaryEnabledRaw?.utf8.count == ClientTray.maxEnabledRawBytes
-                    && boundaryEnabledRaw.map(ClientTray.parseEnabledRaw)?.count == 64,
-                "enabled codec accepts an exact raw-byte boundary")
-            expect(
-                boundaryEnabledRaw.map { ClientTray.parseEnabledRaw($0 + "a").isEmpty } == true,
-                "enabled codec rejects one byte over the raw boundary")
-            let outgoingOversizedEnabled = Set(
-                (0 ..< 65).map { boundedClientID($0, length: 128) })
-            expect(
-                ClientTray.canonicalEnabledRaw(outgoingOversizedEnabled) == nil,
-                "enabled codec refuses to serialize an oversized valid set")
+            func trayEnabledIDs(_ count: Int, _ bytes: Int, stretchFirst: Int = 0) -> Set<String> {
+                var ids = (0 ..< count).map { trayPaddedID($0, bytes) }
+                if stretchFirst != 0 { ids[0] = trayPaddedID(0, bytes + stretchFirst) }
+                return Set(ids)
+            }
+            func traySelectionMap(count: Int, valueBytes: Int, padExact: Bool) -> [String: String] {
+                var map = Dictionary(uniqueKeysWithValues: (0 ..< count).map {
+                    ("c\($0)", String(repeating: "x", count: valueBytes))
+                })
+                guard padExact else { return map }
+                map["final"] = "x"
+                let seed = try! JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]).count
+                map["final"] = String(repeating: "x", count: 1 + ClientTray.maxSelectionRawBytes - seed)
+                return map
+            }
 
-            let selectionRaw = ClientTray.selectionsRaw(
-                updating: "{\"codex\":\"weekly.v1\"}",
-                clientId: "claude", selection: "model.gpt|preview.v1")
+            let enabledExact = ClientTray.canonicalEnabledRaw(
+                trayEnabledIDs(64, 127, stretchFirst: 1))!
+            let selMap = traySelectionMap(
+                count: 15, valueBytes: ClientTray.maxCardIDBytes, padExact: true)
+            let selExact = ClientTray.canonicalSelectionsRaw(selMap)!
+            var selOver = selMap
+            selOver["overflow"] = String(repeating: "x", count: ClientTray.maxCardIDBytes)
+            let oversizedEnabled = String(repeating: "a,", count: ClientTray.maxEnabledRawBytes)
+            let overEntrySel = String(data: try! JSONSerialization.data(
+                withJSONObject: Dictionary(uniqueKeysWithValues: (0 ... ClientTray.maxEntries).map {
+                    ("c\($0)", "card\($0)")
+                }), options: [.sortedKeys]), encoding: .utf8)!
+            let delim = "{\"claude\":\"model.gpt|preview.v1\",\"codex\":\"weekly.v1\"}"
+
+            expect(ClientTray.enabled(defaults: clientDefaults).isEmpty, "enabled codec: defaults off")
+            for (name, raw, want) in [
+                ("deterministic sorted CSV", ClientTray.canonicalEnabledRaw(["codex", "claude"]), Optional("claude,codex")),
+                ("refuses one-over exact-byte set", ClientTray.canonicalEnabledRaw(trayEnabledIDs(65, 128)), nil),
+                ("refuses over-entry set", ClientTray.canonicalEnabledRaw(Set((0 ... ClientTray.maxEntries).map { "c\($0)" })), nil),
+            ] as [(String, String?, String?)] {
+                expect(raw == want, "enabled codec serialize: \(name)")
+            }
             expect(
-                selectionRaw == "{\"claude\":\"model.gpt|preview.v1\",\"codex\":\"weekly.v1\"}",
-                "selection map uses deterministic sorted JSON")
-            clientDefaults.set(selectionRaw, forKey: ClientTray.selectionsKey)
+                enabledExact.utf8.count == ClientTray.maxEnabledRawBytes
+                    && ClientTray.parseEnabledRaw(enabledExact).count == 64,
+                "enabled codec parse: exact raw-byte boundary")
             expect(
-                ClientTray.selections(defaults: clientDefaults)["claude"] == "model.gpt|preview.v1",
-                "selection codec preserves card delimiters exactly")
+                selExact.utf8.count == ClientTray.maxSelectionRawBytes
+                    && ClientTray.parseSelectionsRaw(selExact).count == 16
+                    && ClientTray.canonicalSelectionsRaw(selOver) == nil,
+                "selection codec parse: exact raw-byte boundary; serialize refuses oversized valid map")
             expect(
                 ClientTray.selectionsRaw(
-                    updating: "{}", clientId: "codex", selection: "weekly.v1")
-                    == "{\"codex\":\"weekly.v1\"}",
-                "Settings can commit selection state through its observed AppStorage raw")
-
-            var boundarySelections = Dictionary(uniqueKeysWithValues: (0 ..< 15).map {
-                ("c\($0)", String(repeating: "x", count: ClientTray.maxCardIDBytes))
-            })
-            boundarySelections["final"] = "x"
-            let initialBoundaryData = try! JSONSerialization.data(
-                withJSONObject: boundarySelections, options: [.sortedKeys])
-            let boundaryPadding = ClientTray.maxSelectionRawBytes - initialBoundaryData.count
-            boundarySelections["final"] = String(repeating: "x", count: 1 + boundaryPadding)
-            let boundarySelectionRaw = ClientTray.canonicalSelectionsRaw(boundarySelections)
+                    updating: "{\"codex\":\"weekly.v1\"}", clientId: "claude",
+                    selection: "model.gpt|preview.v1") == delim,
+                "selection codec serialize: deterministic sorted JSON")
+            clientDefaults.set(delim, forKey: ClientTray.selectionsKey)
             expect(
-                boundarySelectionRaw?.utf8.count == ClientTray.maxSelectionRawBytes
-                    && boundarySelectionRaw.map(ClientTray.parseSelectionsRaw)?.count == 16,
-                "selection codec accepts an exact raw-byte boundary")
+                ClientTray.selections(defaults: clientDefaults)["claude"] == "model.gpt|preview.v1",
+                "selection codec parse: preserves card delimiters")
+            for (name, stored, parsed, write, id, on) in [
+                ("one extra byte fails closed", enabledExact + "a", Set<String>(), nil, "claude", true),
+                ("oversized input fails closed", oversizedEnabled, [], nil, "claude", true),
+                ("AppStorage enable", "claude", ["claude"], Optional("claude,codex"), "codex", true),
+                ("AppStorage disable", "claude,codex", ["claude", "codex"], Optional("claude"), "codex", false),
+            ] as [(String, String, Set<String>, String?, String, Bool)] {
+                clientDefaults.set(stored, forKey: ClientTray.enabledKey)
+                expect(ClientTray.enabled(defaults: clientDefaults) == parsed, "enabled codec parse: \(name)")
+                expect(
+                    ClientTray.enabledRaw(updating: stored, clientId: id, enabled: on) == write,
+                    "enabled codec write-back: \(name)")
+            }
+            for (name, stored, parsed, write, id, sel) in [
+                ("one extra byte fails closed", selExact + " ", [String: String](), nil, "claude", "auto"),
+                ("AppStorage write-back", "{}", [:], Optional("{\"codex\":\"weekly.v1\"}"), "codex", "weekly.v1"),
+                ("over-entry root fails closed", overEntrySel, [:], nil, "claude", "auto"),
+            ] as [(String, String, [String: String], String?, String, String)] {
+                clientDefaults.set(stored, forKey: ClientTray.selectionsKey)
+                expect(
+                    ClientTray.selections(defaults: clientDefaults) == parsed,
+                    "selection codec parse: \(name)")
+                expect(
+                    ClientTray.selectionsRaw(updating: stored, clientId: id, selection: sel) == write,
+                    "selection codec write-back: \(name)")
+            }
+            clientDefaults.set(
+                "{\"claude\":\"auto\",\"Codex\":\"bad\",\"codex\":42,\"unknown\":\"bounded\"}",
+                forKey: ClientTray.selectionsKey)
             expect(
-                boundarySelectionRaw.map {
-                    ClientTray.parseSelectionsRaw($0 + " ").isEmpty
-                } == true,
-                "selection codec rejects one byte over the raw boundary")
-            var outgoingOversizedSelections = boundarySelections
-            outgoingOversizedSelections["overflow"] = String(
-                repeating: "x", count: ClientTray.maxCardIDBytes)
-            expect(
-                ClientTray.canonicalSelectionsRaw(outgoingOversizedSelections) == nil,
-                "selection codec refuses to serialize an oversized valid map")
-
-            let tooManyEnabled = Set((0 ..< ClientTray.maxEntries + 1).map { "c\($0)" })
-            expect(
-                ClientTray.canonicalEnabledRaw(tooManyEnabled) == nil,
-                "over-limit enabled mutation does not serialize")
-            let oversizedEnabled = String(repeating: "a,", count: ClientTray.maxEnabledRawBytes)
-            clientDefaults.set(oversizedEnabled, forKey: ClientTray.enabledKey)
-            expect(
-                ClientTray.enabled(defaults: clientDefaults).isEmpty,
-                "oversized enabled input fails closed before splitting")
-            expect(
-                ClientTray.enabledRaw(
-                    updating: oversizedEnabled, clientId: "claude", enabled: true) == nil,
-                "oversized enabled input is not repaired by write-back")
-
-            let mixedSelections = """
-            {"claude":"auto","Codex":"bad","codex":42,"unknown":"bounded"}
-            """
-            clientDefaults.set(mixedSelections, forKey: ClientTray.selectionsKey)
-            expect(
-                ClientTray.selections(defaults: clientDefaults) == [
-                    "claude": "auto", "unknown": "bounded"],
-                "selection codec drops invalid entries but preserves bounded unknown ids")
+                ClientTray.selections(defaults: clientDefaults) == ["claude": "auto", "unknown": "bounded"],
+                "selection codec parse: drops invalid entries, keeps bounded unknown ids")
             clientDefaults.set(42, forKey: ClientTray.selectionsKey)
             expect(
                 ClientTray.selections(defaults: clientDefaults).isEmpty,
-                "non-string selection defaults fail closed")
-
-            var oversizedRoot: [String: String] = [:]
-            for index in 0 ..< ClientTray.maxEntries + 1 {
-                oversizedRoot["c\(index)"] = "card\(index)"
-            }
-            let oversizedRootData = try! JSONSerialization.data(
-                withJSONObject: oversizedRoot, options: [.sortedKeys])
-            let oversizedRootRaw = String(data: oversizedRootData, encoding: .utf8)!
-            clientDefaults.set(oversizedRootRaw, forKey: ClientTray.selectionsKey)
-            expect(
-                ClientTray.selections(defaults: clientDefaults).isEmpty,
-                "selection root over the entry cap fails closed")
-            expect(
-                ClientTray.selectionsRaw(
-                    updating: oversizedRootRaw, clientId: "claude", selection: "auto") == nil,
-                "over-limit selection root is not written back")
+                "selection codec parse: non-string defaults fail closed")
         } else {
             expect(false, "isolated individual-tray defaults suite is available")
         }
 
+        for (name, id, sel, card, remaining) in [
+            ("Auto picks this client's tightest healthy window", "claude", ClientTray.autoSelection, Optional("session.v1"), Optional<Double>.none),
+            ("Auto rejects an unhealthy snapshot", "grok", ClientTray.autoSelection, nil, nil),
+            ("explicit selection may use a same-client error snapshot", "grok", "billing.weekly.v1", Optional("billing.weekly.v1"), Optional(1.0)),
+            ("missing explicit cards never fall back across cards or clients", "codex", "missing.v1", nil, nil),
+        ] as [(String, String, String, String?, Double?)] {
+            let window = ClientTray.resolveWindow(payload: quotaPayload, clientId: id, selection: sel)
+            expect(
+                window?.cardId == card && (remaining == nil || window?.remainingPercent == remaining),
+                "quota selection: \(name)")
+        }
         expect(
             ClientTray.resolveWindow(
-                payload: quotaPayload, clientId: "claude", selection: ClientTray.autoSelection
-            )?.cardId == "session.v1",
-            "client Auto resolves only that client's tightest healthy window")
+                payload: quotaPayload, clientId: "claude", selection: "weekly.v1")?.cardId != "missing.v1",
+            "quota selection: missing explicit cards never fall back across cards or clients")
         expect(
-            ClientTray.resolveWindow(
-                payload: quotaPayload, clientId: "grok", selection: ClientTray.autoSelection
-            ) == nil,
-            "client Auto rejects an unhealthy snapshot")
-        expect(
-            ClientTray.resolveWindow(
-                payload: quotaPayload, clientId: "grok", selection: "billing.weekly.v1"
-            )?.remainingPercent == 1,
-            "explicit client selection accepts an error snapshot fallback")
-        expect(
-            ClientTray.resolveWindow(
-                payload: quotaPayload, clientId: "codex", selection: "missing.v1"
-            ) == nil
-                && ClientTray.resolveWindow(
-                    payload: quotaPayload, clientId: "claude", selection: "weekly.v1")?.cardId
-                    != "missing.v1",
-            "missing explicit cards never fall back across cards or clients")
-        expect(
-            ClientTray.percentText(-2) == "0%"
-                && ClientTray.percentText(101) == "100%"
-                && ClientTray.percentText(.nan) == "—%"
-                && ClientTray.percentText(nil) == "—%",
-            "client percentage presentation clamps finite values and fails closed")
+            ClientTray.percentText(-2) == "0%" && ClientTray.percentText(101) == "100%"
+                && ClientTray.percentText(.nan) == "—%" && ClientTray.percentText(nil) == "—%",
+            "percent presentation: clamps finite values and fails closed")
         expect(
             ClientTray.quotaClientID(for: "antigravity-cli") == "antigravity"
                 && ClientTray.processIdentity(for: "antigravity")
                     != ClientTray.processIdentity(for: "antigravity-cli")
                 && ClientTray.autosaveName(for: "kilo")
                     != ClientTray.autosaveName(for: "kilocode"),
-            "quota lookup aliases never collide in process or placement identity")
-        let routeMemory = StatusItemRouteMemory(
-            mainClient: ClientTray.overviewTab, mainView: AppView.monthly.rawValue)
-        let firstClaudeRoute = routeMemory.activateClient(
-            "claude", currentClient: ClientTray.overviewTab,
-            currentView: AppView.monthly.rawValue)
-        routeMemory.record(clientId: "claude", view: AppView.models.rawValue)
-        let firstCodexRoute = routeMemory.activateClient(
-            "codex", currentClient: "claude", currentView: AppView.models.rawValue)
-        routeMemory.record(clientId: "codex", view: AppView.hourly.rawValue)
-        let restoredClaudeRoute = routeMemory.activateClient(
-            "claude", currentClient: "codex", currentView: AppView.hourly.rawValue)
-        let restoredMainRoute = routeMemory.activateMain(
-            currentClient: "claude", currentView: restoredClaudeRoute.view)
-        let mainCodexRoute = routeMemory.switchClient(
-            from: restoredMainRoute.clientId, currentView: restoredMainRoute.view, to: "codex")
-        _ = routeMemory.activateClient(
-            "claude", currentClient: mainCodexRoute.clientId, currentView: mainCodexRoute.view)
-        let mainAgainRoute = routeMemory.activateMain(
-            currentClient: "claude", currentView: AppView.models.rawValue)
-        expect(
-            ClientTray.activeViewKey == "tokenbar.view"
-                && firstClaudeRoute == .init(
-                    clientId: "claude", view: AppView.overview.rawValue)
-                && firstCodexRoute == .init(
-                    clientId: "codex", view: AppView.overview.rawValue)
-                && restoredClaudeRoute.view == AppView.models.rawValue
-                && restoredMainRoute == .init(
-                    clientId: ClientTray.overviewTab, view: AppView.monthly.rawValue)
-                // The main item keeps its OWN per-client lens: switching to a tab
-                // it has not visited opens Overview, regardless of where the
-                // individual Codex item was left (hourly, above).
-                && mainCodexRoute == .init(
-                    clientId: "codex", view: AppView.overview.rawValue)
-                && mainAgainRoute == mainCodexRoute,
-            "main and individual items restore independent process-lifetime routes")
+            "identity: quota lookup aliases stay disjoint from process and placement")
 
-        // A session that quit on a client tab persists that tab and lens for the
-        // MAIN item. The first click on that client's own item must still open
-        // Overview instead of inheriting the previous session's main lens.
-        let persistedMainMemory = StatusItemRouteMemory(
-            mainClient: "claude", mainView: AppView.models.rawValue)
-        let firstItemVisit = persistedMainMemory.activateClient(
-            "claude", currentClient: "claude", currentView: AppView.models.rawValue)
-        let mainAfterItemVisit = persistedMainMemory.activateMain(
-            currentClient: "claude", currentView: firstItemVisit.view)
-        expect(
-            firstItemVisit == .init(clientId: "claude", view: AppView.overview.rawValue)
-                && mainAfterItemVisit == .init(
-                    clientId: "claude", view: AppView.models.rawValue),
-            "an unvisited client item ignores the persisted main lens and cannot clobber it")
+        enum TrayRouteAction {
+            case activateClient(String), activateMain, recordView(String), switchClient(String)
+        }
+        func playRoutes(
+            _ title: String, start: StatusItemRouteMemory.Route,
+            steps: [(String, TrayRouteAction, StatusItemRouteMemory.Route?)]
+        ) {
+            let memory = StatusItemRouteMemory(mainClient: start.clientId, mainView: start.view)
+            var cur = start
+            for step in steps {
+                switch step.1 {
+                case .activateClient(let id):
+                    cur = memory.activateClient(id, currentClient: cur.clientId, currentView: cur.view)
+                case .activateMain:
+                    cur = memory.activateMain(currentClient: cur.clientId, currentView: cur.view)
+                case .recordView(let view):
+                    memory.record(clientId: cur.clientId, view: view)
+                    cur = .init(clientId: cur.clientId, view: view)
+                case .switchClient(let id):
+                    cur = memory.switchClient(from: cur.clientId, currentView: cur.view, to: id)
+                }
+                if let want = step.2 {
+                    expect(cur == want, "route memory \(title): \(step.0)")
+                }
+            }
+        }
+        expect(ClientTray.activeViewKey == "tokenbar.view", "route memory: main view preference key")
+        playRoutes(
+            "disjoint lenses",
+            start: .init(clientId: ClientTray.overviewTab, view: AppView.monthly.rawValue),
+            steps: [
+                ("first Claude opens Overview", .activateClient("claude"), .init(clientId: "claude", view: AppView.overview.rawValue)),
+                ("record Claude models", .recordView(AppView.models.rawValue), nil),
+                ("first Codex opens Overview", .activateClient("codex"), .init(clientId: "codex", view: AppView.overview.rawValue)),
+                ("record Codex hourly", .recordView(AppView.hourly.rawValue), nil),
+                ("Claude individual lens restored", .activateClient("claude"), .init(clientId: "claude", view: AppView.models.rawValue)),
+                ("main restores its own monthly route", .activateMain, .init(clientId: ClientTray.overviewTab, view: AppView.monthly.rawValue)),
+                ("main Codex tab ignores individual hourly lens", .switchClient("codex"), .init(clientId: "codex", view: AppView.overview.rawValue)),
+                ("revisit Claude individual", .activateClient("claude"), nil),
+                ("returning to main keeps Codex Overview", .activateMain, .init(clientId: "codex", view: AppView.overview.rawValue)),
+            ])
+        playRoutes(
+            "persisted main lens",
+            start: .init(clientId: "claude", view: AppView.models.rawValue),
+            steps: [
+                ("unvisited individual ignores persisted main lens", .activateClient("claude"), .init(clientId: "claude", view: AppView.overview.rawValue)),
+                ("individual visit cannot clobber persisted main lens", .activateMain, .init(clientId: "claude", view: AppView.models.rawValue)),
+            ])
 
-        // The individual-items spinner must terminate. `stats`/`agentUsage` stay
-        // nil when a fetch fails, so a payload-presence check would spin forever;
-        // the gate is request lifecycle, and a failed phase is terminal.
-        //
-        // This table treats `.loading` as "a request is still in flight", which
-        // holds only because DashboardModel settles phase on EVERY initial path —
-        // including the stale-year recovery, where apply() clears the filter and
-        // spawns an unfiltered reload before reaching `.ready`, and that reload's
-        // failure branch has to move a never-ready model to `.failed`. If a new
-        // path can leave phase on `.loading` with no request running, this
-        // spinner silently becomes permanent again.
-        expect(
-            SettingsWindowView.isInitialLoad(phase: .loading, agentUsageAttempted: false)
-                && SettingsWindowView.isInitialLoad(
-                    phase: .loading, agentUsageAttempted: true)
-                && SettingsWindowView.isInitialLoad(
-                    phase: .ready, agentUsageAttempted: false)
-                && !SettingsWindowView.isInitialLoad(
-                    phase: .ready, agentUsageAttempted: true)
-                && SettingsWindowView.isInitialLoad(
-                    phase: .failed("boom"), agentUsageAttempted: false)
-                && !SettingsWindowView.isInitialLoad(
-                    phase: .failed("boom"), agentUsageAttempted: true),
-            "the individual-items spinner ends once both initial requests settle, including failures")
-        let settingsModelUsesAllTime = MainActor.assumeIsolated {
-            DashboardModel(initialYear: nil).year == nil
+        let auto = ClientTray.autoSelection
+        for (name, present, enabled, hidden, sel, payload, status, value, showRuntime) in [
+            ("error-only stays configurable", ["antigravity-cli"], Set<String>(), Set<String>(), [String: String](), quotaPayload as AgentUsagePayload?, ClientTray.Status.errorAuto, "—%", false),
+            ("missing explicit stays represented", ["codex"], Set(["codex"]), Set<String>(), ["codex": "missing.v1"], quotaPayload, .missingSelection, "—%", true),
+            ("hidden is Settings-only suppressed", ["codex"], Set(["codex"]), Set(["codex"]), ["codex": "weekly.v1"], quotaPayload, .suppressed, "35%", false),
+            ("Auto error snapshot", ["grok"], Set(["grok"]), Set<String>(), ["grok": auto], quotaPayload, .errorAuto, "—%", true),
+            ("explicit last-good error", ["grok"], Set(["grok"]), Set<String>(), ["grok": "billing.weekly.v1"], quotaPayload, .errorExplicit, "1%", true),
+            ("missing payload keeps enabled row", ["codex"], Set(["codex"]), Set<String>(), [String: String](), nil, .unavailable, "—%", true),
+        ] as [(String, [String], Set<String>, Set<String>, [String: String], AgentUsagePayload?, ClientTray.Status, String, Bool)] {
+            let row = ClientTray.settingsRows(
+                presentClients: present, payload: payload, enabled: enabled, selections: sel,
+                hidden: hidden, orderRaw: "", officialClients: officialClientIDs).first
+            expect(row?.status == status && row?.valueText == value, "tray status: \(name)")
+            let items = ClientTray.runtimePresentations(
+                graph: clientGraph, payload: payload, enabled: enabled, selections: sel,
+                hidden: hidden, officialClients: officialClientIDs)
+            if showRuntime {
+                expect(items.first?.status == status && items.first?.valueText == value, "tray runtime: \(name)")
+            } else {
+                expect(items.isEmpty || items.first?.clientId != present.first, "tray runtime omits Settings-only row: \(name)")
+            }
+        }
+
+        for (phase, attempted, spinning, name) in [
+            (DashboardModel.Phase.loading, false, true, "loading unsettled"),
+            (.loading, true, true, "loading after quota"),
+            (.ready, false, true, "ready unsettled"),
+            (.ready, true, false, "ready settled"),
+            (.failed("boom"), false, true, "failed unsettled"),
+            (.failed("boom"), true, false, "failed settled"),
+        ] as [(DashboardModel.Phase, Bool, Bool, String)] {
+            expect(
+                SettingsWindowView.isInitialLoad(phase: phase, agentUsageAttempted: attempted) == spinning,
+                "individual-items spinner: \(name)")
         }
         expect(
-            settingsModelUsesAllTime,
+            MainActor.assumeIsolated { DashboardModel(initialYear: nil).year == nil },
             "Settings can pin its client universe to the all-time graph")
 
         // The invariant is that the card never labels rows with a range they do
@@ -6768,146 +6909,134 @@ enum SelfTest {
         expect(AppView.effective(.overview, hiddenRaw: "overview") == .overview,
             "overview is never subject to the hidden-lens fallback")
 
-        // Filtered stats derive their range from the SELECTED clients (issue
-        // #36 Fix, round 5): a hidden client active AFTER the visible client's
-        // last day must not reset/shorten the visible streak. Fixture: "vis"
-        // active 07-01..07-03, hidden "hid" active 07-05 → meta.dateRange
-        // spans 07-01..07-05. Without the fix, streaks for {vis} walk to 07-05
-        // and current resets to 0 on the empty 07-04/07-05 tail; with the fix
-        // the range is 07-01..07-03 so current == longest == 3.
-        func daily(_ client: String, _ date: String, _ cost: Double) -> String {
-            """
-            {"date":"\(date)","totals":{"tokens":10,"cost":\(cost),"messages":1},"intensity":1,
-             "tokenBreakdown":{"input":10,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
-             "clients":[{"client":"\(client)","modelId":"m","providerId":"p","cost":\(cost),"messages":1,
-              "tokens":{"input":10,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}}]}
-            """
+        // Filtered activity, DayBars windows, tooltip placement, and chart geometry.
+        // Hidden later activity cannot extend selected streaks or shift token/cost
+        // bars; a message-only day stays activity but does not move the metric window.
+        func activityDay(_ client: String, _ date: String, tokens: Int64 = 10, cost: Double = 1) -> String {
+            "{\"date\":\"\(date)\",\"totals\":{\"tokens\":\(tokens),\"cost\":\(cost),\"messages\":1},\"intensity\":\(tokens > 0 ? 1 : 0),\"tokenBreakdown\":{\"input\":\(tokens),\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"reasoning\":0},\"clients\":[{\"client\":\"\(client)\",\"modelId\":\"m\",\"providerId\":\"p\",\"cost\":\(cost),\"messages\":1,\"tokens\":{\"input\":\(tokens),\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"reasoning\":0}}]}"
         }
-        func messageOnlyDaily(_ client: String, _ date: String) -> String {
-            """
-            {"date":"\(date)","totals":{"tokens":0,"cost":0,"messages":1},"intensity":0,
-             "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
-             "clients":[{"client":"\(client)","modelId":"m","providerId":"p","cost":0,"messages":1,
-              "tokens":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}}]}
-            """
+        func activityPayload(end: String, days: [String]) -> UsagePayload {
+            try! JSONDecoder().decode(UsagePayload.self, from: Data("{\"meta\":{\"generatedAt\":\"now\",\"version\":\"1\",\"dateRange\":{\"start\":\"2026-07-01\",\"end\":\"\(end)\"}},\"summary\":{\"totalTokens\":0,\"totalCost\":0,\"totalDays\":0,\"activeDays\":0,\"averagePerDay\":0,\"maxCostInSingleDay\":0,\"clients\":[\"vis\",\"hid\"],\"models\":[]},\"years\":[],\"contributions\":[\(days.joined(separator: ","))]}".utf8))
         }
-        func rangeStatsPayload(end: String, days: [String]) -> UsagePayload {
-            let json = """
-            {"meta":{"generatedAt":"now","version":"1","dateRange":{"start":"2026-07-01","end":"\(end)"}},
-             "summary":{"totalTokens":0,"totalCost":0,"totalDays":0,"activeDays":0,"averagePerDay":0,
-                        "maxCostInSingleDay":0,"clients":["vis","hid"],"models":[]},
-             "years":[],
-             "contributions":[\(days.joined(separator: ","))]}
-            """
-            return try! JSONDecoder().decode(UsagePayload.self, from: Data(json.utf8))
+        let visDays = (1...3).map { activityDay("vis", String(format: "2026-07-%02d", $0)) }
+        let withHidden = activityPayload(end: "2026-07-05", days: visDays + [activityDay("hid", "2026-07-05")])
+        let noHidden = activityPayload(end: "2026-07-03", days: visDays)
+        let messageTail = activityPayload(end: "2026-07-31", days: [
+            activityDay("vis", "2026-07-01"), activityDay("vis", "2026-07-31", tokens: 0, cost: 0)])
+        struct ActivityCase { let name: String; let payload: UsagePayload; let end: String; let current: Int; let longest: Int; let average: Double? }
+        for c in [
+            ActivityCase(name: "hidden later activity does not extend selected streak/range/average", payload: withHidden, end: "2026-07-03", current: 3, longest: 3, average: 1),
+            ActivityCase(name: "a trailing message-only day remains current activity", payload: messageTail, end: "2026-07-31", current: 1, longest: 1, average: nil),
+        ] {
+            let stats = UsageStats(payload: c.payload, selectedClients: ["vis"])
+            expect(stats.dateRange.end == c.end && stats.streaks.current == c.current && stats.streaks.longest == c.longest && (c.average.map { stats.averagePerDay == $0 } ?? true), c.name)
         }
-        // With the hidden client extending the range to 07-05.
-        let withHidden = rangeStatsPayload(end: "2026-07-05", days: [
-            daily("vis", "2026-07-01", 1), daily("vis", "2026-07-02", 1),
-            daily("vis", "2026-07-03", 1), daily("hid", "2026-07-05", 1),
-        ])
         let visFiltered = UsageStats(payload: withHidden, selectedClients: ["vis"])
-        expect(visFiltered.streaks.current == 3 && visFiltered.streaks.longest == 3,
-            "filtered streak ignores a hidden client's later activity")
-        expect(visFiltered.dateRange.end == "2026-07-03",
-            "filtered range ends at the selected clients' last active day")
-        expect(visFiltered.averagePerDay == 1,
-            "filtered averagePerDay divides by selected active days, not the hidden-extended span")
-        // Equivalence: same numbers as a payload where the hidden client never
-        // existed (range naturally 07-01..07-03, {vis} is all present).
-        let noHidden = rangeStatsPayload(end: "2026-07-03", days: [
-            daily("vis", "2026-07-01", 1), daily("vis", "2026-07-02", 1),
-            daily("vis", "2026-07-03", 1),
-        ])
         let visAlone = UsageStats(payload: noHidden, selectedClients: ["vis"])
-        expect(visFiltered.streaks.current == visAlone.streaks.current
-            && visFiltered.streaks.longest == visAlone.streaks.longest
-            && visFiltered.dateRange.end == visAlone.dateRange.end,
-            "filtered stats equal a payload without the hidden client")
+        expect(visFiltered.streaks.current == visAlone.streaks.current && visFiltered.streaks.longest == visAlone.streaks.longest && visFiltered.dateRange.end == visAlone.dateRange.end, "filtered stats equal a payload without the hidden client")
 
-        let messageTailPayload = rangeStatsPayload(end: "2026-07-31", days: [
-            daily("vis", "2026-07-01", 1), messageOnlyDaily("vis", "2026-07-31"),
-        ])
-        let messageTailStats = UsageStats(payload: messageTailPayload, selectedClients: ["vis"])
-        expect(
-            messageTailStats.dateRange.end == "2026-07-31"
-                && messageTailStats.streaks.current == 1,
-            "a trailing message-only day remains current activity instead of resetting the streak")
-
-        // DayBars trailing window anchors to the passed range end, not the
-        // unfiltered payload range (issue #36 Fix, round 6): the caller passes
-        // the selection-derived stats.dateRange.end, so a hidden client active
-        // AFTER the visible client can't shift the window past the visible
-        // activity. Fixture: vis active 07-03, hidden active 07-05.
-        let chartPayload = rangeStatsPayload(end: "2026-07-05", days: [
-            daily("vis", "2026-07-03", 1), daily("hid", "2026-07-05", 1),
-        ])
+        let chartPayload = activityPayload(end: "2026-07-05", days: [activityDay("vis", "2026-07-03"), activityDay("hid", "2026-07-05")])
         let chartColors = ModelColorMap(report: nil)
-        let visBars = DayBars.build(
-            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeStart: "2026-07-03", rangeEnd: "2026-07-03",
-            endFallback: "2026-07-09")
-        expect(visBars.count == DayBars.window && visBars.last?.date == "2026-07-03",
-            "chart window anchors to the filtered range end")
-        expect((visBars.last?.totalTokens ?? 0) > 0,
-            "visible client's last active day is the last (in-window) bar")
-        // DayBars derives its token/cost anchor from the selected series, so a
-        // later non-metric range end cannot shift visible usage out of view.
-        let shiftedBars = DayBars.build(
-            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeStart: "2026-07-05", rangeEnd: "2026-07-05",
-            endFallback: "2026-07-09")
-        expect(shiftedBars.last?.date == "2026-07-03" && (shiftedBars.last?.totalTokens ?? 0) > 0,
-            "chart derives its range end from selected token/cost activity")
-        let messageTailBars = DayBars.build(
-            payload: messageTailPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeStart: "2026-07-01",
-            rangeEnd: messageTailStats.dateRange.end, endFallback: "2026-07-31")
-        expect(
-            messageTailBars.last?.date == "2026-07-01"
-                && (messageTailBars.last?.totalTokens ?? 0) > 0,
-            "a later message-only day does not shift the token/cost chart window")
-
-        // DayBars now spans the whole recorded range so the chart can scroll
-        // back to the first day (padding to a full viewport for short history).
-        // Fixture: vis active on the range endpoints 60 days apart.
-        let longPayload = rangeStatsPayload(end: "2026-07-05", days: [
-            daily("vis", "2026-05-07", 1), daily("vis", "2026-07-05", 1),
-        ])
-        // (a) History longer than the window → full-length series ending at
-        // rangeEnd and starting at rangeStart, one bar per inclusive day.
+        // DayBars spans the whole recorded range so the chart can scroll back
+        // to the first day, padding to a full viewport for short history. The
+        // window still anchors on the selected series' activity, so hidden or
+        // message-only later days cannot push visible usage out of view.
+        let longPayload = activityPayload(end: "2026-07-05", days: [
+            activityDay("vis", "2026-05-07"), activityDay("vis", "2026-07-05")])
+        let emptyPayload = activityPayload(end: "2026-07-09", days: [])
+        struct DayBarCase {
+            let name: String
+            let payload: UsagePayload
+            let rangeStart: String
+            let rangeEnd: String
+            let fallback: String
+            let count: Int?
+            let first: String?
+            let last: String
+            let hasTokens: Bool
+        }
+        for c in [
+            DayBarCase(name: "hidden later activity does not push selected usage out of the window",
+                payload: chartPayload, rangeStart: "2026-07-05", rangeEnd: "2026-07-05",
+                fallback: "2026-07-09", count: DayBars.window, first: nil,
+                last: "2026-07-03", hasTokens: true),
+            DayBarCase(name: "a later message-only day does not shift the token/cost window",
+                payload: messageTail, rangeStart: "2026-07-01", rangeEnd: "2026-07-31",
+                fallback: "2026-07-31", count: nil, first: nil,
+                last: "2026-07-01", hasTokens: true),
+            DayBarCase(name: "long history yields a full-range series from rangeStart to rangeEnd",
+                payload: longPayload, rangeStart: "2026-05-07", rangeEnd: "2026-07-05",
+                fallback: "2026-07-09", count: 60, first: "2026-05-07",
+                last: "2026-07-05", hasTokens: true),
+            DayBarCase(name: "short history pads to exactly one window ending at rangeEnd",
+                payload: chartPayload, rangeStart: "2026-07-03", rangeEnd: "2026-07-03",
+                fallback: "2026-07-09", count: DayBars.window, first: "2026-06-04",
+                last: "2026-07-03", hasTokens: true),
+            DayBarCase(name: "empty rangeStart falls back to a trailing window",
+                payload: chartPayload, rangeStart: "", rangeEnd: "2026-07-03",
+                fallback: "2026-07-09", count: DayBars.window, first: "2026-06-04",
+                last: "2026-07-03", hasTokens: true),
+            DayBarCase(name: "unparseable rangeStart falls back to a trailing window",
+                payload: chartPayload, rangeStart: "not-a-date", rangeEnd: "2026-07-03",
+                fallback: "2026-07-09", count: DayBars.window, first: nil,
+                last: "2026-07-03", hasTokens: true),
+            DayBarCase(name: "empty series uses endFallback when rangeEnd is empty",
+                payload: emptyPayload, rangeStart: "", rangeEnd: "",
+                fallback: "2026-07-09", count: DayBars.window, first: nil,
+                last: "2026-07-09", hasTokens: false),
+        ] {
+            let bars = DayBars.build(
+                payload: c.payload, clientIds: ["vis"], stackBy: .agent, colors: chartColors,
+                rangeStart: c.rangeStart, rangeEnd: c.rangeEnd, endFallback: c.fallback)
+            expect(
+                (c.count.map { bars.count == $0 } ?? true)
+                    && (c.first.map { bars.first?.date == $0 } ?? true)
+                    && bars.last?.date == c.last
+                    && ((bars.last?.totalTokens ?? 0) > 0) == c.hasTokens,
+                c.name)
+        }
+        // The long series carries activity at both ends, not just the tail.
         let longBars = DayBars.build(
-            payload: longPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeStart: "2026-05-07", rangeEnd: "2026-07-05",
-            endFallback: "2026-07-09")
-        expect(longBars.count == 60 && longBars.first?.date == "2026-05-07"
-            && longBars.last?.date == "2026-07-05",
-            "long history yields a full-range series from rangeStart to rangeEnd")
+            payload: longPayload, clientIds: ["vis"], stackBy: .agent, colors: chartColors,
+            rangeStart: "2026-05-07", rangeEnd: "2026-07-05", endFallback: "2026-07-09")
         expect((longBars.first?.totalTokens ?? 0) > 0 && (longBars.last?.totalTokens ?? 0) > 0,
             "both endpoints of the long series carry their activity")
-        // (b) History shorter than the window pads older empty days so the
-        // viewport is always full — exactly `window` bars ending at rangeEnd.
-        let shortBars = DayBars.build(
-            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeStart: "2026-07-03", rangeEnd: "2026-07-03",
-            endFallback: "2026-07-09")
-        expect(shortBars.count == DayBars.window
-            && shortBars.first?.date == "2026-06-04" && shortBars.last?.date == "2026-07-03",
-            "short history pads to exactly one window ending at rangeEnd")
-        // (c) Empty/invalid rangeStart falls back to a trailing window series.
-        let emptyStartBars = DayBars.build(
-            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeStart: "", rangeEnd: "2026-07-03",
-            endFallback: "2026-07-09")
-        expect(emptyStartBars.count == DayBars.window
-            && emptyStartBars.first?.date == "2026-06-04" && emptyStartBars.last?.date == "2026-07-03",
-            "empty rangeStart falls back to a trailing window")
-        let badStartBars = DayBars.build(
-            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
-            colors: chartColors, rangeStart: "not-a-date", rangeEnd: "2026-07-03",
-            endFallback: "2026-07-09")
-        expect(badStartBars.count == DayBars.window && badStartBars.last?.date == "2026-07-03",
-            "unparseable rangeStart falls back to a trailing window")
+
+        // `PopoverTooltipPlacement` still places the cards that have not moved
+        // to the shared TooltipHost layer (window/quota/models/trend panels).
+        let viewport = CGRect(x: 100, y: 200, width: 400, height: 300)
+        let chartFrame = CGRect(x: 120, y: 250, width: 360, height: 150)
+        let tip = CGSize(width: 210, height: 120)
+        struct TooltipCase { let name: String; let anchor: CGPoint; let size: CGSize; let viewport: CGRect?; let width: CGFloat?; let height: CGFloat?; let matchNil: Bool }
+        for c in [
+            TooltipCase(name: "upper-half places below the cursor", anchor: CGPoint(x: 180, y: 30), size: tip, viewport: viewport, width: nil, height: 42, matchNil: false),
+            TooltipCase(name: "lower-half places above the cursor", anchor: CGPoint(x: 180, y: 140), size: tip, viewport: viewport, width: nil, height: 8, matchNil: false),
+            TooltipCase(name: "lower-half dodges above even with room below", anchor: CGPoint(x: 180, y: 100), size: tip, viewport: viewport, width: nil, height: -32, matchNil: false),
+            TooltipCase(name: "clamps to the side with more visible space", anchor: CGPoint(x: 180, y: 110), size: CGSize(width: 210, height: 260), viewport: viewport, width: nil, height: -46, matchNil: false),
+            TooltipCase(name: "clamps a near-edge anchor horizontally", anchor: CGPoint(x: 2, y: 30), size: tip, viewport: viewport, width: 0, height: nil, matchNil: false),
+            TooltipCase(name: "viewport-taller tooltip pins to the visible top inset", anchor: CGPoint(x: 180, y: 30), size: CGSize(width: 210, height: 400), viewport: viewport, width: nil, height: -46, matchNil: false),
+            TooltipCase(name: "stale non-intersecting viewport falls back to container-only", anchor: CGPoint(x: 180, y: 30), size: tip, viewport: CGRect(x: 100, y: 0, width: 400, height: 80), width: nil, height: nil, matchNil: true),
+            TooltipCase(name: "partial-overlap stale viewport that misses the anchor falls back", anchor: CGPoint(x: 180, y: 100), size: tip, viewport: CGRect(x: 100, y: 200, width: 400, height: 80), width: nil, height: nil, matchNil: true),
+        ] {
+            let got = PopoverTooltipPlacement.offset(anchor: c.anchor, tooltipSize: c.size, containerFrame: chartFrame, viewport: c.viewport)
+            let nilViewport = c.matchNil ? PopoverTooltipPlacement.offset(anchor: c.anchor, tooltipSize: c.size, containerFrame: chartFrame, viewport: nil) : nil
+            expect((c.width.map { got?.width == $0 } ?? true) && (c.height.map { got?.height == $0 } ?? true) && (!c.matchNil || got?.height == nilViewport?.height), "tooltip: \(c.name)")
+        }
+
+        let chartWidth: CGFloat = 360
+        let barGap = UsageChartGeometry.gap
+        let barWidth = (chartWidth - barGap * 2) / 3
+        let frames = (0..<3).map { UsageChartGeometry.barFrame(index: $0, barWidth: barWidth) }
+        expect(frames[0].minX == 0 && frames[1].minX - frames[0].maxX == barGap && abs(frames[2].maxX - chartWidth) < 0.0001, "chart bar frames fill the width with documented gaps")
+        for c in [
+            (name: "in-bar hits that bar", x: frames[1].midX, expected: Optional(1)),
+            (name: "gap pixels floor-attach to the left bar", x: frames[0].maxX + barGap / 2, expected: Optional(0)),
+            (name: "leading edge hits its own index", x: frames[1].minX, expected: Optional(1)),
+            (name: "trailing edge stays on that bar", x: frames[1].maxX, expected: Optional(1)),
+            (name: "past the last stride is out of range", x: frames[2].maxX + barGap + 1, expected: nil),
+        ] as [(name: String, x: CGFloat, expected: Int?)] {
+            expect(UsageChartGeometry.barIndex(atX: c.x, barWidth: barWidth, count: 3) == c.expected, c.name)
+        }
 
         let modelWidths = ModelBarGeometry.widths(
             values: [1_000_000, 1, 1, 1, 1], totalWidth: 120)
@@ -7216,455 +7345,235 @@ enum SelfTest {
             expect(passed, "filter parity: \(label)")
         }
 
-        // MARK: - FLAT-HEATMAP (append-only section; do not reorder/edit above)
+        // MARK: - FLAT-HEATMAP (contract suite; decision table in issue #157)
+        //
+        // Six contracts, one table/grid each, replacing the append-only
+        // per-round matrices: metric (C1), date/cutoff (C2), hit testing (C3),
+        // scroll/hover lifecycle (C4), layout/ring bounds (C5), chart-view (C6).
 
-        // A1/A2: the heatmap grid must read the exact same, already-filtered
-        // `stats.perDayMap` UsageChartCard hands ContributionGraph3D — same
-        // pipeline, same values, and NOT the unfiltered payload total.
-        let heatJSON = """
-        {"meta":{"generatedAt":"now","version":"1","dateRange":{"start":"2026-01-01","end":"2026-01-01"}},
-         "summary":{"totalTokens":0,"totalCost":0,"totalDays":1,"activeDays":1,"averagePerDay":0,
-                    "maxCostInSingleDay":0,"clients":["a","b"],"models":[]},
-         "years":[],
-         "contributions":[
-           {"date":"2026-01-01","totals":{"tokens":0,"cost":0,"messages":0},"intensity":1,
-            "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
-            "clients":[
-              {"client":"a","modelId":"m","providerId":"p","cost":2,"messages":1,
-               "tokens":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}},
-              {"client":"b","modelId":"m","providerId":"p","cost":3,"messages":1,
-               "tokens":{"input":50,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}}]}
-         ]}
-        """
-        let heatPayload = try! JSONDecoder().decode(UsagePayload.self, from: Data(heatJSON.utf8))
-        let heatStatsA = UsageStats(payload: heatPayload, selectedClients: ["a"])
-        let heatGridA = buildGrid(year: "2026", perDayMap: heatStatsA.perDayMap)
-        let heatCellA = heatGridA.cells.first { $0.date == "2026-01-01" }
-        expect(
-            heatCellA?.tokens == 100 && heatCellA?.cost == 2,
-            "heatmap grid cell matches the filtered UsageStats value for the selected client")
-        expect(
-            (heatCellA?.tokens ?? 0) != 150 && (heatCellA?.cost ?? 0) != 5,
-            "heatmap grid cell for one client is not the two-client total")
-
-        // `maxValue` gained a `cutoff` parameter in round 4 (FIX 3); this
-        // constant preserves every existing A3/A4 fixture's original
-        // semantics (nothing excluded) rather than weakening what they test.
-        let noCutoffFilter = "9999-12-31"
-
-        // A3 (invariant 3): a `tokens == 0, cost > 0` day must count as "has
-        // data" under the Price metric. This is reachable (UsageStats.swift
-        // 105-110) and `cell.active` (Grid.swift:49) is tokens-only — using
-        // it here would wrongly blank this day out.
-        let costOnlyGrid = buildGrid(
-            year: "2026",
-            perDayMap: ["2026-05-05": PerDay(date: "2026-05-05", tokens: 0, cost: 5, intensity: 1)])
-        let costOnlyCell = costOnlyGrid.cells.first { $0.date == "2026-05-05" }!
-        expect(costOnlyCell.active == false, "sanity: a cost-only day is not `active` (tokens-only flag)")
-        expect(
-            ContributionHeatmap.hasData(costOnlyCell, metric: .cost) == true,
-            "Price metric treats cost>0 as data even when active==false")
-        expect(
-            ContributionHeatmap.hasData(costOnlyCell, metric: .tokens) == false,
-            "Tokens metric still has no data on a cost-only day")
-        let costOnlyMax = ContributionHeatmap.maxValue(costOnlyGrid, metric: .cost, cutoff: noCutoffFilter)
-        expect(
-            HeatmapLayout.level(
-                value: ContributionHeatmap.value(costOnlyCell, metric: .cost), max: costOnlyMax) >= 1,
-            "cost-only day renders at a non-zero heatmap intensity level")
-
-        // A4 (invariant 4): Tokens and Price take their intensity denominator
-        // independently — the day with the most tokens need not be the day
-        // with the highest cost, and each metric's own top day must still
-        // reach the top intensity level under its own max.
-        let dualMetricGrid = buildGrid(
+        // C1 — metric semantics: independent tokens/cost maxima, a future day
+        // excluded from both, a cost>0/tokens==0 day is data under Price only.
+        let metricGrid = buildGrid(
             year: "2026",
             perDayMap: [
                 "2026-03-01": PerDay(date: "2026-03-01", tokens: 1000, cost: 1, intensity: 1),
                 "2026-03-08": PerDay(date: "2026-03-08", tokens: 10, cost: 100, intensity: 1),
-            ])
-        let dayHighTokens = dualMetricGrid.cells.first { $0.date == "2026-03-01" }!
-        let dayHighCost = dualMetricGrid.cells.first { $0.date == "2026-03-08" }!
-        let dualMaxTokens = ContributionHeatmap.maxValue(dualMetricGrid, metric: .tokens, cutoff: noCutoffFilter)
-        let dualMaxCost = ContributionHeatmap.maxValue(dualMetricGrid, metric: .cost, cutoff: noCutoffFilter)
-        expect(
-            dualMaxTokens == 1000 && dualMaxCost == 100,
-            "tokens and cost maxima are computed independently, from different days")
-        expect(
-            HeatmapLayout.level(
-                value: ContributionHeatmap.value(dayHighTokens, metric: .tokens), max: dualMaxTokens) == 4
-                && HeatmapLayout.level(
-                    value: ContributionHeatmap.value(dayHighCost, metric: .cost), max: dualMaxCost) == 4,
-            "each metric's own top day reaches the highest intensity level")
-        expect(
-            HeatmapLayout.level(
-                value: ContributionHeatmap.value(dayHighCost, metric: .tokens), max: dualMaxTokens) < 4,
-            "the cost-max day is not also the tokens-max day (cost wrongly reusing maxTokens would fail this)")
-
-        // Five-level threshold boundaries (invariant 9): >=0.75/0.5/0.25/>0/else.
-        expect(
-            HeatmapLayout.level(value: 75, max: 100) == 4
-                && HeatmapLayout.level(value: 50, max: 100) == 3
-                && HeatmapLayout.level(value: 25, max: 100) == 2
-                && HeatmapLayout.level(value: 1, max: 100) == 1
-                && HeatmapLayout.level(value: 0, max: 100) == 0
-                && HeatmapLayout.level(value: 10, max: 0) == 0,
-            "five-level intensity thresholds match >=0.75/0.5/0.25/>0/else")
-
-        // A5/A6: calendar boundaries across years, including a leap day.
-        // `buildGrid` clamps to `max(53, …)`, so every real year lands on 53
-        // or 54 columns; 2028 is the nearest 54-column year to today.
-        expect(buildGrid(year: "2026", perDayMap: [:]).cols == 53, "2026 uses the standard 53 columns")
-        expect(buildGrid(year: "2028", perDayMap: [:]).cols == 54, "2028 needs a 54th column")
-        let leapGrid = buildGrid(
-            year: "2028",
-            perDayMap: ["2028-02-29": PerDay(date: "2028-02-29", tokens: 1, cost: 0, intensity: 1)])
-        let leapCell = leapGrid.cells.first { $0.date == "2028-02-29" }
-        expect(
-            leapCell?.inYear == true && leapCell?.active == true,
-            "2028-02-29 is a valid in-year, active cell (pure ISODay stepping, no Calendar)")
-
-        // A7 (invariant 7): `chartViewRaw` fallback is exhaustive, not an
-        // ad hoc `!is3D && !isHeatmap` chain — any unknown value, not just
-        // the ones tested here, falls back to Bars.
-        expect(ChartView(raw: "2d") == .bars, "legacy '2d' still maps to Bars (no migration needed)")
-        expect(ChartView(raw: "3d") == .threeD, "legacy '3d' still maps to 3D")
-        expect(ChartView(raw: "heat") == .heatmap, "new 'heat' value maps to Heatmap")
-        expect(ChartView(raw: "garbage") == .bars, "an unknown chartViewRaw falls back to Bars, not a crash")
-
-        // MARK: - FLAT-HEATMAP round 2 (append-only; do not reorder/edit above)
-
-        // Item 3(a): future-day cutoff. Current year clips to today; any
-        // other (necessarily past) year still runs through Dec 31.
-        expect(
-            ContributionHeatmap.cutoffDate(year: "2026", today: "2026-07-29") == "2026-07-29",
-            "the selected year matching today's year cuts off at today")
-        expect(
-            ContributionHeatmap.cutoffDate(year: "2025", today: "2026-07-29") == "2025-12-31",
-            "a past selected year still runs through Dec 31, not today's date")
-
-        let cutoffCurrent = ContributionHeatmap.cutoffDate(year: "2026", today: "2026-07-29")
-        let currentYearGrid = buildGrid(year: "2026", perDayMap: [:])
-        let renderableCurrent = currentYearGrid.cells
-            .filter { ContributionHeatmap.isRenderable($0, cutoff: cutoffCurrent) }
-            .map(\.date)
-        expect(
-            renderableCurrent.max() == "2026-07-29" && !renderableCurrent.contains("2026-07-30"),
-            "the current year renders through today and no further (a `<` vs `<=` slip would fail this)")
-
-        let cutoffPast = ContributionHeatmap.cutoffDate(year: "2025", today: "2026-07-29")
-        let pastYearGrid = buildGrid(year: "2025", perDayMap: [:])
-        let renderablePast = pastYearGrid.cells
-            .filter { ContributionHeatmap.isRenderable($0, cutoff: cutoffPast) }
-            .map(\.date)
-        expect(
-            renderablePast.max() == "2025-12-31",
-            "a past year still renders all the way to Dec 31 (forgetting the year check would clip it to today's date)")
-
-        // Item 1: the tooltip's anchor must be derived from the scrolling
-        // content's *current* on-screen origin, not pinned to the cell's
-        // position within that content alone — that pin is exactly the old
-        // clipping bug (tooltip position never accounted for scroll, so it
-        // rendered inside the ScrollView's own clipped content layer). This
-        // is the pure-logic slice of the fix; the actual on-screen clip
-        // behavior needs a human looking at the popover (A9-equivalent).
-        expect(
-            ContributionHeatmap.tooltipAnchor(cellCenter: CGPoint(x: 50, y: 20), contentOrigin: .zero)
-                == CGPoint(x: 50, y: 20),
-            "an unscrolled, unmoved content anchors directly on the cell's own center")
-        expect(
-            ContributionHeatmap.tooltipAnchor(
-                cellCenter: CGPoint(x: 50, y: 20), contentOrigin: CGPoint(x: -300, y: 0))
-                == CGPoint(x: -250, y: 20),
-            "scrolling the content 300pt left shifts the anchor by the same 300pt — proving the tooltip "
-                + "tracks the outer container, not a position frozen inside the scrolled/clipped content")
-
-        // MARK: - FLAT-HEATMAP round 3 (append-only; do not reorder/edit above)
-
-        // Layout width (and hit-testing) must derive from the last
-        // RENDERABLE column, not `grid.cols` — round 2 correctly stopped
-        // drawing/hovering future days but left `grid.cols` driving the
-        // layout width, so the blank cutoff-past columns still ate width and
-        // `scrollTo(.trailing)` landed on empty space instead of today.
-        let r3Today = "2026-07-29"
-        let r3CurrentYearGrid = buildGrid(year: "2026", perDayMap: [:])
-        let r3TodayCell = r3CurrentYearGrid.cells.first { $0.date == r3Today }!
-        // September, not August: July 29 (a Wednesday) and Aug 1 fall in the
-        // same Sunday-Saturday week/column, which would make the "later
-        // column" assertion below vacuously true regardless of the fix.
-        let r3SeptemberCell = r3CurrentYearGrid.cells.first { $0.date == "2026-09-01" }!
-        let r3LastColCurrent = ContributionHeatmap.lastRenderableCol(r3CurrentYearGrid, cutoff: r3Today)
-        expect(
-            r3LastColCurrent == r3TodayCell.col,
-            "the current year's last renderable column is today's column, not the last column of the year")
-        expect(
-            r3LastColCurrent < r3SeptemberCell.col,
-            "a column after today contributes no width (using grid.cols here would fail this)")
-
-        // Note: a mutated `cutoffDate` that always returns `today` regardless
-        // of year (the round-2 mutation target) does NOT fail this specific
-        // assertion — a past year's dates all lexicographically precede a
-        // current-year "today" string, so that particular bug still yields
-        // full width here by coincidence; it's caught instead by round 2's
-        // own "past selected year still runs through Dec 31" test above. This
-        // assertion's real mutation target is a wrong past-year end date
-        // (e.g. `"\(year)-01-01"` instead of `"\(year)-12-31"`), which does
-        // narrow the width and does fail here.
-        let r3PastCutoff = ContributionHeatmap.cutoffDate(year: "2025", today: r3Today)
-        let r3PastYearGrid = buildGrid(year: "2025", perDayMap: [:])
-        let r3LastColPast = ContributionHeatmap.lastRenderableCol(r3PastYearGrid, cutoff: r3PastCutoff)
-        expect(
-            r3LastColPast == r3PastYearGrid.cols - 1,
-            "a past year still spans the full grid width (a wrong past-year cutoff end date would narrow it)")
-
-        // Month labels must stop at the same cutoff as the cells — calling
-        // the real `monthLabelCols(grid:cutoff:)`, not a hand-rebuilt copy of
-        // its filter, so dropping the cutoff filter inside it would be caught.
-        let r3JulyFirstCell = r3CurrentYearGrid.cells.first { $0.date == "2026-07-01" }!
-        let r3MonthLabelCols = ContributionHeatmap.monthLabelCols(grid: r3CurrentYearGrid, cutoff: r3Today)
-            .map(\.col)
-        expect(
-            r3MonthLabelCols.contains(r3JulyFirstCell.col),
-            "July's label (on or before the cutoff) is still present")
-        expect(
-            !r3MonthLabelCols.contains(r3SeptemberCell.col),
-            "September's label (after the cutoff) is dropped (mutation: skipping the isRenderable filter "
-                + "inside monthLabelCols would fail this)")
-
-        // MARK: - FLAT-HEATMAP round 4 (Codex P2 fixes; append-only)
-
-        // FIX 1: the re-scroll-to-trailing trigger is `cutoff`, which changes
-        // on both a year-filter change and a day rollover — this is the pure,
-        // testable half of the fix. The actual SwiftUI `onChange(of:
-        // cutoff)` → `proxy.scrollTo` wiring firing at the right time needs a
-        // human watching the popover switch years while on the Heatmap tab;
-        // there's no headless SwiftUI view-update harness here to automate
-        // that half.
-        expect(
-            ContributionHeatmap.cutoffDate(year: "2026", today: "2026-07-29")
-                != ContributionHeatmap.cutoffDate(year: "2025", today: "2026-07-29"),
-            "cutoff changes across a year-filter switch (the re-scroll trigger fires)")
-        expect(
-            ContributionHeatmap.cutoffDate(year: "2026", today: "2026-07-29")
-                != ContributionHeatmap.cutoffDate(year: "2026", today: "2026-07-30"),
-            "cutoff also changes across a day rollover while the popover stays open")
-
-        // FIX 2: a horizontal wheel-redirect already parked at an edge must
-        // report "not consumed" so the dashboard's vertical ScrollView still
-        // sees the wheel tick — the pre-fix code clamped and unconditionally
-        // reported the event as handled even when the clamped origin was
-        // identical to the one it started with.
-        let r4RightEdge = HorizontalWheelScroll.clampedScroll(originX: 500, step: -20, maxX: 500)
-        expect(
-            r4RightEdge.newOriginX == 500 && r4RightEdge.moved == false,
-            "already at the trailing edge: origin doesn't move, so the event is not consumed "
-                + "(mutation: always returning moved=true would fail this)")
-        let r4LeftEdge = HorizontalWheelScroll.clampedScroll(originX: 0, step: 20, maxX: 500)
-        expect(
-            r4LeftEdge.newOriginX == 0 && r4LeftEdge.moved == false,
-            "already at the leading edge: origin doesn't move, so the event is not consumed")
-        let r4MidScroll = HorizontalWheelScroll.clampedScroll(originX: 100, step: 20, maxX: 500)
-        expect(
-            r4MidScroll.newOriginX == 80 && r4MidScroll.moved == true,
-            "a scroll that actually changes the origin IS consumed")
-
-        // FIX 3: a hidden future cell (clock skew, an imported session dated
-        // past today) must not sit in either metric's intensity denominator
-        // — the same `isRenderable` cutoff that keeps it from being drawn or
-        // hoverable must also keep it out of `maxValue`.
-        let r4FutureShockGrid = buildGrid(
-            year: "2026",
-            perDayMap: [
-                "2026-07-10": PerDay(date: "2026-07-10", tokens: 100, cost: 5, intensity: 1),
+                "2026-05-05": PerDay(date: "2026-05-05", tokens: 0, cost: 5, intensity: 1),
                 "2026-08-15": PerDay(date: "2026-08-15", tokens: 999_999, cost: 9999, intensity: 1),
             ])
-        let r4Cutoff = "2026-07-29"
-        let r4VisibleCell = r4FutureShockGrid.cells.first { $0.date == "2026-07-10" }!
-        let r4TokensMax = ContributionHeatmap.maxValue(r4FutureShockGrid, metric: .tokens, cutoff: r4Cutoff)
-        let r4CostMax = ContributionHeatmap.maxValue(r4FutureShockGrid, metric: .cost, cutoff: r4Cutoff)
+        let metricCutoff = "2026-07-29"
+        let tokenMaxDay = metricGrid.cells.first { $0.date == "2026-03-01" }!
+        let costMaxDay = metricGrid.cells.first { $0.date == "2026-03-08" }!
+        let costOnlyDay = metricGrid.cells.first { $0.date == "2026-05-05" }!
+        let maxTok = ContributionHeatmap.maxValue(metricGrid, metric: .tokens, cutoff: metricCutoff)
+        let maxCost = ContributionHeatmap.maxValue(metricGrid, metric: .cost, cutoff: metricCutoff)
         expect(
-            r4TokensMax == 100 && r4CostMax == 5,
-            "a hidden future day's huge values don't enter either metric's intensity denominator")
+            maxTok == 1000 && maxCost == 100
+                && ContributionHeatmap.hasData(costOnlyDay, metric: .cost)
+                && !ContributionHeatmap.hasData(costOnlyDay, metric: .tokens),
+            "tokens/cost maxima are independent, exclude the future day past cutoff, and a cost-only day "
+                + "is data under Price but not Tokens (never `cell.active`, which is tokens-only)")
         expect(
-            HeatmapLayout.level(
-                value: ContributionHeatmap.value(r4VisibleCell, metric: .tokens), max: r4TokensMax) == 4
-                && HeatmapLayout.level(
-                    value: ContributionHeatmap.value(r4VisibleCell, metric: .cost), max: r4CostMax) == 4,
-            "the only visible day still renders at full intensity (mutation: reverting the tokens branch "
-                + "to `grid.maxTokens` or the cost branch to an unfiltered reduce would crush this)")
-
-        // MARK: - FLAT-HEATMAP round 5 (Codex P2 fix + audit; append-only)
-
-        // FIX: a FUTURE selected year (reachable if clock skew or an
-        // imported session put activity there, so it shows up in the year
-        // picker) must render nothing, not the whole year — the old two-way
-        // `year == currentYear ? today : "\(year)-12-31"` treated every
-        // non-current year as past.
+            HeatmapLayout.level(value: ContributionHeatmap.value(tokenMaxDay, metric: .tokens), max: maxTok) == 4
+                && HeatmapLayout.level(value: ContributionHeatmap.value(costMaxDay, metric: .cost), max: maxCost) == 4
+                && HeatmapLayout.level(value: ContributionHeatmap.value(costMaxDay, metric: .tokens), max: maxTok) < 4,
+            "each metric's top day hits full intensity under its own max; the cost-max day isn't the tokens-max day")
         expect(
-            ContributionHeatmap.cutoffDate(year: "2026", today: "2026-07-29") == "2026-07-29",
-            "the current year still cuts off at today")
+            HeatmapLayout.level(value: 75, max: 100) == 4 && HeatmapLayout.level(value: 50, max: 100) == 3
+                && HeatmapLayout.level(value: 25, max: 100) == 2 && HeatmapLayout.level(value: 1, max: 100) == 1
+                && HeatmapLayout.level(value: 0, max: 100) == 0 && HeatmapLayout.level(value: 10, max: 0) == 0,
+            "five-level intensity thresholds match >=0.75/0.5/0.25/>0/else")
+        // The grid must read the same, already client-filtered `stats.perDayMap`
+        // UsageChartCard hands ContributionGraph3D, not the unfiltered total.
+        let heatJSON = """
+        {"meta":{"generatedAt":"now","version":"1","dateRange":{"start":"2026-01-01","end":"2026-01-01"}},
+         "summary":{"totalTokens":0,"totalCost":0,"totalDays":1,"activeDays":1,"averagePerDay":0,
+         "maxCostInSingleDay":0,"clients":["a","b"],"models":[]},"years":[],"contributions":[
+         {"date":"2026-01-01","totals":{"tokens":0,"cost":0,"messages":0},"intensity":1,
+         "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},"clients":[
+         {"client":"a","modelId":"m","providerId":"p","cost":2,"messages":1,
+          "tokens":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}},
+         {"client":"b","modelId":"m","providerId":"p","cost":3,"messages":1,
+          "tokens":{"input":50,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0}}]}]}
+        """
+        let heatPayload = try! JSONDecoder().decode(UsagePayload.self, from: Data(heatJSON.utf8))
+        let heatStats = UsageStats(payload: heatPayload, selectedClients: ["a"])
+        let heatCellA = buildGrid(year: "2026", perDayMap: heatStats.perDayMap).cells.first { $0.date == "2026-01-01" }
         expect(
-            ContributionHeatmap.cutoffDate(year: "2025", today: "2026-07-29") == "2025-12-31",
-            "a past year still cuts off at its own Dec 31")
+            heatCellA?.tokens == 100 && heatCellA?.cost == 2
+                && (heatCellA?.tokens ?? 0) != 150 && (heatCellA?.cost ?? 0) != 5,
+            "heatmap cell matches the filtered UsageStats value for the selected client, not the two-client total")
+        // C2 — date/cutoff semantics: one grid per year-class proving
+        // `cutoffDate`, renderable cells, the last renderable column (layout
+        // width/month labels derive from this, not `grid.cols` — round 3), and
+        // content width all agree.
+        let cutoffToday = "2026-07-29"
+        let currentGrid = buildGrid(year: "2026", perDayMap: [:])
+        let currentCutoff = ContributionHeatmap.cutoffDate(year: "2026", today: cutoffToday)
+        let currentTodayCell = currentGrid.cells.first { $0.date == cutoffToday }!
+        // September, not August: July 29 and Aug 1 share a Sun-Sat column,
+        // which would make the "later column" half vacuously true regardless.
+        let currentSeptCell = currentGrid.cells.first { $0.date == "2026-09-01" }!
+        let currentRenderable = currentGrid.cells
+            .filter { ContributionHeatmap.isRenderable($0, cutoff: currentCutoff) }.map(\.date)
+        let currentLastCol = ContributionHeatmap.lastRenderableCol(currentGrid, cutoff: currentCutoff)
+        let currentLabelCols = ContributionHeatmap.monthLabelCols(grid: currentGrid, cutoff: currentCutoff).map(\.col)
         expect(
-            ContributionHeatmap.cutoffDate(year: "2027", today: "2026-07-29") == "2026-07-29",
-            "a future year cuts off at today too (mutation: the old `year == currentYear ? today : "
-                + "\"\\(year)-12-31\"` two-way branch would return \"2027-12-31\" here and fail this)")
-
-        let r5FutureYearGrid = buildGrid(year: "2027", perDayMap: [:])
-        let r5FutureCutoff = ContributionHeatmap.cutoffDate(year: "2027", today: "2026-07-29")
+            currentCutoff == cutoffToday
+                && currentRenderable.max() == cutoffToday && !currentRenderable.contains("2026-07-30")
+                && currentLastCol == currentTodayCell.col && currentLastCol < currentSeptCell.col
+                && currentLabelCols.contains(currentGrid.cells.first { $0.date == "2026-07-01" }!.col)
+                && !currentLabelCols.contains(currentSeptCell.col),
+            "the current year clips at today: cutoff, renderable cells, last renderable column, and month "
+                + "labels all stop there, not at the end of the year or `grid.cols`")
         expect(
-            ContributionHeatmap.lastRenderableCol(r5FutureYearGrid, cutoff: r5FutureCutoff) == -1,
-            "a future year has zero renderable columns")
-
-        // Zero renderable columns (the future-year case just established, or
-        // any grid where nothing passes the cutoff) must not produce a
-        // negative canvas width.
+            ContributionHeatmap.cutoffDate(year: "2026", today: cutoffToday)
+                != ContributionHeatmap.cutoffDate(year: "2026", today: "2026-07-30")
+                && ContributionHeatmap.cutoffDate(year: "2026", today: "2026-07-30") == "2026-07-30",
+            "consecutive calendar days in the current year produce distinct cutoffs, so a popover left open across midnight re-scrolls")
+        let pastGrid = buildGrid(year: "2025", perDayMap: [:])
+        let pastCutoff = ContributionHeatmap.cutoffDate(year: "2025", today: cutoffToday)
+        let futureGrid = buildGrid(year: "2027", perDayMap: [:])
+        let futureCutoff = ContributionHeatmap.cutoffDate(year: "2027", today: cutoffToday)
+        let pastRenderableMax = pastGrid.cells.filter { ContributionHeatmap.isRenderable($0, cutoff: pastCutoff) }.map(\.date).max()
         expect(
-            ContributionHeatmap.contentWidth(visibleCols: 0, monthLabelCols: []) == 0,
-            "zero visible columns is zero width, not a negative width from `0 * step - gap` "
-                + "(mutation: dropping the `visibleCols > 0` guard would fail this)")
+            pastCutoff == "2025-12-31" && pastRenderableMax == "2025-12-31"
+                && ContributionHeatmap.lastRenderableCol(pastGrid, cutoff: pastCutoff) == pastGrid.cols - 1,
+            "a past year cuts off at, renders through, and spans the full grid width to its own Dec 31")
         expect(
-            ContributionHeatmap.contentWidth(visibleCols: 3, monthLabelCols: []) > 0,
-            "sanity: a normal, nonzero column count still produces a positive width")
-
-        // MARK: - FLAT-HEATMAP round 6 (Codex round 3 P2 fixes + audit; append-only)
-
-        // FIX 1: `ChartView.next` owns the ⌘G cycle order. The regression
-        // this guards was specifically that Heatmap couldn't be distinguished
-        // from 3D by the old handler, so it's the heatmap→threeD step (not
-        // just "the cycle eventually returns") that matters most here.
-        expect(ChartView.bars.next == .heatmap, "cycle: Bars -> Heatmap")
+            futureCutoff == cutoffToday
+                && ContributionHeatmap.lastRenderableCol(futureGrid, cutoff: futureCutoff) == -1
+                && ContributionHeatmap.contentWidth(visibleCols: 0, monthLabelCols: []) == 0
+                && ContributionHeatmap.contentWidth(visibleCols: 3, monthLabelCols: []) > 0,
+            "a future year clips at today too (not its own Dec 31), so it has zero renderable columns and "
+                + "zero width — never negative width from `0 * step - gap`")
+        // Calendar boundaries: `buildGrid` clamps to `max(53, …)`, and a leap
+        // day steps correctly through pure ISODay arithmetic (no Calendar).
+        let leapCell = buildGrid(
+            year: "2028", perDayMap: ["2028-02-29": PerDay(date: "2028-02-29", tokens: 1, cost: 0, intensity: 1)])
+            .cells.first { $0.date == "2028-02-29" }
         expect(
-            ChartView.heatmap.next == .threeD,
-            "cycle: Heatmap -> 3D, not back to Bars — this is exactly the regression: the old handler's "
-                + "binary `chartViewRaw == \"2d\" ? \"3d\" : \"2d\"` treated Heatmap the same as \"any "
-                + "non-2d value\" and always landed on 3D, then only ever toggled Bars<->3D afterward, so "
-                + "a keyboard user starting on Heatmap could never cycle back to it")
-        expect(ChartView.threeD.next == .bars, "cycle: 3D -> Bars, closing the loop")
-        expect(
-            ChartView.bars.next.next.next == .bars,
-            "three ⌘G presses from any state return to that same state")
-
-        // FIX 2: contentWidth gains the trailing margin ONLY when the LAST
-        // renderable column itself has a month label.
-        let r6BaseWidth = ContributionHeatmap.contentWidth(visibleCols: 5, monthLabelCols: [])
-        let r6TrailingLabelWidth = ContributionHeatmap.contentWidth(
-            visibleCols: 5, monthLabelCols: [(col: 4, label: "Sep")])
-        expect(
-            r6TrailingLabelWidth == r6BaseWidth + HeatmapLayout.lastColumnLabelMargin,
-            "a label landing in the last renderable column adds exactly the named margin")
-        let r6MidLabelWidth = ContributionHeatmap.contentWidth(
-            visibleCols: 5, monthLabelCols: [(col: 2, label: "Jul")])
-        expect(
-            r6MidLabelWidth == r6BaseWidth,
-            "a label on a column that ISN'T the last one adds no margin (mutation: adding the margin "
-                + "whenever monthLabelCols is merely non-empty, instead of checking the last column "
-                + "specifically, would fail this)")
-
-        // FIX 3: gap coordinates are dead zones (unlike the bar chart's
-        // intentional gap-attaches-to-the-left-bar rule); horizontal and
-        // vertical boundaries both tested at the cell's last valid pixel and
-        // the gap's first pixel.
-        let r6Cell = HeatmapLayout.cell
-        let r6Step = HeatmapLayout.step
-        expect(
-            ContributionHeatmap.withinCell(offset: 0, step: r6Step, cell: r6Cell),
-            "the first pixel of a cell is inside it")
-        expect(
-            ContributionHeatmap.withinCell(offset: r6Cell - 0.1, step: r6Step, cell: r6Cell),
-            "the last valid pixel just before the gap is still inside the cell")
-        expect(
-            !ContributionHeatmap.withinCell(offset: r6Cell, step: r6Step, cell: r6Cell),
-            "the first pixel of the gap is rejected (mutation: dropping the `< cell` check, i.e. always "
-                + "returning true, would fail this)")
-        expect(
-            !ContributionHeatmap.withinCell(offset: r6Step - 0.1, step: r6Step, cell: r6Cell),
-            "the last pixel of the gap, right before the next cell, is still rejected")
-        expect(
-            ContributionHeatmap.withinCell(offset: r6Step, step: r6Step, cell: r6Cell),
-            "the first pixel of the NEXT cell is inside it again")
-        expect(
-            ContributionHeatmap.withinCell(offset: r6Step + r6Cell - 0.1, step: r6Step, cell: r6Cell),
-            "the second cell's last valid pixel is inside it")
-        expect(
-            !ContributionHeatmap.withinCell(offset: r6Step + r6Cell, step: r6Step, cell: r6Cell),
-            "the second cell's gap is rejected too")
-
-        // MARK: - FLAT-HEATMAP round 7 (Codex round 4 P2 fix + audit; append-only)
-
-        // FIX: `shouldClearHoverOnOriginChange` is the pure half of "clear
-        // hover when the content actually scrolled, not on every incidental
-        // re-layout". The `onGeometryChange` → `hoverIndex = nil` wiring
-        // itself firing at the right moment during a live scroll has no
-        // headless SwiftUI harness here and is manual-verification-only.
-        expect(
-            !ContributionHeatmap.shouldClearHoverOnOriginChange(
-                old: CGPoint(x: 10, y: 20), new: CGPoint(x: 10, y: 20)),
-            "an unchanged origin never clears the hover (mutation: always returning true here would "
-                + "make hover impossible to establish at all, since the geometry modifier's initial call "
-                + "would immediately clear it)")
-        expect(
-            ContributionHeatmap.shouldClearHoverOnOriginChange(
-                old: CGPoint(x: 10, y: 20), new: CGPoint(x: 40, y: 20)),
-            "a changed origin (e.g. a redirected wheel scroll) clears the hover (mutation: always "
-                + "returning false would leave a stale tooltip pinned through a scroll — the original bug)")
-        expect(
-            ContributionHeatmap.shouldClearHoverOnOriginChange(
-                old: CGPoint(x: 10, y: 20), new: CGPoint(x: 10, y: 5)),
-            "a vertical-only origin change also clears the hover")
-
-        // MARK: - FLAT-HEATMAP round 8 (perf regression fix; append-only)
-
-        // The scroll-perf fix: measuring `contentOrigin` in a coordinate
-        // space anchored to the OUTER container (instead of `.global`)
-        // means a shared ancestor translation — the dashboard's own
-        // vertical ScrollView scrolling — cancels out, because both the
-        // content's and the container's `.global` positions shift by the
-        // SAME delta. This models that arithmetic directly: two `.global`
-        // snapshots of content/container before an ancestor scroll, and two
-        // after a 150pt vertical shift applied to BOTH.
-        let r8ContentGlobalBefore = CGPoint(x: 40, y: 320)
-        let r8ContainerGlobalBefore = CGPoint(x: 20, y: 300)
-        let r8AncestorScrollDelta: CGFloat = 150
-        let r8ContentGlobalAfter = CGPoint(
-            x: r8ContentGlobalBefore.x, y: r8ContentGlobalBefore.y - r8AncestorScrollDelta)
-        let r8ContainerGlobalAfter = CGPoint(
-            x: r8ContainerGlobalBefore.x, y: r8ContainerGlobalBefore.y - r8AncestorScrollDelta)
-        expect(
-            r8ContentGlobalBefore != r8ContentGlobalAfter,
-            "sanity: the raw `.global` position genuinely changes during the ancestor scroll — this is "
-                + "exactly why tracking `.global` fired `onGeometryChange`'s action, and therefore wrote "
-                + "state, on every single frame of a scroll this view had no other stake in")
+            buildGrid(year: "2026", perDayMap: [:]).cols == 53 && buildGrid(year: "2028", perDayMap: [:]).cols == 54
+                && leapCell?.inYear == true && leapCell?.active == true,
+            "2026 uses 53 columns, 2028 needs a 54th, and Feb 29 is a valid in-year active cell")
+        // C3 — hit testing: `cellAt` is production's own point -> `grid.cells`
+        // index resolver (static so SelfTest calls it directly, not a copy of
+        // its coordinate math). One class each: in a cell, a horizontal gap, a
+        // vertical gap, out of bounds — the last anchored to `cutoff`-derived
+        // `visibleCols`, doubling as proof hit testing honors that cutoff too.
+        struct HeatmapHitCase { let name: String; let point: CGPoint; let expected: Int? }
+        let hitVisibleCols = currentLastCol + 1
+        let hitCol = 2, hitRow = 3
+        let hitCellRect = HeatmapLayout.rect(col: hitCol, row: hitRow)
+        for c in [
+            HeatmapHitCase(name: "inside a cell resolves to that cell", point: CGPoint(x: hitCellRect.minX + 1, y: hitCellRect.minY + 1), expected: hitCol * 7 + hitRow),
+            HeatmapHitCase(name: "a horizontal gap point is a dead zone", point: CGPoint(x: hitCellRect.maxX + 1, y: hitCellRect.minY + 1), expected: nil),
+            HeatmapHitCase(name: "a vertical gap point is a dead zone", point: CGPoint(x: hitCellRect.minX + 1, y: hitCellRect.maxY + 1), expected: nil),
+            HeatmapHitCase(name: "past the last renderable column is out of bounds", point: CGPoint(x: HeatmapLayout.rect(col: hitVisibleCols, row: 0).minX + 1, y: HeatmapLayout.gridTop + 1), expected: nil),
+            HeatmapHitCase(name: "leading cell edge is inside the cell", point: CGPoint(x: hitCellRect.minX, y: hitCellRect.minY), expected: hitCol * 7 + hitRow),
+            HeatmapHitCase(name: "trailing cell edge is the gap, not the cell", point: CGPoint(x: hitCellRect.maxX, y: hitCellRect.minY + 1), expected: nil),
+            HeatmapHitCase(name: "next cell leading edge resolves to the next column", point: CGPoint(x: HeatmapLayout.rect(col: hitCol + 1, row: hitRow).minX, y: hitCellRect.minY), expected: (hitCol + 1) * 7 + hitRow),
+        ] {
+            expect(
+                ContributionHeatmap.cellAt(c.point, grid: currentGrid, visibleCols: hitVisibleCols) == c.expected,
+                "hit test: \(c.name)")
+        }
+        // C4 — scroll/hover lifecycle. `shouldClearHoverOnOriginChange`: an
+        // unchanged origin never clears (else hover could never be
+        // established, since every geometry pass would zero it); a real move
+        // does.
+        struct HeatmapOriginCase { let name: String; let old: CGPoint; let new: CGPoint; let clears: Bool }
+        for c in [
+            HeatmapOriginCase(name: "unchanged origin", old: CGPoint(x: 10, y: 20), new: CGPoint(x: 10, y: 20), clears: false),
+            HeatmapOriginCase(name: "horizontal move", old: CGPoint(x: 10, y: 20), new: CGPoint(x: 40, y: 20), clears: true),
+            HeatmapOriginCase(name: "vertical move", old: CGPoint(x: 10, y: 20), new: CGPoint(x: 10, y: 5), clears: true),
+        ] {
+            expect(
+                ContributionHeatmap.shouldClearHoverOnOriginChange(old: c.old, new: c.new) == c.clears,
+                "hover lifecycle: \(c.name)")
+        }
+        // Round 8 (perf): `contentOrigin` is measured anchored to the OUTER
+        // container, not `.global` — a shared ancestor's vertical scroll
+        // shifts content's and container's `.global` by the SAME delta and
+        // cancels out; a genuine horizontal scroll of this content does not.
         func relative(content: CGPoint, container: CGPoint) -> CGPoint {
             CGPoint(x: content.x - container.x, y: content.y - container.y)
         }
-        let r8RelativeBefore = relative(content: r8ContentGlobalBefore, container: r8ContainerGlobalBefore)
-        let r8RelativeAfter = relative(content: r8ContentGlobalAfter, container: r8ContainerGlobalAfter)
+        let contentGlobal = CGPoint(x: 40, y: 320)
+        let containerGlobal = CGPoint(x: 20, y: 300)
+        let ancestorShift: CGFloat = 150
+        let relBefore = relative(content: contentGlobal, container: containerGlobal)
+        let relAfterAncestor = relative(
+            content: CGPoint(x: contentGlobal.x, y: contentGlobal.y - ancestorShift),
+            container: CGPoint(x: containerGlobal.x, y: containerGlobal.y - ancestorShift))
+        let relAfterHScroll = relative(content: CGPoint(x: contentGlobal.x - 60, y: contentGlobal.y), container: containerGlobal)
         expect(
-            r8RelativeBefore == r8RelativeAfter,
-            "content's position relative to its container is invariant under a shared ancestor "
-                + "translation — this is exactly the value a coordinate space anchored to the container "
-                + "reports directly, instead of two independent `.global` values that must be subtracted")
+            relBefore == relAfterAncestor
+                && !ContributionHeatmap.shouldClearHoverOnOriginChange(old: relBefore, new: relAfterAncestor)
+                && relBefore != relAfterHScroll
+                && ContributionHeatmap.shouldClearHoverOnOriginChange(old: relBefore, new: relAfterHScroll),
+            "a shared ancestor translation leaves the container-relative origin unchanged and does not "
+                + "clear hover, while a genuine horizontal content scroll changes it and does clear "
+                + "(mutation: using only one side's global delta would fail the first half)")
+        // The tooltip anchors on the outer container's origin, not a position
+        // frozen inside the scrolled/clipped content.
         expect(
-            !ContributionHeatmap.shouldClearHoverOnOriginChange(old: r8RelativeBefore, new: r8RelativeAfter),
-            "so a pure vertical ancestor scroll correctly does NOT clear the hover or write state "
-                + "(mutation: if the container-relative value were computed wrong — e.g. only the "
-                + "content's delta and not the container's — this would go red)")
-
-        // Contrast: a genuine HORIZONTAL scroll of this grid's own content
-        // (the container does not move) must still change the relative
-        // origin, so hover keeps clearing correctly for the case that
-        // actually matters (round 7's fix).
-        let r8HScrolledContentGlobal = CGPoint(x: r8ContentGlobalBefore.x - 60, y: r8ContentGlobalBefore.y)
-        let r8HScrolledRelative = relative(content: r8HScrolledContentGlobal, container: r8ContainerGlobalBefore)
+            ContributionHeatmap.tooltipAnchor(cellCenter: CGPoint(x: 50, y: 20), contentOrigin: .zero)
+                == CGPoint(x: 50, y: 20)
+                && ContributionHeatmap.tooltipAnchor(cellCenter: CGPoint(x: 50, y: 20), contentOrigin: CGPoint(x: -300, y: 0))
+                == CGPoint(x: -250, y: 20),
+            "the tooltip anchor tracks the content's origin in the outer container's coordinate space")
+        // FIX 2: a horizontal wheel-redirect already parked at an edge reports
+        // "not consumed" so the dashboard's own vertical ScrollView sees it.
+        struct HeatmapWheelCase { let name: String; let originX: CGFloat; let step: CGFloat; let newX: CGFloat; let moved: Bool }
+        for c in [
+            HeatmapWheelCase(name: "trailing edge, further trailing", originX: 500, step: -20, newX: 500, moved: false),
+            HeatmapWheelCase(name: "leading edge, further leading", originX: 0, step: 20, newX: 0, moved: false),
+            HeatmapWheelCase(name: "a step that actually moves the origin", originX: 100, step: 20, newX: 80, moved: true),
+        ] {
+            let r = HorizontalWheelScroll.clampedScroll(originX: c.originX, step: c.step, maxX: 500)
+            expect(r.newOriginX == c.newX && r.moved == c.moved, "wheel edge: \(c.name)")
+        }
+        // C5 — layout/ring bounds. The hover ring reaches `hoverRingReach`
+        // beyond its cell on every side; `gridLeading`/`gridTop`/
+        // `contentWidth`/`contentHeight` reserve exactly that room, so a ring
+        // on any edge cell is never clipped. `ringGridHeight` mirrors
+        // `ContributionHeatmap`'s private `gridHeight`, built only from
+        // `HeatmapLayout`'s public constants.
+        let ringVisibleCols = 6
+        let ringContentWidth = ContributionHeatmap.contentWidth(visibleCols: ringVisibleCols, monthLabelCols: [])
+        let ringContentHeight = HeatmapLayout.gridTop + 7 * HeatmapLayout.step - HeatmapLayout.gap + HeatmapLayout.hoverRingReach
+        struct HeatmapRingCase { let name: String; let col: Int; let row: Int }
+        for c in [
+            HeatmapRingCase(name: "leading column", col: 0, row: 3),
+            HeatmapRingCase(name: "trailing column", col: ringVisibleCols - 1, row: 3),
+            HeatmapRingCase(name: "top row", col: 3, row: 0),
+            HeatmapRingCase(name: "bottom row", col: 3, row: 6),
+        ] {
+            let rect = HeatmapLayout.rect(col: c.col, row: c.row)
+            let reach = HeatmapLayout.hoverRingReach
+            expect(
+                rect.minX - reach >= 0 && rect.maxX + reach <= ringContentWidth
+                    && rect.minY - reach >= 0 && rect.maxY + reach <= ringContentHeight,
+                "ring bounds: \(c.name) fits within the content frame")
+        }
+        // FIX 2: contentWidth gains the trailing margin ONLY when the LAST
+        // renderable column itself has a month label.
+        let ringBaseWidth = ContributionHeatmap.contentWidth(visibleCols: 5, monthLabelCols: [])
         expect(
-            r8HScrolledRelative != r8RelativeBefore,
-            "a genuine horizontal content scroll DOES change the container-relative origin")
+            ContributionHeatmap.contentWidth(visibleCols: 5, monthLabelCols: [(col: 4, label: "Sep")])
+                == ringBaseWidth + HeatmapLayout.lastColumnLabelMargin
+                && ContributionHeatmap.contentWidth(visibleCols: 5, monthLabelCols: [(col: 2, label: "Jul")]) == ringBaseWidth,
+            "a month label on the last renderable column adds the named trailing margin; any other column adds none")
+        // C6 — chart-view integration. Legacy persisted values still decode,
+        // and the cmd-G cycle closes: Bars -> Heatmap -> 3D -> Bars.
         expect(
-            ContributionHeatmap.shouldClearHoverOnOriginChange(old: r8RelativeBefore, new: r8HScrolledRelative),
-            "...and therefore still clears the hover, same as before this round's fix")
-
+            ChartView(raw: "2d") == .bars && ChartView(raw: "3d") == .threeD && ChartView(raw: "heat") == .heatmap
+                && ChartView(raw: "garbage") == .bars
+                && ChartView.bars.next == .heatmap && ChartView.heatmap.next == .threeD
+                && ChartView.threeD.next == .bars && ChartView.bars.next.next.next == .bars,
+            "legacy '2d'/'3d' decode unchanged, 'heat' maps to Heatmap, an unknown value falls back to "
+                + "Bars, and cmd-G cycles Bars -> Heatmap -> 3D -> Bars, three presses returning to start")
         // MARK: - Tray frame aspect (append-only section)
 
         // `anim-parrot` art is 48x36. `loadFrames` used to assign 18x18
@@ -12079,6 +11988,23 @@ enum SelfTest {
                    && Format.money(tokens: 2_100_000, cost: 0.003) == "<$0.01",
                "QH-MONEY tokens with no price get a dash rather than a false total, "
                    + "while a window that genuinely spent nothing still reads $0.00")
+        // FMT-TIER. `compactTokens` picked its unit from the raw value and only
+        // then rounded the mantissa, so a `%.0f` carry out of 999.5 published a
+        // mantissa that had left its own tier: "1000M", "1000K".
+        expect(Format.compactTokens(999_500_000) == "1B"
+                   && Format.compactTokens(999_999_999) == "1B"
+                   && Format.compactTokens(999_500) == "1M"
+                   && Format.compactTokens(999_999) == "1M",
+               "FMT-TIER a mantissa that rounds up to 1000 is promoted to the next "
+                   + "unit rather than printed as \"1000M\" / \"1000K\"")
+        expect(Format.compactTokens(999_499_999) == "999M"
+                   && Format.compactTokens(999_499) == "999K"
+                   && Format.compactTokens(1_000_000_000) == "1B"
+                   && Format.compactTokens(1_234_567) == "1.2M"
+                   && Format.compactTokens(12_345) == "12.3K"
+                   && Format.compactTokens(999) == "999",
+               "FMT-TIER every value outside the two half-unit bands renders exactly "
+                   + "as it did before the promotion was added")
         // QH-REASON. "Not enough history" is a false sentence for three of the
         // states that reach the heatmap tooltip's fallback: their history is
         // sufficient and each fails for its own reason.
@@ -12469,6 +12395,179 @@ enum SelfTest {
         } else {
             expect(false, "QH-CACHE-LIVE the live fixture produces a ratio row")
         }
+
+        // QH-DIST. A reset inside a group makes the two old denominators
+        // disagree with each other and with the truth: the readings return to
+        // zero, so the displacement collapses while the range saturates at the
+        // highest reading. Both call sites now measure the distance travelled.
+        //
+        // Worked from the group behind a card that read 4.2B per 10% where the
+        // volume implied 0.35B: first 0%, last 8%, peak 85%, 93 points actually
+        // consumed. Dividing by 8 rather than 93 is the whole 11.6x.
+        let distResetReadings: [Double] = [0, 40, 85, 0, 3, 8]
+        expect(abs(QuotaHistoryFold.consumed(distResetReadings) - 93) < 1e-9,
+               "QH-DIST a run crossing one reset consumed 93, not the 8 it ended on "
+                   + "nor the 85 it reached")
+        let distSamples = distResetReadings.enumerated().map {
+            QuotaSample(atMs: Int64($0.offset + 1) * 1_000_000, usedPercent: $0.element)
+        }
+        let distMessages = try! JSONDecoder().decode(
+            [WindowMessage].self,
+            from: Data("""
+            [{"timestamp":1500000,"client":"c","providerId":"p",
+              "modelId":"m","input":930,"output":0,"cacheRead":0,"cacheWrite":0,
+              "reasoning":0,"cost":9.3,"isTurnStart":true}]
+            """.utf8))
+        // 930 tokens over 93 points is 10 per point, so per-tenth is 100. The
+        // same fixture under the old displacement of 8 divides by 11.6x less
+        // and reports 11.6x more, which is the defect's whole size.
+        if case let .ratio(distTokens, _, distError) =
+            WindowEquivalence.row(samples: distSamples, messages: distMessages)
+        {
+            expect(distTokens == 100,
+                   "QH-DIST the live path divides by the distance travelled, so the "
+                       + "numerator's two windows meet a denominator that counted both")
+            expect(distError == 1,
+                   "QH-DIST and the quoted error follows the same denominator — "
+                       + "two rises at 0.5 each over 93, not the 6% that 0.5/8 printed")
+        } else {
+            expect(false, "QH-DIST the crossing fixture still produces a ratio row")
+        }
+
+        // QH-RUNS. Each rise `consumed` sums was quantised on its own, so a
+        // group that crossed a reset carries the uncertainty of every rise, not
+        // of one. [0,3,0,3] is two 3-point rises: 6 consumed, but neither rise
+        // clears the single-rise bar and their summed error is ±1 on 6, about
+        // 17% — over tolerance. It must come back insufficient, not as a ratio
+        // quoted at ±8%.
+        expect(QuotaHistoryFold.risingRuns([0, 3, 0, 3]) == 2,
+               "QH-RUNS one decline separates two rises")
+        expect(QuotaHistoryFold.risingRuns([1, 12, 30]) == 1
+                   && QuotaHistoryFold.risingRuns([7]) == 0
+                   && QuotaHistoryFold.risingRuns([]) == 0,
+               "QH-RUNS a monotonic run is one rise; a lone reading has none; nothing is none")
+        let runsSamples = [0.0, 3, 0, 3].enumerated().map {
+            QuotaSample(atMs: Int64($0.offset + 1) * 1_000_000, usedPercent: $0.element)
+        }
+        let runsMessages = try! JSONDecoder().decode(
+            [WindowMessage].self,
+            from: Data("""
+            [{"timestamp":1500000,"client":"c","providerId":"p",
+              "modelId":"m","input":60,"output":0,"cacheRead":0,"cacheWrite":0,
+              "reasoning":0,"cost":0.6,"isTurnStart":true}]
+            """.utf8))
+        if case let .insufficient(runsDelta, runsError) =
+            WindowEquivalence.row(samples: runsSamples, messages: runsMessages)
+        {
+            expect(abs(runsDelta - 6) < 1e-9,
+                   "QH-RUNS the consumption is still the full 6 — the gate scales, the sum does not")
+            expect(runsError == 17,
+                   "QH-RUNS and the error is 0.5 × 2 rises over 6, not 0.5 over 6")
+        } else {
+            expect(false, "QH-RUNS two sub-threshold rises must not be admitted as one measurement")
+        }
+
+        // QH-RUNS-A1. The run count under one rule: a positive delta starts a
+        // run iff no earlier delta was positive or the most recent non-zero
+        // delta was negative; zero deltas are transparent. The first cut
+        // counted declines and charged [0,9,0]'s trailing decline as a rise.
+        for (readings, want) in [([0.0, 9, 0], 1), ([0, 3, 0, 3], 2), ([0, 5, 5, 9], 1),
+                                 ([0, 9, 8, 9], 2), ([1, 12, 30, 55], 1), ([7], 0),
+                                 ([], 0), ([5, 5, 5], 0)] as [([Double], Int)] {
+            expect(QuotaHistoryFold.risingRuns(readings) == want,
+                   "QH-RUNS-A1 risingRuns(\(readings)) == \(want)")
+        }
+        // QH-RUNS-A2. The one statement of the admission rule. `delta > 0`
+        // is what keeps `runs == 0` from turning the threshold into zero.
+        expect(!WindowEquivalence.deltaQualifies(6, runs: 2)
+                   && WindowEquivalence.deltaQualifies(9, runs: 1)
+                   && !WindowEquivalence.deltaQualifies(0, runs: 0)
+                   && WindowEquivalence.deltaQualifies(93, runs: 2)
+                   && !WindowEquivalence.deltaQualifies(4.9, runs: 1),
+               "QH-RUNS-A2 deltaQualifies clears the bar once per rise and never at zero")
+        // QH-RUNS-A3. A trailing decline is not a rise: [0,9,0] is one
+        // 9-point measurement, admitted at threshold 5 with error 0.5/9.
+        let trailSamples = [0.0, 9, 0].enumerated().map {
+            QuotaSample(atMs: Int64($0.offset + 1) * 1_000_000, usedPercent: $0.element)
+        }
+        let trailMessages = try! JSONDecoder().decode(
+            [WindowMessage].self,
+            from: Data("""
+            [{"timestamp":1500000,"client":"c","providerId":"p",
+              "modelId":"m","input":90,"output":0,"cacheRead":0,"cacheWrite":0,
+              "reasoning":0,"cost":0.9,"isTurnStart":true}]
+            """.utf8))
+        if case let .ratio(trailTokens, _, trailError) =
+            WindowEquivalence.row(samples: trailSamples, messages: trailMessages)
+        {
+            expect(trailTokens == 100, "QH-RUNS-A3 90 tokens over one 9-point rise is 100 per tenth")
+            expect(trailError == 6, "QH-RUNS-A3 and its error is 0.5 over 9, one rise not two")
+        } else {
+            expect(false, "QH-RUNS-A3 a single rise followed by a decline is still admitted")
+        }
+        // QH-RUNS-A4. The same rule at the pooled site. A merged [0,3,0,3]
+        // cycle carries delta 6 over 2 rises; beside two clean qualifying
+        // cycles it must NOT be admitted, so the pool sees two, not three.
+        let mergedCycle = QuotaHistoryFold.cycles(points: [0.0, 3, 0, 3].enumerated().map {
+            heatPoint(1_767_600_000 + Int64($0.offset) * 3_600, $0.element, reset: monReset)
+        }).first!
+        expect(abs(mergedCycle.usedPercent - 6) < 1e-9 && mergedCycle.risingRuns == 2,
+               "QH-RUNS-A4 the merged cycle carries both its consumption and its run count")
+        let poolRow = WindowEquivalence.aggregate(cycles: [
+            WindowEquivalence.Cycle(deltaPercent: 50, spanTokens: 5_000, spanCost: 5,
+                                    observedFraction: 1, risingRuns: 1),
+            WindowEquivalence.Cycle(deltaPercent: 40, spanTokens: 4_000, spanCost: 4,
+                                    observedFraction: 1, risingRuns: 1),
+            WindowEquivalence.Cycle(deltaPercent: mergedCycle.usedPercent, spanTokens: 600,
+                                    spanCost: 0.6, observedFraction: 1,
+                                    risingRuns: mergedCycle.risingRuns),
+        ])
+        if case let .tooFewCycles(poolCount, poolNeeded) = poolRow {
+            expect(poolCount == 2 && poolNeeded == 3,
+                   "QH-RUNS-A4 the pool admits the two clean cycles and rejects the merged one")
+        } else {
+            expect(false, "QH-RUNS-A4 the merged cycle must not make a third admitted cycle")
+        }
+        // QH-RUNS-A9. The insufficient row's error sums half-steps over every
+        // rise in every cycle offered — not over admitted cycles, which are
+        // empty by construction in that branch, and not per cycle.
+        if case let .insufficient(insDelta, insError) = WindowEquivalence.aggregate(cycles: [
+            WindowEquivalence.Cycle(deltaPercent: 2, spanTokens: 100, spanCost: 0.1,
+                                    observedFraction: 1, risingRuns: 1),
+            WindowEquivalence.Cycle(deltaPercent: 3, spanTokens: 100, spanCost: 0.1,
+                                    observedFraction: 1, risingRuns: 2),
+        ]) {
+            expect(abs(insDelta - 5) < 1e-9 && insError == 30,
+                   "QH-RUNS-A9 three rises at 0.5 over 5 points is 30%, not 20% per-cycle nor 0% over admitted")
+        } else {
+            expect(false, "QH-RUNS-A9 two sub-threshold cycles produce the insufficient row")
+        }
+        // The pooled site, same readings, same answer.
+        let distCycles = QuotaHistoryFold.cycles(points: distResetReadings.enumerated().map {
+            heatPoint(1_767_600_000 + Int64($0.offset) * 3_600, $0.element, reset: monReset)
+        })
+        expect(distCycles.first.map { abs($0.usedPercent - 93) < 1e-9 } == true,
+               "QH-DIST the pooled site agrees with the live one, which is the point "
+                   + "of stating the rule once")
+        expect(distCycles.first.map { abs($0.peakUsedPercent - 85) < 1e-9 } == true,
+               "QH-DIST and the peak is untouched — still the highest reading")
+        // Two resets accumulate rather than saturating. Asserting past 100 is
+        // the deliberate outcome: a group holding three windows consumed three
+        // windows' worth of one allowance.
+        expect(abs(QuotaHistoryFold.consumed([0, 60, 99, 0, 50, 99, 0, 20]) - 218) < 1e-9,
+               "QH-DIST consumption accumulates across every reset in the group and "
+                   + "may exceed 100, where the range would have saturated at 99")
+        // The no-op that guards the regression. Compared against the old
+        // expressions computed here rather than against literals, so what is
+        // asserted is the equality itself.
+        let distRising: [Double] = [1, 12, 30, 55, 88, 99]
+        expect(abs(QuotaHistoryFold.consumed(distRising)
+                   - ((distRising.max() ?? 0) - (distRising.min() ?? 0))) < 1e-9,
+               "QH-DIST on readings that only rise the distance equals the old range")
+        expect(abs(QuotaHistoryFold.consumed(distRising)
+                   - ((distRising.last ?? 0) - (distRising.first ?? 0))) < 1e-9,
+               "QH-DIST and equals the old displacement, so every clean cycle is "
+                   + "left exactly where it was")
 
         // QH-B. Exhaustion is an absolute reading, not the observed span. A
         // cycle first seen at 40% and last at 100% consumed 60 points as far as
@@ -13301,8 +13400,15 @@ enum SelfTest {
         expect(Set(LimitsLayout.allCases.map(\.rawValue)) == ["full", "classic", "chart"],
                "LL2 three layouts are offered, and Settings enumerates allCases")
 
+        // Stated in behaviour rather than by reading the constant, because the
+        // constant is no longer reachable from this target: `minimumDelta` is
+        // internal to `TokenBarCore` so the admission comparison cannot be
+        // written outside `deltaQualifies`. Bracketing the boundary is also a
+        // stronger claim than the equality it replaces — it says where the bar
+        // is AND that it admits at it, which an `== 5` on the constant did not.
         expect(
-            WindowEquivalence.minimumDelta == 5,
+            !WindowEquivalence.deltaQualifies(4.999, runs: 1)
+                && WindowEquivalence.deltaQualifies(5, runs: 1),
             "V15 the threshold follows from the tolerance, not from a chosen number")
 
         // Every row string is rendered, not just constructed. A literal `%` in
@@ -14415,6 +14521,239 @@ enum SelfTest {
         expect(OverviewCard.visible(hiddenRaw: "chart", orderRaw: "streaks,chart").first == .streaks
                 && OverviewCard.visible(hiddenRaw: "chart", orderRaw: "streaks,chart").contains(.chart),
                "CO8 the Overview anchor survives a tampered hidden set at its dragged position")
+
+        // QH-RUNS-A5. The dashboard's qualifying-window filter applies the same
+        // rule as the pooled aggregate and the live row. Three completed
+        // cycles, the third a merged [0,3,0,3]: it carries 6 points over two
+        // rises, which clears a single-rise bar and fails a two-rise one. With
+        // it rejected the window has two admitted cycles, not three, and
+        // `rebuildQuotaEquivalences` builds no row for it at all — not a
+        // `.tooFewCycles` row, no key. Drop the run factor from
+        // `deltaQualifies` and the key appears.
+        func runsCurve(cycles: [[Double]]) -> QuotaCurve {
+            var points: [String] = []
+            var oldest = Int64.max, newest = Int64.min
+            for (index, readings) in cycles.enumerated() {
+                let reset = m3fNow - Int64(cycles.count - index) * 18_000
+                // Spread from 17,000s before reset towards 1,000s before, so
+                // every cycle's observed fraction is about 16,000 / 18,000.
+                // Integer division means a 4-reading cycle ends a second or two
+                // short of -1,000, so coverage is derived from the points
+                // actually emitted — the decoder rejects a coverage block that
+                // does not match them.
+                let step = readings.count > 1 ? 16_000 / (readings.count - 1) : 0
+                for (slot, pct) in readings.enumerated() {
+                    let at = reset - 17_000 + Int64(slot * step)
+                    oldest = min(oldest, at); newest = max(newest, at)
+                    points.append("""
+                        {"sampledAt":\(at),"usedPercent":\(pct),
+                         "resetAt":\(reset),"durationSeconds":18000,
+                         "durationSource":"provider","origin":"liveV3",
+                         "isActiveGroup":false}
+                        """)
+                }
+            }
+            let json = """
+                {"points":[\(points.joined(separator: ","))],
+                 "coverage":{"oldestSampledAt":\(oldest),
+                             "newestSampledAt":\(newest),
+                             "sampleCount":\(points.count)},
+                 "activeResetAt":null,"generation":11}
+                """
+            return try! JSONDecoder().decode(QuotaCurve.self, from: Data(json.utf8))
+        }
+        let runsA5Keys: [String]? = awaitMainActorValue {
+            let src = WindowScanCountingSource(payload: m3fPayload)
+            src.curveByAccount = [
+                nil: runsCurve(cycles: [[0, 40], [0, 45], [0, 3, 0, 3]]),
+                m3ExtraKey: runsCurve(cycles: [[0, 20], [0, 25], [0, 30]]),
+            ]
+            let m = DashboardModel(source: src, initialYear: nil)
+            m.windowCardClients = ["claude"]
+            let poll = Task { await m.pollAgentUsage() }
+            var spins = 0
+            while !m.agentUsageAttempted, spins < 2_000 {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+                spins += 1
+            }
+            poll.cancel()
+            _ = await poll.value
+            m.windowUsageClient = nil
+            m.quotaLensAllAgents = true
+            await m.refreshWindowUsage()
+            return Array(m.quotaEquivalences.keys).sorted()
+        }
+        expect(runsA5Keys?.contains("claude|session.v1") == false,
+               "QH-RUNS-A5 a window whose third cycle is a merged two-rise 6 does not "
+                   + "qualify at the dashboard filter, so no equivalence row is built for it")
+        expect(runsA5Keys?.contains("claude|\(m3ExtraKey)|session.v1") == true,
+               "QH-RUNS-A5 and the control window with three clean cycles does qualify, "
+                   + "so the absence above is the filter and not a broken fixture")
+
+        // M3-q. The defect issue #258 reports, at the layer this side owns:
+        // every account's equivalence row folding one shared scan.
+        //
+        // Asserted on WHICH accounts were scanned, not on how many. A count
+        // alone passes when the model issues two scans for the primary and none
+        // for the extra account, which is the shape a wrong selector produces.
+        // Point `unionScan(for:)` at `Self.cardAccountKey` and this goes red.
+        func m3qCurve(accountUsed: [Double]) -> QuotaCurve {
+            // Three completed cycles, each moving more than `minimumDelta` and
+            // sampled across most of the window, so all three are admitted.
+            var points: [String] = []
+            for (index, used) in accountUsed.enumerated() {
+                let reset = m3fNow - Int64(3 - index) * 18_000
+                for (offset, pct) in [(-17_000, 0.0), (-1_000, used)] {
+                    points.append("""
+                        {"sampledAt":\(reset + Int64(offset)),"usedPercent":\(pct),
+                         "resetAt":\(reset),"durationSeconds":18000,
+                         "durationSource":"provider","origin":"liveV3",
+                         "isActiveGroup":false}
+                        """)
+                }
+            }
+            let json = """
+                {"points":[\(points.joined(separator: ","))],
+                 "coverage":{"oldestSampledAt":\(m3fNow - 71_000),
+                             "newestSampledAt":\(m3fNow - 19_000),
+                             "sampleCount":\(points.count)},
+                 "activeResetAt":null,"generation":11}
+                """
+            return try! JSONDecoder().decode(QuotaCurve.self, from: Data(json.utf8))
+        }
+        let m3qAccounts: [String?]? = awaitMainActorValue {
+            let src = WindowScanCountingSource(payload: m3fPayload)
+            src.curveByAccount = [
+                nil: m3qCurve(accountUsed: [40, 45, 50]),
+                m3ExtraKey: m3qCurve(accountUsed: [20, 25, 30]),
+            ]
+            let m = DashboardModel(source: src, initialYear: nil)
+            m.windowCardClients = ["claude"]
+            let poll = Task { await m.pollAgentUsage() }
+            var spins = 0
+            while !m.agentUsageAttempted, spins < 2_000 {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+                spins += 1
+            }
+            poll.cancel()
+            _ = await poll.value
+            // The all-agent lens: no card on screen, only the estimates.
+            m.windowUsageClient = nil
+            m.quotaLensAllAgents = true
+            src.scans = 0
+            src.scannedAccounts = []
+            await m.refreshWindowUsage()
+            return src.scannedAccounts
+        }
+        // The same run again, this time serving each account a DIFFERENT set of
+        // rows, so the estimate itself has to differ. `m3qAccounts` above
+        // observes which scans were issued; only this observes which one each
+        // row read, and a selector that issued two scans and then folded the
+        // primary's into both rows would pass the first and fail here.
+        func m3qMessage(atSecs: Int64, cost: Double) -> WindowMessage {
+            try! JSONDecoder().decode(WindowMessage.self, from: Data("""
+            {"timestamp":\(atSecs * 1000),"client":"claude",
+             "providerId":"anthropic","modelId":"claude-opus-5",
+             "input":\(Int(cost * 1_000_000)),"output":0,"cacheRead":0,
+             "cacheWrite":0,"reasoning":0,"cost":\(cost),"isTurnStart":true}
+            """.utf8))
+        }
+        // The fold attributes through the user's declarations, and an
+        // undeclared row is `.unassigned` — which would leave both accounts
+        // reporting "none of it recorded here" and make the comparison below
+        // vacuous. Installed and restored around the block, the same way the
+        // attribution card's case above does it.
+        let m3qSavedAttribution = UserDefaults.standard.object(
+            forKey: UsageAttribution.confirmedKey)
+        UserDefaults.standard.set(
+            UsageAttribution.confirmedRaw(
+                updating: nil,
+                record: UsageAttribution.Record(
+                    client: "claude", provider: "anthropic", model: nil,
+                    state: .assigned("claude"))),
+            forKey: UsageAttribution.confirmedKey)
+        defer {
+            UserDefaults.standard.set(
+                m3qSavedAttribution, forKey: UsageAttribution.confirmedKey)
+        }
+        func m3qRowsFor(cost: Double) -> [WindowMessage] {
+            [63_000, 45_000, 27_000].map { m3qMessage(atSecs: m3fNow - $0, cost: cost) }
+        }
+        let m3qPrimaryRows = m3qRowsFor(cost: 100)
+        let m3qExtraRows = m3qRowsFor(cost: 1)
+        let m3qRows: [String: WindowEquivalence.Row]? = awaitMainActorValue {
+            let src = WindowScanCountingSource(payload: m3fPayload)
+            // The SAME quota movement for both accounts, deliberately. The
+            // denominators being equal leaves the rows differing only by which
+            // scan each one folded, which is the property under test; two
+            // different curves would also produce two different rows and prove
+            // nothing about the scan.
+            src.curveByAccount = [
+                nil: m3qCurve(accountUsed: [40, 45, 50]),
+                m3ExtraKey: m3qCurve(accountUsed: [40, 45, 50]),
+            ]
+            // One row inside EVERY admitted cycle's observed span, because an
+            // estimate is a fold across all of them and a cycle with no usage
+            // reports as unaccounted rather than as a number.
+            //
+            // Two orders of magnitude apart between the accounts, so no
+            // rounding can make the two rows agree by accident.
+            src.messagesByAccount = [
+                "": m3qPrimaryRows,
+                m3ExtraKey: m3qExtraRows,
+            ]
+            let m = DashboardModel(source: src, initialYear: nil)
+            m.windowCardClients = ["claude"]
+            let poll = Task { await m.pollAgentUsage() }
+            var spins = 0
+            while !m.agentUsageAttempted, spins < 2_000 {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+                spins += 1
+            }
+            poll.cancel()
+            _ = await poll.value
+            m.windowUsageClient = nil
+            m.quotaLensAllAgents = true
+            await m.refreshWindowUsage()
+            return m.quotaEquivalences
+        }
+        func m3qCost(_ row: WindowEquivalence.Row?) -> Double? {
+            switch row {
+            case let .ratio(_, cost, _): return cost
+            case let .costOnly(cost, _): return cost
+            default: return nil
+            }
+        }
+        let m3qPrimaryRow = m3qRows?["claude|session.v1"]
+        let m3qExtraRow = m3qRows?["claude|\(m3ExtraKey)|session.v1"]
+        expect(
+            m3qCost(m3qPrimaryRow) != nil && m3qCost(m3qExtraRow) != nil,
+            "M3-q both accounts produce a priced estimate, so the comparison "
+                + "below is between two real numbers rather than a nil and a "
+                + "number, which would pass while measuring nothing")
+        // The RATIO, not two pinned floats. The fixture serves the primary
+        // rows costing 100x the extra account's, so a hundredfold gap is the
+        // property; the absolute figures are an artefact of the delta values
+        // and would have to be re-pinned every time the fixture moved.
+        let m3qRatio = zip([m3qCost(m3qPrimaryRow)], [m3qCost(m3qExtraRow)])
+            .compactMap { primary, extra -> Double? in
+                guard let primary, let extra, extra > 0 else { return nil }
+                return primary / extra
+            }
+            .first
+        expect(
+            (m3qRatio.map { abs($0 - 100) < 0.001 }) == true,
+            "M3-q each account's estimate is built from its OWN account's rows; "
+                + "reading one shared scan gives both accounts the same "
+                + "numerator, which is what issue #258 reports")
+        expect(
+            Set((m3qAccounts ?? []).map { $0 ?? "" }) == Set(["", m3ExtraKey]),
+            "M3-q each account's equivalence reads a scan of its OWN transcripts; "
+                + "one shared scan divides every account's usage by each account's "
+                + "own quota movement")
+        expect(
+            (m3qAccounts ?? []).count == 2,
+            "M3-q the two accounts are scanned once each, not once per window")
 
         if failures > 0 {
             print("\(failures) selftest check(s) failed")

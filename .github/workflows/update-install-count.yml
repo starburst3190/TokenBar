@@ -24,11 +24,17 @@ jobs:
       # from scratch and force-pushed every run, so it always holds exactly one
       # commit. Shields reads it via the raw URL for the `badges` ref.
       - name: Compute and publish download count
+        # Explicit bash: ubuntu-latest's default is `bash -e` without pipefail,
+        # which would let awk publish 0 or a partial total after `gh api` fails.
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          COUNT=$(gh api repos/Nanako0129/TokenBar/releases \
-            --jq '[.[].assets[] | select(.name | test("\\.(tar\\.gz|dmg|zip|pkg)$")) | .download_count] | add // 0')
+          # Paginate: GitHub's default page is 30 releases. Sum outside jq so a
+          # per-page `--jq` cannot emit multiple numbers into the badge JSON.
+          COUNT=$(gh api --paginate repos/Nanako0129/TokenBar/releases \
+            --jq '[.[].assets[] | select(.name | test("\\.(tar\\.gz|dmg|zip|pkg)$")) | .download_count] | add // 0' \
+            | awk '{s+=$1} END {print s+0}')
           JSON="{\"schemaVersion\":1,\"label\":\"installs\",\"message\":\"${COUNT}\",\"color\":\"brightgreen\"}"
 
           # Build the orphan branch in an isolated repo so the workspace tree is
