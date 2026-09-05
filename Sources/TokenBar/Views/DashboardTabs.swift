@@ -101,13 +101,14 @@ struct DashboardTabs: View {
                 if kbdHints && index <= 9 {
                     Text("⌘\(index)")
                         .font(.system(size: 8, weight: .semibold).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .padding(.horizontal, 3)
                         .padding(.vertical, 1)
                         .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
                 }
             }
-            .foregroundStyle(active == id ? .primary : .secondary)
+            .foregroundStyle(
+                active == id ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondaryAdaptive))
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(

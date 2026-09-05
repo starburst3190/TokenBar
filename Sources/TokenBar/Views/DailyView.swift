@@ -123,13 +123,13 @@ struct DailyView: View {
                 Text((rows.count == 1 ? "%lld active day" : "%lld active days")
                     .localized(rows.count))
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
         ) {
             if rows.isEmpty {
                 Text("No usage in this range")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 VStack(spacing: 2) {
                     ForEach(rows, id: \.date) { row in
@@ -171,7 +171,7 @@ struct DailyView: View {
                     Spacer()
                     Text(Format.compactTokens(row.tokens))
                         .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     Text(Format.usd(row.cost))
                         .font(.caption.monospacedDigit())
                         .frame(minWidth: 56, alignment: .trailing)
@@ -204,7 +204,7 @@ struct DailyView: View {
                             Spacer()
                             Text(Format.compactTokens(slice.tokens))
                                 .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.secondaryAdaptive)
                             Text(Format.usd(slice.cost))
                                 .font(.caption2.monospacedDigit())
                                 .frame(minWidth: 50, alignment: .trailing)

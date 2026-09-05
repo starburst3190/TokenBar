@@ -196,7 +196,7 @@ struct UsageChartCard: View {
                         Text(item.label).lineLimit(1)
                     }
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                 }
                 if hidden > 0 {
                     Text("+\(hidden)")
@@ -439,7 +439,7 @@ private struct ScrollingBarChart: View {
                 Text(Format.usd(bar.totalCost))
             }
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
             ForEach(
                 bar.segments.sorted { $0.tokens > $1.tokens }.prefix(6), id: \.key
             ) { segment in
@@ -448,7 +448,7 @@ private struct ScrollingBarChart: View {
                     Text(segment.label).lineLimit(1)
                     Spacer()
                     Text("\(Format.compactTokens(segment.tokens)) · \(Format.usd(segment.cost))")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
                 .font(.caption2)
             }

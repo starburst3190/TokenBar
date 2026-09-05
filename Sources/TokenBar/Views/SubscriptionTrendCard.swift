@@ -99,11 +99,11 @@ struct SubscriptionTrendCard: View {
                         ? "Usage recorded, but none of it is priced."
                         : "Usage recorded, but it carries no token counts.").localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary))
+                    .foregroundStyle(.secondaryAdaptive))
             case .noUsage:
                 placeholder(Text("No usage recorded in this range.".localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary))
+                    .foregroundStyle(.secondaryAdaptive))
             case .loading:
                 placeholder(LoadingLine(title: "Reading daily usage…"))
             }
@@ -240,7 +240,7 @@ struct SubscriptionTrendCard: View {
                 if day.isEmpty {
                     Text("No usage this day")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 } else {
                     // Largest first, matching the legend and `UsageChartCard`'s
                     // tooltip. Note the stack itself is largest-at-the-bottom,
@@ -260,7 +260,7 @@ struct SubscriptionTrendCard: View {
                                         tokens: bucket.tokens, cost: bucket.cost)
                                      : Format.tokens(
                                         tokens: bucket.tokens, cost: bucket.cost))
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.secondaryAdaptive)
                             }
                             .font(.caption2)
                         }
@@ -305,7 +305,7 @@ struct SubscriptionTrendCard: View {
             Text(verbatim: trend.days.last.map { Format.monthDay($0.date) } ?? "")
         }
         .font(.caption2)
-        .foregroundStyle(.tertiary)
+        .foregroundStyle(.tertiaryAdaptive)
     }
 
     private func legend(_ trend: SubscriptionTrend) -> some View {
@@ -322,12 +322,12 @@ struct SubscriptionTrendCard: View {
             // subscription draws a band no legend entry accounts for.
             if ordered(trend).count > 4 {
                 Text(verbatim: "+\(ordered(trend).count - 4)")
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
             Spacer()
         }
         .font(.caption2)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.secondaryAdaptive)
         .lineLimit(1)
     }
 
@@ -343,7 +343,7 @@ struct SubscriptionTrendCard: View {
         if trend.targets == [SubscriptionTrendFold.unassignedTarget] {
             Text("Nothing is classified yet. Settings › Usage attribution splits this by subscription.")
                 .font(.system(size: 9))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }

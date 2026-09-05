@@ -490,7 +490,7 @@ struct PopoverView: View {
             } label: {
                 Text((model.year ?? "All").localized)
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.visible)
@@ -510,7 +510,7 @@ struct PopoverView: View {
                     .font(.caption.weight(.semibold))
                 Text("Switch to the TokenBar 1.0 release — keeps your data")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             Spacer()
             Button("Switch") { BridgeBuild.switchToRelease() }
@@ -521,7 +521,7 @@ struct PopoverView: View {
             } label: {
                 Image(systemName: "xmark")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             .buttonStyle(.plain)
             .help("Dismiss")
@@ -559,7 +559,7 @@ struct PopoverView: View {
                     // where the data is stale and nothing is running to fix it.
                     // Tinting the existing glyph says so without adding a
                     // control; the age itself is in the tooltip.
-                    .foregroundStyle(showingStaleRestore ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                    .foregroundStyle(showingStaleRestore ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondaryAdaptive))
                     .frame(width: 16, height: 16)
             }
         }
@@ -614,7 +614,7 @@ struct PopoverView: View {
             activityLED
             Text(tokensPerMin.map { "\(Format.compactTokens(Int64($0.rounded()))) tok/min" } ?? "— tok/min")
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
         }
     }
 
@@ -652,12 +652,12 @@ struct PopoverView: View {
                 ProgressView()
                     .controlSize(.small)
                 Text("Loading usage…")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             .frame(maxWidth: .infinity, minHeight: 120)
         case let .failed(message):
             Label(message, systemImage: "exclamationmark.triangle")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .frame(maxWidth: .infinity, minHeight: 120)
         case .ready:
             lens

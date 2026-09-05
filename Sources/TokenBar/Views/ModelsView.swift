@@ -51,7 +51,7 @@ struct ModelsView: View {
                         .localized(
                             rows.count, Format.compactTokens(totalTokens),
                             Format.usd(totalCost)))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     if let updatedAt = report?.pricingUpdatedAt {
                         Text("Prices updated %@".localized(Format.relativeTime(updatedAt)))
                             .foregroundStyle(.tertiaryAdaptive)
@@ -68,7 +68,7 @@ struct ModelsView: View {
             } else if rows.isEmpty {
                 Text("No model usage in this range")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 VStack(spacing: 10) {
                     ForEach(rows, id: \.rowID) { entry in
@@ -130,7 +130,7 @@ struct ModelsView: View {
                         (Text(kind.label.localized + " ").foregroundStyle(.tertiaryAdaptive)
                             + Text(Format.compactTokens(kind.pick(entry))))
                             .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                     }
                 }
             }

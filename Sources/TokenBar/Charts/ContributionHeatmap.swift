@@ -443,7 +443,7 @@ struct ContributionHeatmap: View {
             Canvas { context, _ in
                 for (col, label) in state.monthLabelCols {
                     context.draw(
-                        Text(label).font(.caption2).foregroundStyle(.secondary),
+                        Text(label).font(.caption2).foregroundStyle(.secondaryAdaptive),
                         at: CGPoint(
                             x: HeatmapLayout.gridLeading + CGFloat(col) * HeatmapLayout.step,
                             y: HeatmapLayout.monthLabelHeight / 2),
@@ -591,10 +591,10 @@ struct ContributionHeatmap: View {
             Text(Format.monthDay(cell.date)).font(.caption.weight(.semibold))
             Text("%@ tokens".localized(Format.exactTokens(cell.tokens)))
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             Text(Format.usd(cell.cost))
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
         }
         .padding(8)
         .frame(width: Self.tooltipWidth, alignment: .leading)

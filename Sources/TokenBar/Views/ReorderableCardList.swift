@@ -59,7 +59,9 @@ struct ReorderableCardList: View {
         HStack(spacing: 8) {
             Text("⠿")
                 .font(.caption)
-                .foregroundStyle(dragId == item.id ? .primary : .tertiary)
+                .foregroundStyle(
+                    dragId == item.id
+                        ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiaryAdaptive))
                 .help("Drag to reorder")
                 .gesture(dragGesture(id: item.id))
 
@@ -69,7 +71,7 @@ struct ReorderableCardList: View {
             if !item.canHide {
                 Text("(always shown)")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
 
             Spacer()

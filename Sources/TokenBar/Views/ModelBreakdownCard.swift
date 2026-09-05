@@ -56,7 +56,7 @@ struct ModelBreakdownCard: View {
                 VStack(alignment: .trailing, spacing: 1) {
                     Text((rows.count == 1 ? "%lld model · %@" : "%lld models · %@")
                         .localized(rows.count, Format.usd(totalCost)))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     if let updatedAt = report?.pricingUpdatedAt {
                         Text("Prices updated %@".localized(Format.relativeTime(updatedAt)))
                             .foregroundStyle(.tertiaryAdaptive)
@@ -73,7 +73,7 @@ struct ModelBreakdownCard: View {
             } else if rows.isEmpty {
                 Text("No model usage in this range")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 legend
                 VStack(spacing: 8) {
@@ -94,7 +94,7 @@ struct ModelBreakdownCard: View {
                     }
                     .buttonStyle(.plain)
                     .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                 }
             }
         }
@@ -110,7 +110,7 @@ struct ModelBreakdownCard: View {
                     Text(kind.label.localized)
                 }
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             }
         }
     }
@@ -295,14 +295,14 @@ struct ModelUsageTooltip: View {
             }
             Text([context, provider].compactMap { $0 }.joined(separator: " · "))
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             HStack {
                 Text("%@ tokens".localized(Format.compactTokens(total)))
                 Spacer()
                 Text(Format.usd(cost))
             }
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
             if let costRatio {
                 // Named in multiples rather than "wrong": the app cannot know
                 // the client's real rate, only that this is far off any price
@@ -320,7 +320,7 @@ struct ModelUsageTooltip: View {
                     Text(kind.label.localized)
                     Spacer()
                     Text("\(Format.compactTokens(kind.value)) · \(Int((Double(kind.value) / Double(max(1, total)) * 100).rounded()))%")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
                 .font(.caption2)
             }

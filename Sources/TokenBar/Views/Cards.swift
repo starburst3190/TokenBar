@@ -270,7 +270,7 @@ struct DashCard<Content: View>: View {
                     if let subtitle {
                         Text(subtitle.localized)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                     }
                 }
                 Spacer()
@@ -297,7 +297,7 @@ struct LoadingLine: View {
                 .frame(width: 14, height: 14)
             Text(title.localized)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
         }
     }
 }
@@ -327,7 +327,7 @@ struct TokenUsageRow: View {
                 .font(.system(size: 15, weight: .semibold).monospacedDigit())
             Text(label.localized)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             Text(sub)
                 .font(.caption2)
                 .foregroundStyle(.tertiaryAdaptive)
@@ -353,10 +353,10 @@ struct StreaksCard: View {
     private func item(_ days: Int, _ label: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             (Text("\(days)").font(.system(size: 17, weight: .semibold).monospacedDigit())
-                + Text(" days").font(.caption).foregroundStyle(.secondary))
+                + Text(" days").font(.caption).foregroundStyle(.secondaryAdaptive))
             Text(label.localized)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -393,7 +393,8 @@ struct SegmentedPicker<Value: Hashable>: View {
                         .lineLimit(1)
                         .fixedSize()
                         .font(.caption2.weight(on ? .semibold : .regular))
-                        .foregroundStyle(on ? .primary : .secondary)
+                        .foregroundStyle(
+                            on ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondaryAdaptive))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(

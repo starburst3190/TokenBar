@@ -22,7 +22,7 @@ struct AgentsView: View {
                 Text((rows.count == 1 ? "%lld agent · %@" : "%lld agents · %@")
                     .localized(rows.count, Format.usd(totalCost)))
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
         ) {
             if report == nil {
@@ -30,7 +30,7 @@ struct AgentsView: View {
             } else if rows.isEmpty {
                 Text("No agent activity in this range")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 VStack(spacing: 10) {
                     ForEach(rows, id: \.agent) { entry in
@@ -74,7 +74,7 @@ struct AgentsView: View {
                     .help(sources)
                 Spacer()
                 Text("%@ msgs".localized(entry.messages.formatted()) + " · \(Format.compactTokens(entry.total)) · \(Format.usd(entry.cost))")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .layoutPriority(1)
             }
             .font(.caption2)

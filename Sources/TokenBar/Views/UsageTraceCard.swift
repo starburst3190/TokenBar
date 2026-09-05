@@ -63,7 +63,7 @@ struct UsageTraceCard: View {
                     .font(.caption2.weight(.semibold))
                 Text(bucket.agent)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                 Text(bucket.model)
                     .font(.caption2)
                     .foregroundStyle(.tertiaryAdaptive)
@@ -71,7 +71,7 @@ struct UsageTraceCard: View {
                 Spacer()
                 Text("\(Format.compactTokens(Int64(bucket.tokensPerMin.rounded())))/m")
                     .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
