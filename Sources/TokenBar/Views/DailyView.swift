@@ -132,13 +132,13 @@ struct DailyView: View {
                 Text((rows.count == 1 ? "%lld active day" : "%lld active days")
                     .localized(rows.count))
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
         ) {
             if rows.isEmpty {
                 Text("No usage in this range")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 VStack(spacing: 2) {
                     ForEach(rows, id: \.date) { row in
@@ -163,22 +163,22 @@ struct DailyView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                         .rotationEffect(.degrees(isOpen ? 90 : 0))
                     Text(Format.monthDay(row.date))
                         .font(.caption)
                     Text("%@ msgs".localized(row.messages.formatted()))
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                     if let turns = row.turns {
                         Text("%@ turns".localized(turns.formatted()))
                             .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                     }
                     Spacer()
                     Text(Format.compactTokens(row.tokens))
                         .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     Text(Format.usd(row.cost))
                         .font(.caption.monospacedDigit())
                         .frame(minWidth: 56, alignment: .trailing)
@@ -211,7 +211,7 @@ struct DailyView: View {
                             Spacer()
                             Text(Format.compactTokens(slice.tokens))
                                 .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.secondaryAdaptive)
                             Text(Format.usd(slice.cost))
                                 .font(.caption2.monospacedDigit())
                                 .frame(minWidth: 50, alignment: .trailing)

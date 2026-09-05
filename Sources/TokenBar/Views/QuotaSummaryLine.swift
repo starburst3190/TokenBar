@@ -51,15 +51,15 @@ struct QuotaSummaryLine: View {
                 if let burning = summary.burning {
                     burnRow(burning)
                 } else if summary.otherWindows > 0, summary.paceCheckedWindows > 0 {
-                    row(label: "Pace", tint: .secondary) {
+                    row(label: "Pace", tint: .secondaryAdaptive) {
                         Text("Every measured window is under its expected pace")
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 if let today {
-                    row(label: "Today", tint: .secondary) {
+                    row(label: "Today", tint: .secondaryAdaptive) {
                         // `money`, not `usdOrBelowCent`: the latter handles
                         // only the sub-cent half. A day of entirely unpriced
                         // models sums to exactly zero, so "5.2K tokens · $0.00"
@@ -73,7 +73,7 @@ struct QuotaSummaryLine: View {
             } else if attempted {
                 Text("No subscription is reporting a usage window right now.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 LoadingLine(title: "Checking agent limits…")
             }
@@ -92,8 +92,8 @@ struct QuotaSummaryLine: View {
     /// short fragments keeps every one of them under a line, which is a layout
     /// the width cannot break rather than a plea that it will not.
     @ViewBuilder
-    private func row(
-        label: String, tint: HierarchicalShapeStyle, @ViewBuilder value: () -> some View
+    private func row<Tint: ShapeStyle>(
+        label: String, tint: Tint, @ViewBuilder value: () -> some View
     ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(label.localized)
@@ -131,7 +131,7 @@ struct QuotaSummaryLine: View {
         // Reset text comes from the same helper the quota cards use, so the
         // countdown here cannot drift from the one shown next to the bar.
         let reset = summary.resetsAt.flatMap { UsagePace.resetText(for: $0) }
-        return row(label: "Tightest", tint: .secondary) {
+        return row(label: "Tightest", tint: .secondaryAdaptive) {
             Text(verbatim: "\(name) · \(summary.tightestLabel.localized)")
                 .font(.system(size: 13, weight: .semibold))
                 .lineLimit(1)
@@ -141,11 +141,11 @@ struct QuotaSummaryLine: View {
                 reset,
             ].compactMap(\.self).joined(separator: " · "))
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             if summary.otherWindows > 0 {
                 Text(othersText(summary))
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
         }
     }
@@ -170,7 +170,7 @@ struct QuotaSummaryLine: View {
     private func burnRow(_ burning: BurnWarning) -> some View {
         let name = Self.burnName(burning)
         let tail = [burning.riskText, burning.etaText].compactMap(\.self).first
-        return row(label: "Burning fastest", tint: .secondary) {
+        return row(label: "Burning fastest", tint: .secondaryAdaptive) {
             Text(verbatim: "\(name) · \(burning.label.localized)")
                 .font(.caption.weight(.medium))
                 .lineLimit(1)

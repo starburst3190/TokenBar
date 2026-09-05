@@ -51,10 +51,10 @@ struct ModelsView: View {
                         .localized(
                             rows.count, Format.compactTokens(totalTokens),
                             Format.usd(totalCost)))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     if let updatedAt = report?.pricingUpdatedAt {
                         Text("Prices updated %@".localized(Format.relativeTime(updatedAt)))
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                             .help("LiteLLM pricing data; refreshes automatically about once an hour")
                     }
                 }
@@ -68,7 +68,7 @@ struct ModelsView: View {
             } else if rows.isEmpty {
                 Text("No model usage in this range")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 VStack(spacing: 10) {
                     ForEach(rows, id: \.rowID) { entry in
@@ -123,14 +123,14 @@ struct ModelsView: View {
                         .truncationMode(.middle)
                     Text(String(format: "%.1f%%", share))
                         .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
                 HStack(spacing: 8) {
                     ForEach(Self.kinds, id: \.label) { kind in
-                        (Text(kind.label.localized + " ").foregroundStyle(.tertiary)
+                        (Text(kind.label.localized + " ").foregroundStyle(.tertiaryAdaptive)
                             + Text(Format.compactTokens(kind.pick(entry))))
                             .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                     }
                 }
             }

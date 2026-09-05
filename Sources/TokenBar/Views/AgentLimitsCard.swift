@@ -499,7 +499,7 @@ struct AgentLimitsCard: View {
                     Text("Checking agent limits…".localized)
                 }
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
             } else if visible.isEmpty {
@@ -510,7 +510,7 @@ struct AgentLimitsCard: View {
                         : "No supported agents yet".localized
                 )
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
             } else {
@@ -555,7 +555,7 @@ struct AgentLimitsCard: View {
                     .fixedSize(horizontal: false, vertical: true)
                 Text("The pace line beside it compares you with your usual pattern instead.")
                     .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(8)
@@ -576,13 +576,13 @@ struct AgentLimitsCard: View {
     private var noteLabel: some View {
         Text(note.localized)
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
     }
 
     private func integrationLine(_ text: String) -> some View {
         Text(text.localized)
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
     }
 
     // MARK: - Drag reorder
@@ -669,7 +669,9 @@ struct AgentLimitsCard: View {
                 if reorderable, row.isPrimary {
                     Text("⠿")
                         .font(.caption)
-                        .foregroundStyle(dragId == id ? .primary : .tertiary)
+                        .foregroundStyle(
+                            dragId == id
+                                ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiaryAdaptive))
                         .help("Drag to reorder")
                         .gesture(dragGesture(for: id, visible: primaryOrder))
                 }
@@ -679,7 +681,7 @@ struct AgentLimitsCard: View {
                 if let account = row.accountLabel {
                     Text(account)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(row.accountKey ?? account)
@@ -693,7 +695,9 @@ struct AgentLimitsCard: View {
                 if let detail = detailText(snapshot) {
                     Text(detail)
                         .font(.caption2)
-                        .foregroundStyle(snapshot?.error != nil ? .red : .secondary)
+                        .foregroundStyle(
+                            snapshot?.error != nil
+                                ? AnyShapeStyle(.red) : AnyShapeStyle(.secondaryAdaptive))
                         .lineLimit(2)
                         .help(snapshot?.error ?? detail)
                 }
@@ -748,7 +752,7 @@ struct AgentLimitsCard: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Using a Claude `setup-token`? TokenBar auto-detects `CLAUDE_CODE_OAUTH_TOKEN` from your login shell. If limits don't appear, store the token in Keychain — run this, then paste the token at the prompt:")
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top, spacing: 6) {
                 Text(Self.claudeSetupCommand)
@@ -854,13 +858,13 @@ struct AgentLimitsCard: View {
                     Spacer()
                     Text(resetText ?? leftLabel)
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
                 bar(fillPercent: fill, color: gauge, paceLeft: nil, paceIsDeficit: false)
                 if resetText != nil {
                     Text(leftLabel)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
             }
         } else {
@@ -875,7 +879,7 @@ struct AgentLimitsCard: View {
                     if let reset = resetText {
                         Text(reset)
                             .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                     }
                 }
                 // The line replaces the bar only when the user asked for it AND
@@ -1037,7 +1041,7 @@ struct AgentLimitsCard: View {
             .font(.caption2)
             .foregroundStyle(
                 runsOutEarly ? AnyShapeStyle(.red)
-                    : direction == .flat ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.secondary))
+                    : direction == .flat ? AnyShapeStyle(.tertiaryAdaptive) : AnyShapeStyle(.secondaryAdaptive))
             .contentShape(Rectangle())
             .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
                 trendFrames[id] = $0
@@ -1055,7 +1059,7 @@ struct AgentLimitsCard: View {
     private func paceLeftLabel(_ text: String) -> some View {
         Text(text)
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
     }
 
     private func paceTextLabel(_ text: String, pace: UsagePace?) -> some View {
@@ -1063,7 +1067,7 @@ struct AgentLimitsCard: View {
             .font(.caption2)
             .foregroundStyle(
                 Self.PacePresentation.isDeficit(pace)
-                    ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
+                    ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiaryAdaptive))
     }
 
     /// What a row with no quota value should say.
@@ -1086,14 +1090,14 @@ struct AgentLimitsCard: View {
                 if classic {
                     Text(placeholderValueLabel)
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
             }
             bar(fillPercent: 0, color: Color(hex: brand), paceLeft: nil, paceIsDeficit: false)
             if !classic {
                 Text(placeholderValueLabel)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
         }
     }

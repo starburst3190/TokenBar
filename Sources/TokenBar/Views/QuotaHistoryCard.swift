@@ -72,13 +72,13 @@ struct QuotaHistoryCard: View {
             } else if cycles.isEmpty, curveUnreadable {
                 Text("Quota history could not be read. It will be retried.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if cycles.isEmpty {
                 Text("No earlier windows recorded yet. They accumulate as TokenBar runs.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
@@ -109,11 +109,11 @@ struct QuotaHistoryCard: View {
             HStack(spacing: 8) {
                 Image(systemName: isOpen ? "chevron.down" : "chevron.right")
                     .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                     .frame(width: 8)
                 Text(Format.windowStamp(ms: cycle.startMs))
                     .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .lineLimit(1)
                     .fixedSize()
                 bars(cycle, row: row)
@@ -127,7 +127,7 @@ struct QuotaHistoryCard: View {
                     // a measurement nobody took. Same dash, same reason.
                     Text(Format.tokens(tokens: row.mineTokens, cost: row.mineCost))
                         .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     // A dash, not "$0.00", when tokens were recorded and none
                     // of them carried a price. This is a fixed-width column, so
                     // the alternative to a placeholder is a false total — the
@@ -139,7 +139,7 @@ struct QuotaHistoryCard: View {
                 } else {
                     Text(verbatim: "·")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                         .frame(width: 54, alignment: .trailing)
                 }
             }
@@ -230,7 +230,7 @@ struct QuotaHistoryCard: View {
             // to confirm.
             Text(Format.clockRange(fromMs: cycle.startMs, toMs: cycle.resetAtMs))
                 .font(.system(size: 9).monospacedDigit())
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             if cycle.observedFraction < Self.thinObservation {
                 Text("TokenBar observed %@%% of this window, so its usage figure is a floor."
                     .localized(String(Int((cycle.observedFraction * 100).rounded()))))
@@ -249,7 +249,7 @@ struct QuotaHistoryCard: View {
                         // total learned the dash and these did not, so expanding
                         // a cost-only model contradicted the line it expanded.
                         Text(Format.tokens(tokens: model.tokens, cost: model.cost))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                         Text(Format.money(tokens: model.tokens, cost: model.cost))
                             .frame(width: 54, alignment: .trailing)
                     }
@@ -258,7 +258,7 @@ struct QuotaHistoryCard: View {
                 if row.models.isEmpty {
                     Text("Nothing in this window was charged to this subscription.")
                         .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
                 // The line that explains a flat bar. Without it a 1% window
                 // holding $535 of work looks like a quiet afternoon.
@@ -311,13 +311,13 @@ struct QuotaHistoryCard: View {
                         return "%@ %@".localized(lead.localized, value)
                     }())
                         .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                         .padding(.top, 1)
                 }
             } else if scanFailed {
                 Text("Local usage could not be read.".localized)
                     .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             } else {
                 LoadingLine(title: "Reading local usage…")
                     .scaleEffect(0.85, anchor: .leading)
@@ -350,7 +350,7 @@ struct QuotaHistoryCard: View {
                     }),
                 tokens: Format.compactTokens, money: Format.usdOrBelowCent))
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.bottom, 2)
@@ -361,7 +361,7 @@ struct QuotaHistoryCard: View {
         Text("Amounts are API list-price equivalents for usage you declared as %@ — not what the subscription charged."
             .localized(ClientRegistry.style(clientId).displayName))
             .font(.system(size: 9))
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 4)

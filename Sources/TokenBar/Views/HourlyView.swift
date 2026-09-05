@@ -93,7 +93,7 @@ struct HourlyView: View {
             } else if !hasData {
                 Text("No usage in this range")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else if mode == .profile {
                 let maxTokens = max(buckets.map(\.tokens).max() ?? 1, 1)
                 VStack(spacing: 3) {
@@ -125,7 +125,7 @@ struct HourlyView: View {
                     }
                     .buttonStyle(.plain)
                     .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                 }
             }
         }
@@ -159,7 +159,8 @@ struct HourlyView: View {
                 } label: {
                     Text(m.label)
                         .font(.caption2.weight(mode == m ? .semibold : .regular))
-                        .foregroundStyle(mode == m ? .primary : .secondary)
+                        .foregroundStyle(
+                            mode == m ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondaryAdaptive))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(
@@ -182,7 +183,8 @@ struct HourlyView: View {
         HStack(spacing: 8) {
             Text(label)
                 .font(.caption2.monospacedDigit())
-                .foregroundStyle(isCurrent ? .primary : .secondary)
+                .foregroundStyle(
+                    isCurrent ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondaryAdaptive))
                 .frame(width: mode == .profile ? 38 : 74, alignment: .leading)
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
@@ -196,7 +198,7 @@ struct HourlyView: View {
             .frame(height: 8)
             Text(tokens > 0 ? Format.compactTokens(tokens) : "")
                 .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .frame(width: 44, alignment: .trailing)
             Text(cost > 0 ? Format.usd(cost) : "")
                 .font(.caption2.monospacedDigit())

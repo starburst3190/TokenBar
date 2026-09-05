@@ -21,7 +21,9 @@ private struct FooterLink: View {
         Link(destination: URL(string: url)!) {
             Label(title.localized, systemImage: systemImage)
                 .font(.caption2)
-                .foregroundStyle(hovering ? Color.primary : Color.secondary)
+                .foregroundStyle(
+                    hovering
+                        ? AnyShapeStyle(Color.primary) : AnyShapeStyle(.secondaryAdaptive))
                 .padding(.horizontal, 6)
                 .padding(.vertical, 3)
                 .background(
@@ -250,7 +252,7 @@ struct SettingsWindowView: View {
                         .font(.caption.weight(.medium))
                     Text(AppInfo.version)
                         .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
             }
             .padding(.leading, 6)
@@ -300,7 +302,7 @@ struct SettingsWindowView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Live preview — settings apply immediately.")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
 
             section("Menu bar") {
                 VStack(spacing: 6) {
@@ -332,7 +334,7 @@ struct SettingsWindowView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label.localized.uppercased())
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             content()
         }
     }

@@ -85,16 +85,16 @@ struct UsageAttributionBreakdownCard: View {
             case .unavailable:
                 Text(UsageAttributionBreakdown.Copy.unavailable.localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             case .empty:
                 Text(UsageAttributionBreakdown.Copy.noUsage.localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             case .rows:
                 if confirmed.isEmpty {
                     Text(UsageAttributionBreakdown.Copy.hint.localized)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
                 VStack(spacing: 6) {
                     ForEach(rows ?? []) { row in
@@ -130,7 +130,7 @@ struct UsageAttributionBreakdownCard: View {
         }
 
         var label: AnyShapeStyle {
-            self == .assigned ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.primary)
+            self == .assigned ? AnyShapeStyle(.secondaryAdaptive) : AnyShapeStyle(Color.primary)
         }
     }
 

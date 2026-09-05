@@ -13,7 +13,9 @@ struct ViewSwitch: View {
                 } label: {
                     Text(view.label)
                         .font(.caption.weight(active == view ? .semibold : .regular))
-                        .foregroundStyle(active == view ? .primary : .secondary)
+                        .foregroundStyle(
+                            active == view
+                                ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondaryAdaptive))
                         .lineLimit(1)
                         .minimumScaleFactor(0.75)
                         .padding(.horizontal, 4)

@@ -44,7 +44,7 @@ struct QuotaHistoryStripCard: View {
             } else if attempted {
                 Text("No completed windows recorded yet. They accumulate as TokenBar runs.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
@@ -72,7 +72,7 @@ struct QuotaHistoryStripCard: View {
                 Text(ago == 0 ? "Most recent window".localized
                               : "%@ windows ago".localized(String(ago)))
                     .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                 Text("Consumed %@%% of the allowance".localized(
                     String(Int(value.rounded()))))
                     .font(.caption2)
@@ -130,17 +130,17 @@ struct QuotaHistoryStripCard: View {
                 Spacer(minLength: 4)
                 Text("%@ windows".localized(String(summary.cycleCount)))
                     .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
             strip(summary)
             Text(headline(summary))
                 .font(.system(size: 9))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             if let row = equivalences[summary.id] {
                 Text(WindowEquivalence.text(
                     row, tokens: Format.compactTokens, money: Format.usdOrBelowCent))
                     .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
