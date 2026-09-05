@@ -14,17 +14,7 @@ struct ModelsView: View {
     /// fetch is not the same as a completed fetch that found nothing.
     var loading = false
 
-    @State private var hover: HoverState?
-    @State private var tooltipSize: CGSize = .zero
-    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
-
-    private struct HoverState {
-        let entry: ModelReportEntry
-        /// Cursor location in the rows container's coordinate space.
-        let point: CGPoint
-    }
-
-    private static let rowsSpace = "models-rows"
+    @Environment(TooltipHost.self) private var tooltipHost
 
     private static let kinds: [(label: String, pick: (ModelReportEntry) -> Int64)] = [
         ("In", { $0.input }),
@@ -75,34 +65,13 @@ struct ModelsView: View {
                         row(entry, totalCost: totalCost)
                     }
                 }
-                .coordinateSpace(name: Self.rowsSpace)
-                .overlay(alignment: .topLeading) {
-                    if let hover {
-                        GeometryReader { geo in
-                            let measuredSize = tooltipSize == .zero
-                                ? CGSize(width: ModelUsageTooltip.width, height: 120)
-                                : tooltipSize
-                            let offset = PopoverTooltipPlacement.offset(
-                                anchor: hover.point,
-                                tooltipSize: measuredSize,
-                                containerFrame: geo.frame(in: .global),
-                                viewport: popoverScrollViewport)
-                            tooltip(hover.entry)
-                                .offset(offset ?? .zero)
-                        }
-                        // GeometryReader fills the rows; keep hits on the rows
-                        // so continuous hover does not end while the tooltip
-                        // is up.
-                        .allowsHitTesting(false)
-                    }
-                }
             }
         }
     }
 
     private func row(_ entry: ModelReportEntry, totalCost: Double) -> some View {
         let share = totalCost > 0 ? entry.cost / totalCost * 100 : 0
-        let isHovered = hover?.entry.rowID == entry.rowID
+        let isHovered = tooltipHost.isActive(owner: entry.rowID)
         return HStack(spacing: 8) {
             Circle()
                 .fill(Color(hex: colors.color(entry.provider, entry.model)))
@@ -155,22 +124,30 @@ struct ModelsView: View {
                 .font(.caption2.monospacedDigit())
             }
         }
-        // Whole-row hit area and a hand-drawn tooltip, matching
-        // ModelBreakdownCard/DailyView. The old `.help` only covered the model
-        // name's glyph rect and carried AppKit's tooltip delay.
+        // Whole-row hit area and the shared hover tooltip, matching
+        // ModelBreakdownCard/DailyView. The `.help` this replaced only covered
+        // the model name's glyph rect and carried AppKit's tooltip delay; the
+        // card-local overlay that replaced *that* still clamped inside this
+        // list, so a tooltip on a row near the bottom had nowhere to go.
         .contentShape(Rectangle())
-        .onContinuousHover(coordinateSpace: .named(Self.rowsSpace)) { phase in
+        .onContinuousHover(coordinateSpace: .named(PopoverViewport.space)) { phase in
             switch phase {
             case let .active(point):
-                hover = HoverState(entry: entry, point: point)
-            case .ended:
-                // Guard on identity: this list scrolls, so an `.ended` from a
-                // row the cursor already left must not clear the current one.
-                if hover?.entry.rowID == entry.rowID {
-                    hover = nil
+                // Build the panel once on row entry; afterwards only re-anchor.
+                if tooltipHost.isActive(owner: entry.rowID) {
+                    tooltipHost.move(owner: entry.rowID, to: point)
+                } else {
+                    tooltipHost.show(owner: entry.rowID, at: point) { tooltip(entry) }
                 }
+            case .ended:
+                // `hide` is owner-guarded, so an `.ended` arriving from a row
+                // the cursor already left cannot blank the row it just entered
+                // — the identity check this list used to do by hand.
+                tooltipHost.hide(owner: entry.rowID)
             }
         }
+        // This list scrolls and refreshes; a row can vanish without an `.ended`.
+        .onDisappear { tooltipHost.hide(owner: entry.rowID) }
     }
 
     // MARK: - Hover tooltip
@@ -189,9 +166,5 @@ struct ModelsView: View {
             total: entry.total,
             cost: entry.cost,
             costRatio: entry.implausibleCostRatio)
-        // Measured here rather than inside the panel: `ModelUsageTooltip` is
-        // now also rendered by the shared HoverTooltipLayer, which measures for
-        // itself, so the size binding belongs to this legacy call site.
-        .onGeometryChange(for: CGSize.self) { $0.size } action: { tooltipSize = $0 }
     }
 }
