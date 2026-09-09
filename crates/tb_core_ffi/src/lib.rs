@@ -25,6 +25,7 @@ mod agent_storage_windows;
 mod agent_usage;
 mod agents_report;
 mod claude_config_dirs;
+mod disabled_providers;
 mod extra_scan_paths;
 mod filter_parity_probe;
 mod hourly_report;
@@ -1042,6 +1043,42 @@ unsafe fn set_extra_scan_paths_from_c(json: *const c_char) -> Result<serde_json:
     let result = extra_scan_paths::set_from_json(raw)?;
     invalidate_scan_caches();
     Ok(result)
+}
+
+/// Replace the process-wide registry of quota providers the user has switched
+/// off (see the `disabled_providers` module doc). `json` is an array of
+/// provider ids, e.g. `["antigravity"]`; full-replace semantics (`[]`
+/// re-enables everything). A disabled provider's future is never created, so it
+/// costs no request, no subprocess and no wait — which is the point, because
+/// `tb_agent_usage` returns only when the slowest provider finishes. Success
+/// data is `{"disabledCount":N,"rejected":[{"id","reason"}]}`; an id outside
+/// the known set is rejected rather than stored, so a typo cannot look like a
+/// working toggle. Malformed JSON returns `{"ok":false,...}` and leaves the
+/// registry untouched.
+///
+/// This does NOT hide a card that is already on screen — the card is gone
+/// because the provider is absent from the next payload, which is a different
+/// thing from a Swift-side visibility filter and is why it saves the time.
+///
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_set_disabled_providers(json: *const c_char) -> *mut c_char {
+    guarded("tb_set_disabled_providers", || {
+        envelope(unsafe { set_disabled_providers_from_c(json) })
+    })
+}
+
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+unsafe fn set_disabled_providers_from_c(json: *const c_char) -> Result<serde_json::Value, String> {
+    if json.is_null() {
+        return Err("disabled providers payload must not be NULL".to_string());
+    }
+    let raw = unsafe { CStr::from_ptr(json) }
+        .to_str()
+        .map_err(|_| "disabled providers payload is not valid UTF-8".to_string())?;
+    disabled_providers::set_from_json(raw)
 }
 
 /// Drop everything that could answer a scan question from before the root set

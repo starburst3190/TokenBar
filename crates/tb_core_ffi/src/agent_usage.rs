@@ -668,24 +668,6 @@ impl Serialize for UsageWindow {
 }
 
 impl UsageWindow {
-    /// Build a window from a "remaining fraction" (0..1) — the shape Antigravity
-    /// reports per model. Used-percent is derived; identity and duration are
-    /// attached by the provider adapter before the snapshot is emitted.
-    pub(crate) fn from_fraction(
-        label: String,
-        remaining_fraction: f64,
-        resets_at: Option<DateTime<Utc>>,
-        now: DateTime<Utc>,
-    ) -> Self {
-        Self::from_used_percent(
-            label,
-            (1.0 - remaining_fraction) * 100.0,
-            resets_at,
-            now,
-            None,
-        )
-    }
-
     /// Build a window from an absolute used-percent (0..100), with an optional
     /// legacy duration hint. The hint is retained only for existing tests and
     /// converted to exact seconds before any wire serialization.
@@ -999,10 +981,6 @@ impl UsageWindow {
         self.pace_status.window_key.as_deref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn pace_reason_for_test(&self) -> Option<&str> {
-        self.pace_status.reason.as_deref()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1484,13 +1462,38 @@ where
     }
 }
 
+/// Takes no `now`: it reads the clock itself, and the outcome it is handed is
+/// proof the response has already arrived.
+///
+/// Every caller used to capture `Utc::now()` on its first line and hold it
+/// across the request, so the timestamp the pace evidence was validated
+/// against was older than the response BY CONSTRUCTION — by the round-trip
+/// time. That is fatal for a window a provider reports as not yet started:
+/// Codex answers a window with no usage with `reset_at = <its now> +
+/// limit_window_seconds`, so the cycle's start IS the instant the response was
+/// built, and `valid_evidence`'s `cycle_started_at <= now` compares it against
+/// a clock reading from before the request. Measured on live data 2026-09-08:
+/// start `1788848567` against `now = 1788848566`, one second apart, which
+/// rejected the provider's duration and left `UsageWindow::unavailable` to
+/// clear `duration_seconds`, `duration_source` and `window_minutes` — no pace,
+/// no length, and a window Swift could no longer place at all (#296).
+///
+/// The comparison is at one-second granularity, so the old ordering failed
+/// only when the round trip crossed a second boundary; the same window was
+/// accepted minutes earlier and rejected later, which is why it read as the
+/// provider being inconsistent rather than as a bug here.
+///
+/// The parameter is gone rather than moved below the `await` at each caller,
+/// so a pre-request timestamp cannot be handed back in.
+/// `apply_provider_outcome_with` still takes one, because a test needs to
+/// state the instant it is asserting about.
 fn apply_provider_outcome(
     client_id: &str,
     account: Option<&str>,
     failure_source: &str,
-    now: DateTime<Utc>,
     outcome: ProviderFetchOutcome,
 ) -> Option<AgentUsageSnapshot> {
+    let now = Utc::now();
     apply_provider_outcome_with(
         &PROVIDER_LAST_GOOD,
         client_id,
@@ -1504,18 +1507,48 @@ fn apply_provider_outcome(
 
 pub async fn run(publication_generation: u64) -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    // Read once, before any future is built. A provider the user switched off
+    // must not have its future CREATED, not merely have its card dropped
+    // afterwards: `tokio::join!` below returns when the slowest one finishes,
+    // so a post-hoc filter would still pay the full wait. The Antigravity CLI
+    // fallback is the case that made this matter — it spawns a ~170MB binary
+    // and takes seconds, and it was holding up the Claude card for users who
+    // do not use Antigravity at all.
+    let disabled = crate::disabled_providers::snapshot();
+    let enabled = |id: &str| !disabled.contains(id);
     let (codex, claude, antigravity, copilot, grok) = tokio::join!(
-        fetch_codex(),
-        fetch_claude_accounts(),
-        fetch_antigravity(),
-        fetch_copilot(),
-        fetch_grok()
+        async { if enabled("codex") { Some(fetch_codex().await) } else { None } },
+        async {
+            if enabled("claude") {
+                fetch_claude_accounts().await
+            } else {
+                Vec::new()
+            }
+        },
+        async {
+            if enabled("antigravity") {
+                Some(fetch_antigravity().await)
+            } else {
+                None
+            }
+        },
+        async { if enabled("copilot") { fetch_copilot().await } else { None } },
+        async { if enabled("grok") { fetch_grok().await } else { None } }
     );
-    let mut agents = vec![codex];
+    // Same order as before: codex, the Claude cards, antigravity, then the two
+    // that were already conditional. A disabled provider contributes no card,
+    // which is what makes it disappear from the UI — there is no separate
+    // hiding step.
+    let mut agents = Vec::new();
+    if let Some(codex) = codex {
+        agents.push(codex);
+    }
     // The primary first, then any extra config directories. With none
     // configured this is the single Claude card it has always been.
     agents.extend(claude);
-    agents.push(antigravity);
+    if let Some(antigravity) = antigravity {
+        agents.push(antigravity);
+    }
     // Copilot only appears when signed in (via opencode); skip a bare not-signed-in error card.
     if let Some(copilot) = copilot {
         agents.push(copilot);
@@ -1555,7 +1588,7 @@ async fn fetch_grok() -> Option<AgentUsageSnapshot> {
         Ok(None) => ProviderFetchOutcome::Absent,
         Err(failure) => ProviderFetchOutcome::Failure(failure),
     };
-    apply_provider_outcome("grok", None, "oauth", now, outcome)
+    apply_provider_outcome("grok", None, "oauth", outcome)
 }
 
 async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
@@ -1590,7 +1623,7 @@ async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
             }
         }
     };
-    apply_provider_outcome("copilot", None, "oauth", now, outcome)
+    apply_provider_outcome("copilot", None, "oauth", outcome)
 }
 
 async fn fetch_antigravity() -> AgentUsageSnapshot {
@@ -1614,13 +1647,12 @@ async fn fetch_antigravity() -> AgentUsageSnapshot {
         },
         Err(failure) => ProviderFetchOutcome::Failure(failure),
     };
-    apply_provider_outcome("antigravity", None, "oauth", now, outcome)
+    apply_provider_outcome("antigravity", None, "oauth", outcome)
         .expect("Antigravity is a required provider card")
 }
 
 async fn fetch_codex() -> AgentUsageSnapshot {
-    let now = Utc::now();
-    apply_provider_outcome("codex", None, "oauth", now, fetch_codex_inner().await)
+    apply_provider_outcome("codex", None, "oauth", fetch_codex_inner().await)
         .expect("Codex is a required provider card")
 }
 
@@ -1724,9 +1756,8 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Dat
 }
 
 async fn fetch_claude() -> AgentUsageSnapshot {
-    let now = Utc::now();
     let (failure_source, outcome) = fetch_claude_inner().await;
-    apply_provider_outcome("claude", None, failure_source, now, outcome)
+    apply_provider_outcome("claude", None, failure_source, outcome)
         .expect("Claude is a required provider card")
 }
 
@@ -1810,9 +1841,8 @@ async fn join_local_ordered<T: 'static>(
 }
 
 async fn fetch_claude_extra_account(config_dir: &str) -> AgentUsageSnapshot {
-    let now = Utc::now();
     let (failure_source, outcome) = fetch_claude_extra_inner(config_dir).await;
-    apply_provider_outcome("claude", Some(config_dir), failure_source, now, outcome)
+    apply_provider_outcome("claude", Some(config_dir), failure_source, outcome)
         .expect("an extra Claude account always produces a card")
 }
 
@@ -5870,6 +5900,39 @@ mod tests {
         gate.clear();
         assert!(gate.blocked_until_for(&binding_a, now).is_none());
         scope.cleanup();
+    }
+
+    /// The whole point of the registry is that a disabled provider's future is
+    /// never built. With every provider switched off this runs to completion
+    /// touching no network at all — which is also why it is safe as a hermetic
+    /// test: any provider still being fetched would need credentials and a
+    /// socket, and would put a card in the payload.
+    #[tokio::test]
+    async fn every_disabled_provider_is_skipped_before_its_future_is_built() {
+        let _guard = crate::disabled_providers::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::disabled_providers::reset_for_test();
+        crate::disabled_providers::set_from_json(
+            r#"["codex","claude","antigravity","copilot","grok"]"#,
+        )
+        .unwrap();
+
+        let payload = run(1).await;
+
+        assert!(
+            payload.agents.is_empty(),
+            "a disabled provider must contribute no card; a card here means its \
+             future was created and awaited, which is the wait this exists to \
+             remove — got {:?}",
+            payload
+                .agents
+                .iter()
+                .map(|a| a.client_id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        crate::disabled_providers::reset_for_test();
     }
 
     #[tokio::test]

@@ -77,6 +77,7 @@ struct SettingsPanel: View {
     /// that authoritative read settle the switch.
     @State private var autostartMutationCommitted = false
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
+    @AppStorage(DisabledProviders.storageKey) private var disabledProvidersRaw = ""
     @AppStorage("tokenbar.views.hidden") private var hiddenViewsRaw = ""
     @AppStorage(OverviewCard.hiddenKey) private var overviewHiddenRaw = ""
     @AppStorage(OverviewCard.orderKey) private var overviewOrderRaw = ""
@@ -276,11 +277,14 @@ struct SettingsPanel: View {
                         ForEach(QuotaColorLevel.allCases, id: \.self) { level in
                             MenuBarTextColorControl(
                                 level: level, hex: textColorBinding(level), editingLevel: $editingTextColor)
+                                .popover(
+                                    isPresented: textColorEditorPresented(level), arrowEdge: .bottom
+                                ) {
+                                    MenuBarTextColorPopover(
+                                        hex: textColorBinding(level), level: level)
+                                        .id(level)
+                                }
                         }
-                    }
-                    .popover(item: $editingTextColor, arrowEdge: .bottom) { level in
-                        MenuBarTextColorPopover(hex: textColorBinding(level), level: level)
-                            .id(level)
                     }
                 }
             }
@@ -347,6 +351,16 @@ struct SettingsPanel: View {
         case .warning: $warningTextColorHex
         case .critical: $criticalTextColorHex
         }
+    }
+
+    private func textColorEditorPresented(_ level: QuotaColorLevel) -> Binding<Bool> {
+        Binding(
+            get: { editingTextColor == level },
+            set: { presented in
+                if !presented, editingTextColor == level {
+                    editingTextColor = nil
+                }
+            })
     }
 
     private func individualItemRow(_ row: ClientTray.SettingsRow) -> some View {
@@ -489,6 +503,37 @@ struct SettingsPanel: View {
                     hint("Hides only that client's quota card here and on its own tab — the tab and its cost/token data stay visible. Useful for accounts with no OAuth quota (e.g. Claude Console). Grayed out when the tab itself is hidden below, since a hidden tab always hides its quota card too.")
                 }
             }
+        }
+
+        section("Quota providers") {
+            let disabled = Set(DisabledProviders.parse(raw: disabledProvidersRaw))
+            VStack(spacing: 1) {
+                ForEach(DisabledProviders.known, id: \.self) { id in
+                    HStack {
+                        HStack(spacing: 6) {
+                            AgentIconView(clientId: id, size: 14)
+                            Text(DisabledProviders.label(id))
+                                .font(.caption)
+                        }
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { !disabled.contains(id) },
+                            set: { fetchIt in
+                                var off = disabled
+                                if fetchIt { off.remove(id) } else { off.insert(id) }
+                                disabledProvidersRaw = off.sorted().joined(separator: ",")
+                            }
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .labelsHidden()
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                }
+            }
+            .glassCard(cornerRadius: 8)
+            hint("Whether TokenBar asks this provider for your quota at all. Off is not the same as hiding the card above: every provider is fetched in one pass that finishes with the slowest of them, so a provider you do not use can delay every other card — Antigravity with no IDE installed runs a command-line tool that takes seconds. Off skips the request entirely and records no quota history for it while it stays off.")
         }
 
         section("Overview cards") {

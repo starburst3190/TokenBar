@@ -19,7 +19,7 @@ use crate::agent_quota_duration::{
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
@@ -355,69 +355,6 @@ fn weighted_median(values: &[f64], weights: &[f64]) -> f64 {
         }
     }
     fallback
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FitWorkCounters {
-    pub(crate) series_key_comparisons: usize,
-    pub(crate) target_sample_reads: usize,
-    pub(crate) non_target_sample_reads: usize,
-    pub(crate) target_profiles_built: usize,
-    pub(crate) non_target_profiles_built: usize,
-    pub(crate) walk_forward_fits: usize,
-    pub(crate) lobo_folds: usize,
-    pub(crate) loco_folds: usize,
-}
-
-#[cfg(test)]
-thread_local! {
-    static FIT_WORK_COUNTERS: RefCell<FitWorkCounters> = RefCell::new(FitWorkCounters::default());
-}
-
-#[cfg(test)]
-pub(crate) fn reset_fit_work_counters() {
-    FIT_WORK_COUNTERS.with(|counters| *counters.borrow_mut() = FitWorkCounters::default());
-}
-
-#[cfg(test)]
-pub(crate) fn fit_work_counters() -> FitWorkCounters {
-    FIT_WORK_COUNTERS.with(|counters| *counters.borrow())
-}
-
-#[cfg(test)]
-fn add_fit_work(update: impl FnOnce(&mut FitWorkCounters)) {
-    FIT_WORK_COUNTERS.with(|counters| update(&mut counters.borrow_mut()));
-}
-
-#[cfg(not(test))]
-fn add_fit_work<F>(_update: F)
-where
-    F: FnOnce(&mut FitWorkCounters),
-{
-}
-
-fn count_series_key_comparisons(count: usize) {
-    add_fit_work(|c| c.series_key_comparisons += count);
-}
-
-fn count_target_sample_reads(count: usize) {
-    add_fit_work(|c| c.target_sample_reads += count);
-}
-
-fn count_target_profiles_built(count: usize) {
-    add_fit_work(|c| c.target_profiles_built += count);
-}
-
-fn count_walk_forward_fits(count: usize) {
-    add_fit_work(|c| c.walk_forward_fits += count);
-}
-
-fn count_lobo_folds(count: usize) {
-    add_fit_work(|c| c.lobo_folds += count);
-}
-
-fn count_loco_folds(count: usize) {
-    add_fit_work(|c| c.loco_folds += count);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2083,7 +2020,6 @@ fn duration_for_outcome(outcome: HistoryOutcome) -> Option<i64> {
 
 fn find_target_series<'a>(store: &'a Store, key: &SeriesKey) -> Option<&'a SeriesState> {
     for series in &store.series {
-        count_series_key_comparisons(1);
         if series.key() == *key {
             return Some(series);
         }
@@ -2699,7 +2635,6 @@ fn fit_lobo_cycle(points: &[FitPoint]) -> Option<(f64, Option<f64>, usize)> {
             tail_sum += mse * error.tail_count as f64;
             tail_count += error.tail_count;
         }
-        count_lobo_folds(1);
     }
     if bucket_mse.is_empty() {
         return None;
@@ -2756,7 +2691,6 @@ fn fit_loco_cycle(
     if bucket_mse.is_empty() {
         return None;
     }
-    count_loco_folds(1);
     let mse = bucket_mse.iter().sum::<f64>() / bucket_mse.len() as f64;
     let tail_mse = (tail_count > 0).then_some(tail_sum / tail_count as f64);
     mse.is_finite().then_some((mse, tail_mse, tail_count))
@@ -2924,7 +2858,6 @@ pub(crate) fn fit_partial_current(points: &[FitPoint]) -> Option<PartialFitResul
             .collect::<Vec<_>>();
         let beta = through_origin_beta(&training)?;
         holdout_mse.push(heldout_linear_error(beta, &buckets[index].1)?);
-        count_walk_forward_fits(1);
     }
     if holdout_mse.len() < 3 {
         return None;
@@ -3003,10 +2936,8 @@ fn calculate_target(
             pace: None,
         };
     };
-    count_target_sample_reads(series.samples.len());
     let current_reset = normalize_reset(reset_at, duration_seconds);
     let cycles = historical_cycles(series, current_reset, now);
-    count_target_profiles_built(cycles.len());
     TargetCalculation {
         complete_cycles: cycles.len(),
         pace: evaluate_current_from_series(
@@ -5760,110 +5691,6 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    /// V5. The hermetic fixture above proves the upgrade on a store this test
-    /// file built; this one proves it on a store the shipping app actually
-    /// wrote, which is the only kind that exists on a user's disk.
-    ///
-    /// **The operator supplies a copy.** Point
-    /// `TOKENBAR_QUOTA_STORE_COPY_SOURCE` at a file you copied out yourself:
-    ///
-    /// ```text
-    /// cp "$HOME/Library/Application Support/com.nyanako.tokenbar/quota-pace-history-v3.json" /tmp/store-copy.json
-    /// TOKENBAR_QUOTA_STORE_COPY_SOURCE=/tmp/store-copy.json cargo test -p tb_core_ffi -- --ignored real_store
-    /// ```
-    ///
-    /// A source inside the application-data directory is refused by this
-    /// function, not by how it is invoked. `#[ignore]` and an unset variable
-    /// are properties of the caller and decay differently from the body:
-    /// `cargo test -- --ignored` is a normal thing to run, and a variable
-    /// exported once into a shell profile is a normal thing to forget. A check
-    /// here cannot be un-set by either.
-    ///
-    /// Byte-equality at the end would only prove this test did not modify the
-    /// source. It proves nothing about a panic between the copy and the
-    /// assertion, and nothing at all if the process is killed. Not opening the
-    /// live file is the only guarantee that survives those.
-    #[test]
-    #[ignore = "needs a store copy the operator made; see the doc comment"]
-    fn a_real_store_upgrades_without_losing_series_or_samples() {
-        let source = std::env::var("TOKENBAR_QUOTA_STORE_COPY_SOURCE")
-            .expect("set TOKENBAR_QUOTA_STORE_COPY_SOURCE to a copy you made");
-        let source = Path::new(&source);
-        // Resolve first: a symlink into the data directory is the same file.
-        let resolved = fs::canonicalize(source).expect("resolve the source path");
-        if let Some(home) = crate::user_home_dir() {
-            let protected = home.join("Library/Application Support");
-            assert!(
-                !resolved.starts_with(&protected),
-                "refusing to open {} — it is inside the application-data directory. \
-                 Copy the store out and point the variable at the copy.",
-                resolved.display()
-            );
-        }
-        let original = fs::read(&resolved).expect("read the store copy");
-
-        let (directory, path) = temp_path("real-store-copy");
-        fs::write(&path, &original).unwrap();
-
-        let raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
-        let series_before = raw["series"].as_array().unwrap().len();
-        let samples_before: usize = raw["series"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|series| series["samples"].as_array().unwrap().len())
-            .sum();
-        assert!(samples_before > 0, "an empty source proves nothing");
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let loaded = load_store_at_with_mode(StorageMode::System, &path, now, now).unwrap();
-
-        assert!(!loaded.quarantined, "the real store was quarantined");
-        assert_eq!(loaded.store.schema_version, HISTORY_SCHEMA_VERSION);
-        assert_eq!(loaded.store.series.len(), series_before);
-        // Two passes run between deserialization and this assertion: the
-        // upgrade, and `drop_unplaceable_samples`. A healthy store should lose
-        // nothing to either, so a drop here is worth failing on whichever one
-        // caused it — but read the failure carefully before assuming it was
-        // the migration.
-        assert_eq!(
-            loaded
-                .store
-                .series
-                .iter()
-                .map(|series| series.samples.len())
-                .sum::<usize>(),
-            samples_before,
-            "a real store lost samples on load — either the migration or \
-             `drop_unplaceable_samples` rejected data this build should place"
-        );
-        assert!(
-            loaded
-                .store
-                .series
-                .iter()
-                .flat_map(|series| series.samples.iter())
-                .all(|sample| sample.plan.is_none()),
-            "a plan value appeared on a sample that predates the field"
-        );
-
-        assert_eq!(
-            fs::read(&resolved).unwrap(),
-            original,
-            "the source was modified"
-        );
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            original,
-            "the copy was rewritten on load"
-        );
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
     fn observed_cycle(reset_at: i64, duration_seconds: i64, end: f64) -> Vec<QuotaSample> {
         complete_cycle(reset_at, duration_seconds, end)
             .into_iter()
@@ -6198,367 +6025,6 @@ mod tests {
             plain.pace.map(|pace| pace.expected_percent),
             "with no advertised nominal the short cycle must reach the fit"
         );
-    }
-
-    /// R3. Every test above asks whether the change does the new thing. This
-    /// one asks whether it broke the old one, on the operator's real store,
-    /// by printing what every series answers today. Run it on this build and
-    /// again with the change reverted, then diff the two outputs: any series
-    /// whose window count or pace moved is a regression, and the codex weekly
-    /// series is the only one that should move at all.
-    ///
-    /// It asserts nothing beyond the store being readable. A pinned expectation
-    /// here would be a transcript of one machine's disk, and the comparison
-    /// this exists for happens between two runs, not inside one.
-    ///
-    /// ```text
-    /// TOKENBAR_QUOTA_STORE_COPY_SOURCE=/tmp/store-copy.json \
-    ///   cargo test -p tb_core_ffi -- --ignored --nocapture real_store_pace_surface
-    /// ```
-    #[test]
-    #[ignore = "needs a store copy the operator made; see the doc comment"]
-    fn real_store_pace_surface() {
-        let source = std::env::var("TOKENBAR_QUOTA_STORE_COPY_SOURCE")
-            .expect("set TOKENBAR_QUOTA_STORE_COPY_SOURCE to a copy you made");
-        let resolved = fs::canonicalize(Path::new(&source)).expect("resolve the source path");
-        if let Some(home) = crate::user_home_dir() {
-            assert!(
-                !resolved.starts_with(home.join("Library/Application Support")),
-                "refusing to open {} — it is inside the application-data directory",
-                resolved.display()
-            );
-        }
-        let original = fs::read(&resolved).expect("read the store copy");
-        let (directory, path) = temp_path("real-store-surface");
-        fs::write(&path, &original).unwrap();
-
-        let copied: serde_json::Value = serde_json::from_slice(&original).unwrap();
-        let now = copied["series"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|series| series["samples"].as_array().unwrap())
-            .filter_map(|sample| sample["sampledAt"].as_i64())
-            .max()
-            .expect("the copy has no samples")
-            + 300;
-        let loaded = load_store_at_with_mode(StorageMode::System, &path, now, now).unwrap();
-
-        for series in &loaded.store.series {
-            let Some(reset_at) = series.active_reset_at else {
-                continue;
-            };
-            let Some(last) = series.samples.last() else {
-                continue;
-            };
-            let calculation = calculate_target(
-                &loaded.store,
-                &series.key(),
-                reset_at,
-                last.duration_seconds,
-                last.used_percent,
-                now,
-            );
-            println!(
-                "{:8} {:34} cycles={:3} expected={}",
-                series.provider_id,
-                &series.window_key[..series.window_key.len().min(34)],
-                calculation.complete_cycles,
-                calculation
-                    .pace
-                    .map(|pace| format!("{:.4}", pace.expected_percent))
-                    .unwrap_or_else(|| "none".to_string()),
-            );
-        }
-        assert_eq!(fs::read(&resolved).unwrap(), original, "the source was modified");
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    /// R1. The fixtures above prove the repair on stores this file built, where
-    /// the superseded group is present by construction. Whether a store the
-    /// shipping app wrote still *holds* such a group is a property of what past
-    /// retains already deleted, and no fixture can answer it — a fixture that
-    /// stages the group has assumed the answer.
-    ///
-    /// So this measures the repair against the retain that would have run
-    /// without it, on the same real store, and prints the delta. It asserts
-    /// only the direction: repair may recover windows, never lose them. The
-    /// count itself is an observation about one operator's disk, not a
-    /// contract, so pinning a number here would fail on every other machine.
-    ///
-    /// Operator supplies a copy, same as V5:
-    ///
-    /// ```text
-    /// TOKENBAR_QUOTA_STORE_COPY_SOURCE=/tmp/store-copy.json \
-    ///   cargo test -p tb_core_ffi -- --ignored --nocapture real_store_recovers
-    /// ```
-    #[test]
-    #[ignore = "needs a store copy the operator made; see the doc comment"]
-    fn a_real_store_recovers_windows_the_old_retain_would_have_dropped() {
-        let source = std::env::var("TOKENBAR_QUOTA_STORE_COPY_SOURCE")
-            .expect("set TOKENBAR_QUOTA_STORE_COPY_SOURCE to a copy you made");
-        let resolved = fs::canonicalize(Path::new(&source)).expect("resolve the source path");
-        if let Some(home) = crate::user_home_dir() {
-            assert!(
-                !resolved.starts_with(home.join("Library/Application Support")),
-                "refusing to open {} — it is inside the application-data directory",
-                resolved.display()
-            );
-        }
-        let original = fs::read(&resolved).expect("read the store copy");
-
-        let (directory, path) = temp_path("real-store-repair");
-        fs::write(&path, &original).unwrap();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let loaded = load_store_at_with_mode(StorageMode::System, &path, now, now).unwrap();
-        assert!(!loaded.quarantined, "the real store was quarantined");
-
-        // Every series counts as active, so the delta measures group-level
-        // retention alone rather than inactive-series eviction.
-        let active_keys = loaded
-            .store
-            .series
-            .iter()
-            .map(|series| series.key())
-            .collect::<BTreeSet<_>>();
-
-        // A group that survives retain *and* describes a cycle is a window the
-        // history can actually use. Surviving samples alone would count the
-        // current partial group too.
-        let complete_windows = |store: &Store| -> usize {
-            store
-                .series
-                .iter()
-                .flat_map(|series| grouped_samples(&series.samples).into_iter())
-                .filter(|(reset, samples)| {
-                    retention_cycle_descriptor(*reset, samples, now).is_some()
-                })
-                .count()
-        };
-
-        let mut without_repair = loaded.store.clone();
-        retain_store(&mut without_repair, now, &active_keys).unwrap();
-
-        let mut with_repair = loaded.store.clone();
-        repair_closed_cycles(&mut with_repair, now, );
-        retain_store(&mut with_repair, now, &active_keys).unwrap();
-
-        let before = complete_windows(&without_repair);
-        let after = complete_windows(&with_repair);
-        println!(
-            "real store: {} series, {} samples on load; complete windows {} -> {} (delta {})",
-            loaded.store.series.len(),
-            loaded
-                .store
-                .series
-                .iter()
-                .map(|series| series.samples.len())
-                .sum::<usize>(),
-            before,
-            after,
-            after as i64 - before as i64
-        );
-        for (repaired, plain) in with_repair.series.iter().zip(without_repair.series.iter()) {
-            let repaired_windows = grouped_samples(&repaired.samples)
-                .into_iter()
-                .filter(|(reset, samples)| {
-                    retention_cycle_descriptor(*reset, samples, now).is_some()
-                })
-                .count();
-            let plain_windows = grouped_samples(&plain.samples)
-                .into_iter()
-                .filter(|(reset, samples)| {
-                    retention_cycle_descriptor(*reset, samples, now).is_some()
-                })
-                .count();
-            if repaired_windows != plain_windows {
-                println!(
-                    "  {:?} {}: {} -> {} windows",
-                    repaired.provider_id, repaired.window_key, plain_windows, repaired_windows
-                );
-            }
-        }
-
-        assert!(
-            after >= before,
-            "repair removed usable windows: {before} -> {after}"
-        );
-        assert_eq!(fs::read(&resolved).unwrap(), original, "the source was modified");
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    /// R2. R1 measures what the repair recovers from a store as it sits, which
-    /// is bounded by what past retains already deleted. This measures the other
-    /// half — whether the window *currently* in progress survives the next
-    /// irregular reset — by replaying one against the operator's real samples
-    /// and comparing to the order the old code used.
-    ///
-    /// The control is not a different build: it is `activeResetAt` moved first
-    /// and then `retain_store`, which is exactly what the pre-fix path did.
-    /// Running both against the same loaded store keeps the only difference the
-    /// ordering under test.
-    ///
-    /// ```text
-    /// TOKENBAR_QUOTA_STORE_COPY_SOURCE=/tmp/store-copy.json \
-    ///   cargo test -p tb_core_ffi -- --ignored --nocapture real_codex_window
-    /// ```
-    #[test]
-    #[ignore = "needs a store copy the operator made; see the doc comment"]
-    fn a_real_codex_window_survives_an_irregular_reset_the_old_order_dropped() {
-        let source = std::env::var("TOKENBAR_QUOTA_STORE_COPY_SOURCE")
-            .expect("set TOKENBAR_QUOTA_STORE_COPY_SOURCE to a copy you made");
-        let resolved = fs::canonicalize(Path::new(&source)).expect("resolve the source path");
-        if let Some(home) = crate::user_home_dir() {
-            assert!(
-                !resolved.starts_with(home.join("Library/Application Support")),
-                "refusing to open {} — it is inside the application-data directory",
-                resolved.display()
-            );
-        }
-        let original = fs::read(&resolved).expect("read the store copy");
-
-        let (directory, path) = temp_path("real-store-replay");
-        fs::write(&path, &original).unwrap();
-        // Anchored to the copy's own last observation, not the wall clock.
-        // `close_at` is bounded by `now`, so a `now` hours later than the copy
-        // stretches the restamped window until its final sample no longer
-        // reaches the coverage bound and the result flips — the verdict would
-        // then depend on how long after the copy the test happened to run.
-        // Five minutes past the last sample is the poll that would have seen
-        // the reset.
-        let copied: serde_json::Value = serde_json::from_slice(&original).unwrap();
-        let now = copied["series"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|series| series["samples"].as_array().unwrap())
-            .filter_map(|sample| sample["sampledAt"].as_i64())
-            .max()
-            .expect("the copy has no samples")
-            + 300;
-        let loaded = load_store_at_with_mode(StorageMode::System, &path, now, now).unwrap();
-
-        let series = loaded
-            .store
-            .series
-            .iter()
-            .find(|series| series.provider_id == "codex" && series.window_key == "main.weekly.v1")
-            .expect("this store has no codex weekly series to replay");
-        let key = series.key();
-        let active = series.active_reset_at.expect("no window is in progress");
-        let duration = series
-            .samples
-            .last()
-            .expect("the codex series has no samples")
-            .duration_seconds;
-
-        // Identify the window under test by its sample timestamps, not its
-        // group key: closing it restamps `resetAt`, so the key is what moves.
-        let in_progress = grouped_samples(&series.samples)
-            .remove(&normalize_reset(active, duration))
-            .expect("no group matches activeResetAt");
-        let stamps = in_progress
-            .iter()
-            .map(|sample| sample.sampled_at)
-            .collect::<BTreeSet<_>>();
-        let active_keys = loaded
-            .store
-            .series
-            .iter()
-            .map(|series| series.key())
-            .collect::<BTreeSet<_>>();
-
-        // Does the window those samples belong to survive as something history
-        // can use, rather than merely leaving some samples behind?
-        let verdict = |store: &Store| -> (usize, bool) {
-            let Some(series) = store
-                .series
-                .iter()
-                .find(|series| series.key() == key)
-            else {
-                return (0, false);
-            };
-            let mut kept = 0;
-            let mut usable = false;
-            for (reset, samples) in grouped_samples(&series.samples) {
-                let overlap = samples
-                    .iter()
-                    .filter(|sample| stamps.contains(&sample.sampled_at))
-                    .count();
-                if overlap == 0 {
-                    continue;
-                }
-                kept += overlap;
-                usable |= retention_cycle_descriptor(reset, &samples, now).is_some();
-            }
-            (kept, usable)
-        };
-
-        // The provider resets now and advertises a fresh window of the same
-        // length — the shape of an irregular reset. It lands later than the
-        // reset in progress because the window it replaces started earlier,
-        // so this exercises the close path rather than the backward-reset
-        // guard that a hand-picked earlier value would trip.
-        let new_reset = now + duration;
-
-        let mut old_order = loaded.store.clone();
-        {
-            let series = old_order
-                .series
-                .iter_mut()
-                .find(|series| series.key() == key)
-                .unwrap();
-            series.active_reset_at = Some(new_reset);
-            series.last_activity_at = series.last_activity_at.max(now);
-        }
-        retain_store(&mut old_order, now, &active_keys).unwrap();
-        let (old_kept, old_usable) = verdict(&old_order);
-
-        record_observation_at_path(
-            key.clone(),
-            Some(new_reset),
-            // The reading a reset actually produces. Under schema 4 this is the
-            // new cycle's own starting point, never the old window's end.
-            0.0,
-            now,
-            provider(new_reset, duration),
-            None,
-            &path,
-        )
-        .unwrap();
-        let replayed = load_store_at_with_mode(StorageMode::System, &path, now, now).unwrap();
-        let (new_kept, new_usable) = verdict(&replayed.store);
-
-        println!(
-            "codex main.weekly.v1: window in progress had {} samples\n  \
-             old order: {old_kept} kept, usable window = {old_usable}\n  \
-             shipping:  {new_kept} kept, usable window = {new_usable}",
-            stamps.len()
-        );
-
-        // Asserting the claim, not the delta. `new_kept >= old_kept` would also
-        // hold at nothing-versus-nothing, which is how a mis-set replay reset
-        // reads: both sides drop the window and the comparison still passes.
-        // The control's numbers are printed rather than asserted because a
-        // store where the old order happened to survive is not this fix
-        // regressing.
-        assert_eq!(
-            new_kept,
-            stamps.len(),
-            "the shipping path lost samples from the window it was closing"
-        );
-        assert!(
-            new_usable,
-            "the closed window is not one history can use — restamping it \
-             produced a group that fails retention coverage"
-        );
-        assert_eq!(fs::read(&resolved).unwrap(), original, "the source was modified");
-
-        fs::remove_dir_all(directory).unwrap();
     }
 
     /// V3. Uses a `Some` value even though nothing writes one yet: with only
@@ -11343,61 +10809,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_work_counter_is_bounded_at_forty_five_walk_forward_fits() {
-        let (directory, path) = temp_path("partial-fit-counter");
-        let duration = 5 * HOUR;
-        let reset_at = 23_000_000 + duration;
-        let now = reset_at - 60;
-        let key = test_key("fixture", "counter-partial", "window.v1");
-        let samples = (0..PHASE_BUCKET_COUNT)
-            .map(|bucket| {
-                let phase = (bucket as f64 + 0.25) / PHASE_BUCKET_COUNT as f64;
-                quota_sample(
-                    reset_at,
-                    duration,
-                    phase,
-                    (phase * 80.0).max(0.1),
-                    SampleOrigin::LiveV3,
-                )
-            })
-            .collect::<Vec<_>>();
-        let store = Store {
-            schema_version: HISTORY_SCHEMA_VERSION,
-            series: vec![SeriesState {
-                provider_id: key.provider_id.clone(),
-                account_scope: key.account_scope.clone(),
-                window_key: key.window_key.clone(),
-                active_reset_at: Some(reset_at),
-                last_activity_at: now,
-                rollover: Some(ObservedState::Watching {
-                    reset_at,
-                    first_seen_at: now,
-                    last_seen_at: now,
-                    consecutive_count: 1,
-                }),
-                samples,
-            }],
-        };
-        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
-        reset_fit_work_counters();
-        let results = record_observations_at_path_and_evaluate(
-            std::slice::from_ref(&key),
-            &[observation(key.clone(), reset_at, 79.0, duration)],
-            now,
-            &path,
-        )
-        .unwrap();
-        assert!(results[0].as_ref().unwrap().1.is_some());
-        let counters = fit_work_counters();
-        assert_eq!(counters.walk_forward_fits, 45);
-        assert_eq!(counters.target_sample_reads, PHASE_BUCKET_COUNT);
-        assert_eq!(counters.target_profiles_built, 0);
-        assert_eq!(counters.non_target_sample_reads, 0);
-        assert_eq!(counters.non_target_profiles_built, 0);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn fit_and_projection_are_exactly_permutation_invariant() {
         let phases = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80];
         let first = line_fit_points(80.0, &phases);
@@ -11573,78 +10984,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_work_counter_hits_maximum_retention_bounds() {
-        let (directory, path) = temp_path("completed-fit-counter");
-        let duration = 5 * HOUR;
-        let current_reset = 24_000_000_000_i64 + duration;
-        let now = current_reset - 60;
-        let key = test_key("fixture", "counter-complete", "window.v1");
-        let mut samples = Vec::with_capacity(129 * PHASE_BUCKET_COUNT);
-        for offset in 1..=RETENTION_MAX_CYCLES {
-            let reset = current_reset - offset as i64 * duration;
-            samples.extend((0..PHASE_BUCKET_COUNT).map(|bucket| {
-                let phase = (bucket as f64 + 0.25) / PHASE_BUCKET_COUNT as f64;
-                quota_sample(
-                    reset,
-                    duration,
-                    phase,
-                    (phase * 80.0).max(0.1),
-                    SampleOrigin::LiveV3,
-                )
-            }));
-        }
-        samples.extend((0..PHASE_BUCKET_COUNT).map(|bucket| {
-            let phase = (bucket as f64 + 0.25) / PHASE_BUCKET_COUNT as f64;
-            quota_sample(
-                current_reset,
-                duration,
-                phase,
-                (phase * 80.0).max(0.1),
-                SampleOrigin::LiveV3,
-            )
-        }));
-        let store = Store {
-            schema_version: HISTORY_SCHEMA_VERSION,
-            series: vec![SeriesState {
-                provider_id: key.provider_id.clone(),
-                account_scope: key.account_scope.clone(),
-                window_key: key.window_key.clone(),
-                active_reset_at: Some(current_reset),
-                last_activity_at: now,
-                rollover: Some(ObservedState::Watching {
-                    reset_at: current_reset,
-                    first_seen_at: now,
-                    last_seen_at: now,
-                    consecutive_count: 1,
-                }),
-                samples,
-            }],
-        };
-        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
-        reset_fit_work_counters();
-        let results = record_observations_at_path_and_evaluate(
-            std::slice::from_ref(&key),
-            &[observation(key.clone(), current_reset, 79.0, duration)],
-            now,
-            &path,
-        )
-        .unwrap();
-        assert_eq!(results[0].as_ref().unwrap().2, RETENTION_MAX_CYCLES);
-        let counters = fit_work_counters();
-        assert_eq!(
-            counters.lobo_folds,
-            RETENTION_MAX_CYCLES * PHASE_BUCKET_COUNT
-        );
-        assert_eq!(counters.loco_folds, RETENTION_MAX_CYCLES);
-        assert_eq!(counters.target_sample_reads, 129 * PHASE_BUCKET_COUNT);
-        assert_eq!(counters.target_profiles_built, RETENTION_MAX_CYCLES);
-        assert_eq!(counters.non_target_sample_reads, 0);
-        assert_eq!(counters.non_target_profiles_built, 0);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn mixed_duration_retention_keeps_slots_bounded_without_fit_work() {
+    fn mixed_duration_retention_keeps_slots_bounded_and_the_fit_unchanged() {
         let duration = 5 * HOUR;
         let current_reset = (53_000_000_000_i64 + duration + 899).div_euclid(900) * 900;
         let now = current_reset - 60;
@@ -11713,24 +11053,10 @@ mod tests {
             schema_version: HISTORY_SCHEMA_VERSION,
             series: vec![mixed_series],
         };
-        reset_fit_work_counters();
         let control = calculate_target(&control_store, &key, current_reset, duration, 79.0, now);
-        let control_counters = fit_work_counters();
-        reset_fit_work_counters();
         let mixed = calculate_target(&mixed_store, &key, current_reset, duration, 79.0, now);
-        let mixed_counters = fit_work_counters();
         assert_eq!(control.complete_cycles, mixed.complete_cycles);
         assert_eq!(control.pace, mixed.pace);
-        assert_eq!(
-            control_counters.target_profiles_built,
-            mixed_counters.target_profiles_built
-        );
-        assert_eq!(control_counters.lobo_folds, mixed_counters.lobo_folds);
-        assert_eq!(control_counters.loco_folds, mixed_counters.loco_folds);
-        assert_eq!(
-            mixed_counters.target_sample_reads,
-            control_counters.target_sample_reads + PHASE_BUCKET_COUNT
-        );
         assert_eq!(mixed.complete_cycles, 127);
         let mixed_groups = grouped_samples(&mixed_store.series[0].samples);
         let mixed_reset = normalize_reset(current_reset - duration, duration);
@@ -11811,7 +11137,6 @@ mod tests {
             schema_version: HISTORY_SCHEMA_VERSION,
             series: after,
         };
-        reset_fit_work_counters();
         let before_result = calculate_target(
             &before_store,
             &target_key,
@@ -11820,8 +11145,6 @@ mod tests {
             60.0,
             now,
         );
-        let before_counters = fit_work_counters();
-        reset_fit_work_counters();
         let after_result = calculate_target(
             &after_store,
             &target_key,
@@ -11830,194 +11153,8 @@ mod tests {
             60.0,
             now,
         );
-        let after_counters = fit_work_counters();
         assert_eq!(before_result.complete_cycles, after_result.complete_cycles);
         assert_eq!(before_result.pace, after_result.pace);
-        assert_eq!(
-            before_counters.target_sample_reads,
-            after_counters.target_sample_reads
-        );
-        assert_eq!(
-            before_counters.target_profiles_built,
-            after_counters.target_profiles_built
-        );
-        assert_eq!(before_counters.lobo_folds, after_counters.lobo_folds);
-        assert_eq!(before_counters.loco_folds, after_counters.loco_folds);
-        assert_eq!(before_counters.non_target_sample_reads, 0);
-        assert_eq!(before_counters.non_target_profiles_built, 0);
-        assert_eq!(after_counters.non_target_sample_reads, 0);
-        assert_eq!(after_counters.non_target_profiles_built, 0);
-        assert_ne!(
-            before_counters.series_key_comparisons,
-            after_counters.series_key_comparisons
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn fit_quality_benchmark_reference() {
-        use std::time::Instant;
-
-        const STORE_SERIES_COUNT: usize = 512;
-        const TARGET_INDICES: [usize; 10] = [0, 56, 112, 168, 224, 280, 336, 392, 448, 504];
-        const RUNS: usize = 20;
-
-        fn median_micros(values: &mut [u128]) -> u128 {
-            values.sort_unstable();
-            values[values.len() / 2]
-        }
-
-        let duration = 5 * HOUR;
-        let current_reset = 24_000_000_000_i64 + duration;
-        let now = current_reset - 60;
-        let build_store = |include_history: bool| {
-            let mut series = Vec::with_capacity(STORE_SERIES_COUNT);
-            let mut target_keys = Vec::with_capacity(TARGET_INDICES.len());
-            for index in 0..STORE_SERIES_COUNT {
-                let account = format!("benchmark-{index:03}");
-                let window = format!("window-{index:03}.v1");
-                let key = test_key("fixture", &account, &window);
-                let target = TARGET_INDICES.contains(&index);
-                let mut samples = Vec::new();
-                if target {
-                    if include_history {
-                        for offset in 1..=RETENTION_MAX_CYCLES {
-                            let reset = current_reset - offset as i64 * duration;
-                            samples.extend((0..PHASE_BUCKET_COUNT).map(|bucket| {
-                                let phase = (bucket as f64 + 0.25) / PHASE_BUCKET_COUNT as f64;
-                                quota_sample(
-                                    reset,
-                                    duration,
-                                    phase,
-                                    (phase * 80.0).max(0.1),
-                                    SampleOrigin::LiveV3,
-                                )
-                            }));
-                        }
-                    }
-                    samples.extend((0..PHASE_BUCKET_COUNT).map(|bucket| {
-                        let phase = (bucket as f64 + 0.25) / PHASE_BUCKET_COUNT as f64;
-                        quota_sample(
-                            current_reset,
-                            duration,
-                            phase,
-                            (phase * 80.0).max(0.1),
-                            SampleOrigin::LiveV3,
-                        )
-                    }));
-                    target_keys.push(key.clone());
-                }
-                series.push(SeriesState {
-                    provider_id: key.provider_id.clone(),
-                    account_scope: key.account_scope.clone(),
-                    window_key: key.window_key.clone(),
-                    active_reset_at: target.then_some(current_reset),
-                    last_activity_at: now,
-                    rollover: target.then(|| ObservedState::Watching {
-                        reset_at: current_reset,
-                        first_seen_at: now,
-                        last_seen_at: now,
-                        consecutive_count: 1,
-                    }),
-                    samples,
-                });
-            }
-            (
-                Store {
-                    schema_version: HISTORY_SCHEMA_VERSION,
-                    series,
-                },
-                target_keys,
-            )
-        };
-
-        let (partial_store, partial_keys) = build_store(false);
-        let (completed_store, completed_keys) = build_store(true);
-        let mut partial_runs = Vec::with_capacity(RUNS);
-        let mut completed_runs = Vec::with_capacity(RUNS);
-        let mut windows_runs = Vec::with_capacity(RUNS);
-        for _ in 0..RUNS {
-            reset_fit_work_counters();
-            let partial_start = Instant::now();
-            let partial = calculate_target(
-                &partial_store,
-                &partial_keys[0],
-                current_reset,
-                duration,
-                79.0,
-                now,
-            );
-            partial_runs.push(partial_start.elapsed().as_micros());
-            assert_eq!(partial.complete_cycles, 0);
-            assert!(partial.pace.is_some());
-            let counters = fit_work_counters();
-            assert_eq!(counters.target_sample_reads, PHASE_BUCKET_COUNT);
-            assert_eq!(counters.target_profiles_built, 0);
-            assert_eq!(counters.non_target_sample_reads, 0);
-            assert_eq!(counters.non_target_profiles_built, 0);
-            assert!(counters.walk_forward_fits <= 45);
-
-            reset_fit_work_counters();
-            let completed_start = Instant::now();
-            let completed = calculate_target(
-                &completed_store,
-                &completed_keys[0],
-                current_reset,
-                duration,
-                79.0,
-                now,
-            );
-            completed_runs.push(completed_start.elapsed().as_micros());
-            assert_eq!(completed.complete_cycles, RETENTION_MAX_CYCLES);
-            assert!(completed.pace.is_some());
-            let counters = fit_work_counters();
-            assert_eq!(
-                counters.target_sample_reads,
-                (RETENTION_MAX_CYCLES + 1) * PHASE_BUCKET_COUNT
-            );
-            assert_eq!(counters.target_profiles_built, RETENTION_MAX_CYCLES);
-            assert_eq!(
-                counters.lobo_folds,
-                RETENTION_MAX_CYCLES * PHASE_BUCKET_COUNT
-            );
-            assert_eq!(counters.loco_folds, RETENTION_MAX_CYCLES);
-            assert_eq!(counters.non_target_sample_reads, 0);
-            assert_eq!(counters.non_target_profiles_built, 0);
-
-            reset_fit_work_counters();
-            let windows_start = Instant::now();
-            for key in &completed_keys {
-                let calculation =
-                    calculate_target(&completed_store, key, current_reset, duration, 79.0, now);
-                assert_eq!(calculation.complete_cycles, RETENTION_MAX_CYCLES);
-                assert!(calculation.pace.is_some());
-            }
-            windows_runs.push(windows_start.elapsed().as_micros());
-            let counters = fit_work_counters();
-            assert_eq!(
-                counters.target_sample_reads,
-                completed_keys.len() * (RETENTION_MAX_CYCLES + 1) * PHASE_BUCKET_COUNT
-            );
-            assert_eq!(
-                counters.target_profiles_built,
-                completed_keys.len() * RETENTION_MAX_CYCLES
-            );
-            assert_eq!(
-                counters.lobo_folds,
-                completed_keys.len() * RETENTION_MAX_CYCLES * PHASE_BUCKET_COUNT
-            );
-            assert_eq!(
-                counters.loco_folds,
-                completed_keys.len() * RETENTION_MAX_CYCLES
-            );
-            assert_eq!(counters.non_target_sample_reads, 0);
-            assert_eq!(counters.non_target_profiles_built, 0);
-        }
-        println!(
-            "fit_quality_benchmark_reference {{\"partialMedianUs\":{},\"maxRetentionMedianUs\":{},\"windows10MedianUs\":{}}}",
-            median_micros(&mut partial_runs),
-            median_micros(&mut completed_runs),
-            median_micros(&mut windows_runs)
-        );
+        assert!(before_result.pace.is_some());
     }
 }
