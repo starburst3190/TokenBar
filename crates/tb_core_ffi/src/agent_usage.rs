@@ -1507,18 +1507,48 @@ fn apply_provider_outcome(
 
 pub async fn run(publication_generation: u64) -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    // Read once, before any future is built. A provider the user switched off
+    // must not have its future CREATED, not merely have its card dropped
+    // afterwards: `tokio::join!` below returns when the slowest one finishes,
+    // so a post-hoc filter would still pay the full wait. The Antigravity CLI
+    // fallback is the case that made this matter — it spawns a ~170MB binary
+    // and takes seconds, and it was holding up the Claude card for users who
+    // do not use Antigravity at all.
+    let disabled = crate::disabled_providers::snapshot();
+    let enabled = |id: &str| !disabled.contains(id);
     let (codex, claude, antigravity, copilot, grok) = tokio::join!(
-        fetch_codex(),
-        fetch_claude_accounts(),
-        fetch_antigravity(),
-        fetch_copilot(),
-        fetch_grok()
+        async { if enabled("codex") { Some(fetch_codex().await) } else { None } },
+        async {
+            if enabled("claude") {
+                fetch_claude_accounts().await
+            } else {
+                Vec::new()
+            }
+        },
+        async {
+            if enabled("antigravity") {
+                Some(fetch_antigravity().await)
+            } else {
+                None
+            }
+        },
+        async { if enabled("copilot") { fetch_copilot().await } else { None } },
+        async { if enabled("grok") { fetch_grok().await } else { None } }
     );
-    let mut agents = vec![codex];
+    // Same order as before: codex, the Claude cards, antigravity, then the two
+    // that were already conditional. A disabled provider contributes no card,
+    // which is what makes it disappear from the UI — there is no separate
+    // hiding step.
+    let mut agents = Vec::new();
+    if let Some(codex) = codex {
+        agents.push(codex);
+    }
     // The primary first, then any extra config directories. With none
     // configured this is the single Claude card it has always been.
     agents.extend(claude);
-    agents.push(antigravity);
+    if let Some(antigravity) = antigravity {
+        agents.push(antigravity);
+    }
     // Copilot only appears when signed in (via opencode); skip a bare not-signed-in error card.
     if let Some(copilot) = copilot {
         agents.push(copilot);
@@ -5712,6 +5742,39 @@ mod tests {
         gate.clear();
         assert!(gate.blocked_until_for(&binding_a, now).is_none());
         scope.cleanup();
+    }
+
+    /// The whole point of the registry is that a disabled provider's future is
+    /// never built. With every provider switched off this runs to completion
+    /// touching no network at all — which is also why it is safe as a hermetic
+    /// test: any provider still being fetched would need credentials and a
+    /// socket, and would put a card in the payload.
+    #[tokio::test]
+    async fn every_disabled_provider_is_skipped_before_its_future_is_built() {
+        let _guard = crate::disabled_providers::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::disabled_providers::reset_for_test();
+        crate::disabled_providers::set_from_json(
+            r#"["codex","claude","antigravity","copilot","grok"]"#,
+        )
+        .unwrap();
+
+        let payload = run(1).await;
+
+        assert!(
+            payload.agents.is_empty(),
+            "a disabled provider must contribute no card; a card here means its \
+             future was created and awaited, which is the wait this exists to \
+             remove — got {:?}",
+            payload
+                .agents
+                .iter()
+                .map(|a| a.client_id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        crate::disabled_providers::reset_for_test();
     }
 
     #[tokio::test]
