@@ -20,6 +20,9 @@ struct PopoverView: View {
     @EnvironmentObject private var chrome: PopoverChrome
     /// Height at the start of the active resize drag (global-space gesture).
     @State private var dragBase: CGFloat?
+    /// Root host for the shared hover tooltip; cards push their panel here and
+    /// HoverTooltipLayer (overlaid on the scroll viewport) renders it.
+    @State private var tooltipHost = TooltipHost()
 
     // The popover's model owns the shared restore snapshot — its per-open
     // teardown/rebuild is exactly what the cache exists to speed up.
@@ -210,24 +213,24 @@ struct PopoverView: View {
                 .padding(.horizontal, 12)
                 .padding(.bottom, 10)
             Divider()
-            GeometryReader { viewport in
-                ScrollView {
-                    content
-                        .padding(12)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(OverlayScrollerEnforcer())
-                }
-                // Live global frame for tooltip clamp. While the height
-                // handle is dragged, publish nil so placement falls back to
-                // the source card only — avoids every-pixel env churn AND a
-                // frozen pre-drag rect that would leave a fake dodge after
-                // the user hovers Models/Usage immediately post-resize.
-                .environment(
-                    \.popoverScrollViewport,
-                    dragBase == nil ? viewport.frame(in: .global) : nil)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipped()
+            ScrollView {
+                content
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(OverlayScrollerEnforcer())
             }
+            .clipped()
+            // The scroll viewport is the true bottom for hover tooltips —
+            // content past it is clipped — so name its coordinate space (cards
+            // report the cursor here) and float a single tooltip layer over it,
+            // above every card and stopping at the viewport edge.
+            .coordinateSpace(name: PopoverViewport.space)
+            .overlay(alignment: .topLeading) {
+                GeometryReader { geo in
+                    HoverTooltipLayer(viewportSize: geo.size)
+                }
+            }
+            .environment(tooltipHost)
             Divider()
             footer
         }
@@ -236,6 +239,12 @@ struct PopoverView: View {
         // entire view tree — for every pointer event.
         .frame(width: chrome.width)
         .frame(maxHeight: .infinity)
+        // Container-level tooltip invalidation: a tab switch swaps every card
+        // under the cursor, and a payload refresh can change the data a shown
+        // panel was built from while the cursor sits still (no hover event
+        // fires to rebuild it) — drop the panel rather than show stale numbers.
+        .onChange(of: activeTab) { tooltipHost.clear() }
+        .onChange(of: model.payload?.meta.generatedAt) { tooltipHost.clear() }
         .animation(.easeOut(duration: 0.16), value: activeViewRaw)
         .animation(.easeOut(duration: 0.16), value: activeTab)
         .background(PopoverBackdrop().ignoresSafeArea())

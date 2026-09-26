@@ -35,6 +35,8 @@ private struct FooterLink: View {
 }
 
 struct SettingsWindowView: View {
+    /// Root host for the shared hover tooltip; see the preview column.
+    @State private var tooltipHost = TooltipHost()
     static let contentSize = CGSize(width: 856, height: 580)
 
     // Settings manages process-wide tray preferences, so its client universe
@@ -157,6 +159,19 @@ struct SettingsWindowView: View {
             }
             .scrollIndicators(.never)
             .frame(width: 330)
+            // AgentLimitsCard reports its trend hover to the shared tooltip
+            // host, so this window has to provide one: the card is not
+            // popover-only, and the host is a hard environment dependency.
+            // Same shape as PopoverView — the viewport's coordinate space is
+            // what cards anchor against, and one layer over it floats the
+            // panel above the cards and stops it at the visible floor.
+            .coordinateSpace(name: PopoverViewport.space)
+            .overlay(alignment: .topLeading) {
+                GeometryReader { geo in
+                    HoverTooltipLayer(viewportSize: geo.size)
+                }
+            }
+            .environment(tooltipHost)
         }
         .frame(width: Self.contentSize.width, height: Self.contentSize.height)
         .background(PopoverBackdrop().ignoresSafeArea())
