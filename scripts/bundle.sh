@@ -23,7 +23,9 @@ APP="$OUT_DIR/$APP_NAME.app"
 
 echo "==> building release binaries"
 cargo build --release
-swift build -c release
+# Native build system: Swift 6.4's default (swift-build) records SDK 14.0 in
+# the binary and AppKit then draws pre-macOS 26 window chrome. See Makefile.
+swift build --build-system native -c release
 
 echo "==> assembling $APP ($VERSION, build $BUILD_NUMBER, $BUNDLE_ID)"
 rm -rf "$APP"
