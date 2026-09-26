@@ -2,6 +2,14 @@ import AppKit
 import SwiftUI
 import TokenBarCore
 
+/// Base (unscaled) content size of the settings window — the single source
+/// for the view's fixed frame, the scale modifier, and the window
+/// controller's scaled sizing and close placeholder.
+enum SettingsWindowMetrics {
+    static let width: CGFloat = 856
+    static let height: CGFloat = 580
+}
+
 /// Standalone settings window: the settings form on the left, a live preview
 /// column on the right. Every control writes UserDefaults and every preview
 /// piece reads the same keys (plus the real menu bar reacts anyway), so
@@ -37,7 +45,8 @@ private struct FooterLink: View {
 struct SettingsWindowView: View {
     /// Root host for the shared hover tooltip; see the preview column.
     @State private var tooltipHost = TooltipHost()
-    static let contentSize = CGSize(width: 856, height: 580)
+    static let contentSize = CGSize(
+        width: SettingsWindowMetrics.width, height: SettingsWindowMetrics.height)
 
     // Settings manages process-wide tray preferences, so its client universe
     // stays all-time even when the dashboard is scoped to one saved year. The
@@ -45,6 +54,7 @@ struct SettingsWindowView: View {
     // popover's restore snapshot with its independently polled data.
     @State private var model = DashboardModel(initialYear: nil)
     @State private var tokensPerMin: Double?
+    @AppStorage(PopoverScale.storageKey) private var popoverScaleRaw = PopoverScale.default.rawValue
     /// Set only when a caller asked for a specific place; the intro card is
     /// the one caller today. Nil means an ordinary open, which must land
     /// wherever the user last was.
@@ -174,6 +184,9 @@ struct SettingsWindowView: View {
             .environment(tooltipHost)
         }
         .frame(width: Self.contentSize.width, height: Self.contentSize.height)
+        .modifier(PopoverScaleModifier(
+            baseWidth: Self.contentSize.width, baseHeight: Self.contentSize.height,
+            scale: (PopoverScale(rawValue: popoverScaleRaw) ?? .default).factor))
         .background(PopoverBackdrop().ignoresSafeArea())
         .task { await model.load() }
         // The attribution page is built from the model report, and `load()` is

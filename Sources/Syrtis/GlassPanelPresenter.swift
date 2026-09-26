@@ -100,13 +100,19 @@ final class GlassPanelPresenter {
         installEventMonitors()
     }
 
-    /// Top edge pinned just under the anchor button.
+    /// Top edge pinned just under the anchor button. `height` is the unscaled
+    /// chrome height; the PopoverScale factor is applied here, the one place
+    /// every path (present, drag, Settings) sizes the panel through, so the
+    /// window stays in sync with the scaleEffect PopoverView applies to its
+    /// content.
     func layout(height: CGFloat, animate: Bool) {
         guard let button = anchor, let window = button.window else { return }
         let anchorRect = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let scale = PopoverScale.current.factor
         let frame = Self.frame(
             anchor: anchorRect, visible: window.screen?.visibleFrame,
-            width: PopoverChrome.width, height: height)
+            width: (PopoverChrome.width * scale).rounded(),
+            height: (height * scale).rounded())
         panel.setFrame(frame, display: true, animate: animate)
         panel.invalidateShadow()
     }
