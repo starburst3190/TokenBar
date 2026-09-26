@@ -61,6 +61,7 @@ struct SettingsPanel: View {
     /// view bumps, so an outside write is observed here and bumps it too.
     @AppStorage(UsageAttribution.confirmedKey) private var observedConfirmedRaw = ""
     @AppStorage(TrayMode.storageKey) private var trayModeRaw = TrayMode.todayTokens.rawValue
+    @AppStorage(PopoverScale.storageKey) private var popoverScaleRaw = PopoverScale.default.rawValue
     @AppStorage(MenuBarTextColor.storageKey) private var textColorMode = MenuBarTextColor.automatic.rawValue
     @AppStorage(MenuBarTextColor.customColorKey) private var textColorHex = MenuBarTextColor.defaultHex
     @AppStorage(MenuBarTextColor.warningColorKey) private var warningTextColorHex = QuotaColorLevel.warning.defaultHex
@@ -939,6 +940,13 @@ struct SettingsPanel: View {
                             }
                         }))
             }
+        }
+
+        section("Menu size") {
+            radioGroup(
+                selection: $popoverScaleRaw,
+                options: PopoverScale.allCases.map { ($0.rawValue, $0.label) })
+            hint("Scales the whole menu — text, icons and layout — proportionally. Reopen the menu to see the new size.")
         }
 
         section("Data refresh") {
