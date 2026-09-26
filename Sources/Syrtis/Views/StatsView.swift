@@ -43,7 +43,7 @@ struct StatsView: View {
             if let modelsUnavailableNote {
                 Text(verbatim: modelsUnavailableNote)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 UsageAttributionBreakdownCard(
@@ -78,7 +78,7 @@ struct StatsView: View {
                             .foregroundStyle(m.accent ? AnyShapeStyle(Color(hex: "#22c55e")) : AnyShapeStyle(.primary))
                         Text(m.label.localized)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                     }
                 }
             }
@@ -87,7 +87,7 @@ struct StatsView: View {
                 if let favorite {
                     HStack {
                         Text("Favorite model")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                         Spacer()
                         HStack(spacing: 5) {
                             Circle()
@@ -103,7 +103,7 @@ struct StatsView: View {
                 if let bestDay = stats.bestDay {
                     HStack {
                         Text("Best day")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                         Spacer()
                         Text("\(Format.monthDay(bestDay.date)) · \(Format.usd(bestDay.cost))")
                     }

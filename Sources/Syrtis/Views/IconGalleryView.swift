@@ -33,7 +33,7 @@ struct IconGalleryView: View {
                             .lineLimit(1)
                         Text(ClientRegistry.style(id).displayName)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                             .lineLimit(1)
                     }
                     .frame(width: 110)

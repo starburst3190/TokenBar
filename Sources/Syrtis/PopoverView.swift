@@ -577,7 +577,7 @@ struct PopoverView: View {
             } label: {
                 Text((model.year ?? "All").localized)
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.visible)
@@ -597,7 +597,7 @@ struct PopoverView: View {
                     .font(.caption.weight(.semibold))
                 Text("Switch to the Syrtis 1.0 release — keeps your data")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             Spacer()
             Button("Switch") { BridgeBuild.switchToRelease() }
@@ -608,7 +608,7 @@ struct PopoverView: View {
             } label: {
                 Image(systemName: "xmark")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             .buttonStyle(.plain)
             .help("Dismiss")
@@ -637,7 +637,7 @@ struct PopoverView: View {
         } label: {
             Image(systemName: "slider.horizontal.3")
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(showQuickSettings ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                .foregroundStyle(showQuickSettings ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondaryAdaptive))
                 .frame(width: 16, height: 16)
         }
         .buttonStyle(.plain)
@@ -660,7 +660,7 @@ struct PopoverView: View {
                     // where the data is stale and nothing is running to fix it.
                     // Tinting the existing glyph says so without adding a
                     // control; the age itself is in the tooltip.
-                    .foregroundStyle(showingStaleRestore ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                    .foregroundStyle(showingStaleRestore ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondaryAdaptive))
                     .frame(width: 16, height: 16)
             }
         }
@@ -734,7 +734,7 @@ struct PopoverView: View {
             Text(verbatim: (tokensPerMin.map { "\(Format.compactTokens(Int64($0.rounded()))) tok/min" } ?? "— tok/min")
                 + (model.deviceOverlay.includesRemote ? " " + DeviceOverlayCopy.thisMacLive.localized : ""))
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
         }
     }
 
@@ -764,12 +764,12 @@ struct PopoverView: View {
                 ProgressView()
                     .controlSize(.small)
                 Text("Loading usage…")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             .frame(maxWidth: .infinity, minHeight: 120)
         case let .failed(message):
             Label(message, systemImage: "exclamationmark.triangle")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .frame(maxWidth: .infinity, minHeight: 120)
         case .ready:
             lens
@@ -913,7 +913,7 @@ struct PopoverView: View {
                     if model.deviceOverlay.includesRemote {
                         Text(DeviceOverlayCopy.windowUsageThisMacOnly.localized)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                             .frame(maxWidth: .infinity, alignment: .trailing)
                             .padding(.bottom, Self.totalsCardGap)
                     }
@@ -1004,7 +1004,7 @@ struct PopoverView: View {
         HStack {
             Text(effectiveView.label)
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             Spacer()
             if let version = UpdaterService.shared.availableVersion {
                 Button {

@@ -168,7 +168,7 @@ struct AttributionOnboardingCardView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(AttributionOnboardingCard.Copy.subtitle.localized)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .fixedSize(horizontal: false, vertical: true)
 
             if let applyFailure {
@@ -191,13 +191,13 @@ struct AttributionOnboardingCardView: View {
                     Text(AttributionOnboardingCard.Copy.moreCount.localized(
                         Int64(summary.records.count - AttributionOnboardingCard.maxVisibleLines)))
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
                 if summary.unsuggestedCount > 0 {
                     Text(AttributionOnboardingCard.Copy.unsuggestedHint.localized(
                         Int64(summary.unsuggestedCount)))
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
             }
 
@@ -207,7 +207,7 @@ struct AttributionOnboardingCardView: View {
                 }
                 .buttonStyle(.plain)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
 
                 Button(AttributionOnboardingCard.Copy.setUpManually.localized) {
                     SettingsWindowController.shared.showFromPopover(scrollingTo: .usageAttribution)

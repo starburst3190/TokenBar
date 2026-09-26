@@ -22,7 +22,7 @@ struct CursorSyncNoticeCardView: View {
                     ForEach(CursorSync.consentParagraphs(profiles: cursorSync.profiles), id: \.self) { paragraph in
                         Text(paragraph.localized)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     HStack(spacing: 10) {
@@ -32,7 +32,7 @@ struct CursorSyncNoticeCardView: View {
                         }
                         .buttonStyle(.plain)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         Button(CursorSync.Copy.continue.localized) {
                             CursorSyncController.shared.answerNotice(continuing: true)
                         }

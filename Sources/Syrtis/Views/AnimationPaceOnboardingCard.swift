@@ -64,7 +64,7 @@ struct AnimationPaceOnboardingCardView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(AnimationPaceOnboarding.Copy.body.localized)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .fixedSize(horizontal: false, vertical: true)
                     ForEach(AnimationPace.allCases, id: \.self) { pace in
                         Button {
@@ -77,7 +77,7 @@ struct AnimationPaceOnboardingCardView: View {
                     HStack {
                         Text(AnimationPaceOnboarding.Copy.recommended.localized)
                             .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                         Spacer()
                         Button(OnboardingSetupCopy.done.localized) {
                             if AnimationPace(rawValue: paceRaw) == nil {
@@ -107,7 +107,7 @@ struct AnimationPaceOnboardingCardView: View {
                 Text(pace.label.localized).font(.caption.weight(.semibold))
                 Text(pace.detail.localized)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

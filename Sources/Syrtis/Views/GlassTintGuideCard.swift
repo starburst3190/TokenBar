@@ -25,7 +25,7 @@ struct GlassTintGuideCardView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(Self.copyBody.localized)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .fixedSize(horizontal: false, vertical: true)
                     GlassTintSlider()
                     HStack {
