@@ -53,89 +53,135 @@ struct QuotaView: View {
     var trend: SubscriptionTrend?
 
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
+    @AppStorage(QuotaCard.hiddenKey) private var hiddenCardsRaw = ""
+    @AppStorage(QuotaCard.orderKey) private var cardOrderRaw = ""
 
     var body: some View {
+        // Filtered by what this surface actually draws, not merely by what the
+        // user left switched on: `visible` still contains the cards belonging
+        // to the OTHER surface, and counting those would report a lens as
+        // populated while it renders nothing.
+        let cards = QuotaCard.visible(hiddenRaw: hiddenCardsRaw, orderRaw: cardOrderRaw)
+            .filter(renders)
         VStack(spacing: 12) {
+            ForEach(cards, id: \.self) { card in
+                self.card(card)
+            }
+            // A lens with nothing in it reads as a bug rather than a choice —
+            // say which it is, and where the choice was made.
+            if cards.isEmpty {
+                Text("No quota cards are switched on. Turn some back on in Settings › Dashboard.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// Whether `card` draws anything here. The two surfaces answer different
+    /// questions (see the type's doc comment), so a card absent from one is not
+    /// a card the user hid — and `card(_:)` below does not re-state any of
+    /// this, because a rule stated twice is a rule that gets reconciled once.
+    private func renders(_ card: QuotaCard) -> Bool {
+        switch card {
+        case .windowUsage: return singleClient != nil && windowCard != nil
+        case .trend: return singleClient == nil
+        case .historyStrip, .heatmap: return singleClient == nil || hasNoWindowCard
+        case .limits: return limitsEnabled
+        case .history: return singleClient != nil && !hasNoWindowCard
+        }
+    }
+
+    /// A client tab with no window card to list a history for: a Bot-only Grok
+    /// install, or a tab whose client reports no quota. It shows the Past
+    /// windows strip and the heatmap, filtered to its own clients, where every
+    /// other client tab shows Window history. These folds need quota history
+    /// only. A grouped tab with a window card (Grok Build & Bot, Antigravity)
+    /// takes the window history, the same card as every other client tab; its
+    /// other member's windows stay on the all-agent Quota lens.
+    private var hasNoWindowCard: Bool {
+        singleClient != nil && windowCard == nil
+    }
+
+    /// The strip and heatmap's "could not read" note: any shown client with an
+    /// unread window.
+    private var unreadable: Bool {
+        singleClient == nil
+            ? !stripUnreadableClients.isEmpty
+            : !stripUnreadableClients.isDisjoint(with: clientIds)
+    }
+
+    @ViewBuilder
+    private func card(_ card: QuotaCard) -> some View {
+        switch card {
+        case .windowUsage:
+            if let windowCard {
+                // Above its siblings: a `zIndex` set inside the card orders
+                // that card's children, not the card among these.
+                WindowUsageCard(
+                    state: windowCard, account: accountContext,
+                    onSelectAccount: onSelectAccount).zIndex(1)
+            }
+        case .trend:
+            // Answers "where is my spend going" across subscriptions, which
+            // the window-by-window cards cannot.
+            SubscriptionTrendCard(trend: trend)
+        case .historyStrip:
+            QuotaHistoryStripCard(
+                summaries: singleClient == nil
+                    ? windowSummaries : windowSummaries.filter { clientIds.contains($0.clientId) },
+                equivalences: equivalences, attempted: usageAttempted,
+                unreadable: unreadable)
+        case .heatmap:
+            // Default order puts this after the strip, not before: the strip
+            // says how much each window consumed, and this says when. "When"
+            // is only a question once "how much" has an answer.
+            QuotaHeatmapCard(
+                windows: singleClient == nil
+                    ? heatmapWindows : heatmapWindows.filter { clientIds.contains($0.clientId) },
+                heatmaps: heatmaps, equivalences: equivalences,
+                attempted: usageAttempted,
+                unreadable: unreadable)
+        case .limits:
             if let singleClient {
-                if let windowCard {
-                    // Above its siblings: a `zIndex` set inside the card orders
-                    // that card's children, not the card among these.
-                    WindowUsageCard(
-                        state: windowCard, account: accountContext,
-                        onSelectAccount: onSelectAccount).zIndex(1)
-                }
-                if limitsEnabled {
-                    AgentLimitsCard(
-                        clients: clientIds, trace: trace, agentUsage: agentUsage,
-                        usageAttempted: usageAttempted,
-                        title: "%@ limits".localized(
-                            ClientRegistry.tabDisplayName(singleClient)),
-                        note: "Session / weekly / model limits",
-                        restrict: true, curves: windowCurves)
-                }
-                if windowCard == nil {
-                    // No window card to list a history for: a Bot-only Grok
-                    // install, or a tab whose client reports no quota. These
-                    // folds need quota history only. A grouped tab with a
-                    // window card (Grok Build & Bot, Antigravity) takes the
-                    // window history below, the same card as every other
-                    // client tab; its other member's windows stay on the
-                    // all-agent Quota lens.
-                    QuotaHistoryStripCard(
-                        summaries: windowSummaries.filter { clientIds.contains($0.clientId) },
-                        equivalences: equivalences, attempted: usageAttempted,
-                        unreadable: !stripUnreadableClients.isDisjoint(with: clientIds))
-                    QuotaHeatmapCard(
-                        windows: heatmapWindows.filter { clientIds.contains($0.clientId) },
-                        heatmaps: heatmaps, equivalences: equivalences,
-                        attempted: usageAttempted,
-                        unreadable: !stripUnreadableClients.isDisjoint(with: clientIds))
-                } else {
-                    QuotaHistoryCard(
-                        clientId: singleClient, cycles: quotaCycles,
-                        rows: quotaHistory, colors: colors,
-                        attempted: usageAttempted && !historyPending,
-                        scanFailed: scanFailed, curveUnreadable: curveUnreadable,
-                        account: accountContext)
-                        // The card holds per-window state — how many rows the
-                        // reader has grown the list to, and which row is open — and
-                        // switching windows inside one client does not by itself
-                        // rebuild it. Keyed on the RESOLVED window rather than the
-                        // stored preference: a choice saved for another client does
-                        // not move this one's window, and a window vanishing from
-                        // the payload moves it without the preference changing.
-                        // Same resolution the cycle list itself went through, so
-                        // the key cannot name a window other than the one the rows
-                        // came from.
-                        // The account is part of the identity (history vocabulary:
-                        // three-part for a non-primary account), so switching
-                        // account rebuilds the card instead of keeping the
-                        // other account's expanded rows.
-                        .id(WindowCardLoader.historyCardId(
-                            payload: agentUsage, clientId: singleClient,
-                            accountKey: accountContext?.resolved))
-                }
-            } else {
-                // Trend first: it answers "where is my spend going" across
-                // subscriptions, which the window-by-window card below cannot.
-                SubscriptionTrendCard(trend: trend)
-                QuotaHistoryStripCard(
-                    summaries: windowSummaries, equivalences: equivalences,
-                    attempted: usageAttempted,
-                    unreadable: !stripUnreadableClients.isEmpty)
-                // After the strip, not before: the strip says how much each
-                // window consumed, and this says when. "When" is only a
-                // question once "how much" has an answer.
-                QuotaHeatmapCard(
-                    windows: heatmapWindows, heatmaps: heatmaps,
-                    equivalences: equivalences, attempted: usageAttempted,
-                    unreadable: !stripUnreadableClients.isEmpty)
-                if limitsEnabled {
-                    AgentLimitsCard(
+                AgentLimitsCard(
                     clients: clientIds, trace: trace, agentUsage: agentUsage,
-                        usageAttempted: usageAttempted,
-                        reorderable: true, curves: windowCurves)
-                }
+                    usageAttempted: usageAttempted,
+                    title: "%@ limits".localized(
+                        ClientRegistry.tabDisplayName(singleClient)),
+                    note: "Session / weekly / model limits",
+                    restrict: true, curves: windowCurves)
+            } else {
+                AgentLimitsCard(
+                    clients: clientIds, trace: trace, agentUsage: agentUsage,
+                    usageAttempted: usageAttempted,
+                    reorderable: true, curves: windowCurves)
+            }
+        case .history:
+            if let singleClient {
+                QuotaHistoryCard(
+                    clientId: singleClient, cycles: quotaCycles,
+                    rows: quotaHistory, colors: colors,
+                    attempted: usageAttempted && !historyPending,
+                    scanFailed: scanFailed, curveUnreadable: curveUnreadable,
+                    account: accountContext)
+                    // The card holds per-window state — how many rows the
+                    // reader has grown the list to, and which row is open — and
+                    // switching windows inside one client does not by itself
+                    // rebuild it. Keyed on the RESOLVED window rather than the
+                    // stored preference: a choice saved for another client does
+                    // not move this one's window, and a window vanishing from
+                    // the payload moves it without the preference changing.
+                    // Same resolution the cycle list itself went through, so
+                    // the key cannot name a window other than the one the rows
+                    // came from.
+                    // The account is part of the identity (history vocabulary:
+                    // three-part for a non-primary account), so switching
+                    // account rebuilds the card instead of keeping the
+                    // other account's expanded rows.
+                    .id(WindowCardLoader.historyCardId(
+                        payload: agentUsage, clientId: singleClient,
+                        accountKey: accountContext?.resolved))
             }
         }
     }
