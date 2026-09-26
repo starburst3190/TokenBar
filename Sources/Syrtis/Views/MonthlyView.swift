@@ -55,7 +55,9 @@ struct MonthlyView: View {
     private static let rowsSpace = "monthly-model-rows"
 
     /// Pure bucketing, internal (not private) so SelfTest can pin it.
-    static func monthRows(
+    /// `nonisolated`: pure data fold with no UI state, called from SelfTest's
+    /// nonisolated context (it would otherwise inherit @MainActor from View).
+    nonisolated static func monthRows(
         payload: UsagePayload, clientIds: [String], turnClientIds: [String] = []
     ) -> [MonthRow] {
         let allow = Set(clientIds)
@@ -92,7 +94,9 @@ struct MonthlyView: View {
 
     /// Drill-down: merge model slices across the month's days (Daily merges
     /// within ONE contribution; Monthly must fold ~31 of them).
-    static func modelSlices(
+    /// `nonisolated`: pure fold over the payload, called from SelfTest's
+    /// nonisolated context (it would otherwise inherit @MainActor from View).
+    nonisolated static func modelSlices(
         for row: MonthRow, clientIds: [String], colors: ModelColorMap
     ) -> [ModelSlice] {
         let allow = Set(clientIds)
