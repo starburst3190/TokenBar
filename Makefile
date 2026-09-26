@@ -3,6 +3,13 @@
 
 .PHONY: all rust build run clean check-docs selftest selftest-bundled
 
+# SwiftPM's native build system, explicitly. Swift 6.4 switched the default to
+# swift-build, which records the deployment target (14.0) as the SDK in
+# LC_BUILD_VERSION. AppKit keys its look off the linked SDK, so a binary that
+# claims SDK 14 gets pre-macOS 26 window chrome — the settings window's traffic
+# lights lose the Liquid Glass style. scripts/bundle.sh uses the same flag.
+SWIFT_BUILD_SYSTEM = --build-system native
+
 all: build
 
 # `make run` starts the dev app against the engine's cache directory, by default
@@ -37,7 +44,7 @@ rust:
 build: rust
 	@$(call relink_if_stale,debug)
 	@$(call rebuild_if_header_stale,debug)
-	swift build
+	swift build $(SWIFT_BUILD_SYSTEM)
 	@$(call sync_localizations,debug)
 
 # Depends on `build`, not `rust`: the localization sync copies into
@@ -45,12 +52,12 @@ build: rust
 # fresh or freshly cleaned checkout.
 run: build
 	@$(if $(DEV_CONFIG_DIR),echo "$(DEV_CONFIG_NOTE)")
-	$(if $(DEV_CONFIG_DIR),TOKSCALE_CONFIG_DIR="$(DEV_CONFIG_DIR)" )swift run Syrtis
+	$(if $(DEV_CONFIG_DIR),TOKSCALE_CONFIG_DIR="$(DEV_CONFIG_DIR)" )swift run $(SWIFT_BUILD_SYSTEM) Syrtis
 
 # Several assertions compare against English UI copy, so the language is
 # pinned here rather than inherited from the developer's Mac.
 selftest: build
-	swift run Syrtis --selftest -AppleLanguages "(en)"
+	swift run $(SWIFT_BUILD_SYSTEM) Syrtis --selftest -AppleLanguages "(en)"
 
 # The same suite from the configuration that ships: release, inside a .app.
 #
@@ -102,7 +109,7 @@ selftest: build
 SELFTEST_BUNDLE_ID ?= com.nyanako.tokenbar.selftest
 selftest-bundled: rust
 	@$(call relink_if_stale,release)
-# scripts/bundle.sh runs a plain `swift build -c release`, which keeps an
+# scripts/bundle.sh runs its own `swift build -c release`, which keeps an
 # imported CTB module built against the previous header. Without this the
 # bundled ABI-seam gate can pass on an incremental checkout against
 # declarations the library no longer has — the exact failure the debug target
@@ -118,7 +125,7 @@ clean:
 bundle: rust
 	@$(call relink_if_stale,release)
 	@$(call rebuild_if_header_stale,release)
-	swift build -c release
+	swift build $(SWIFT_BUILD_SYSTEM) -c release
 	scripts/bundle.sh
 
 # SwiftPM does not track the Rust staticlib as a dependency: with no Swift
