@@ -92,6 +92,21 @@ public struct ClaudeConfigDirsResult: Decodable, Equatable, Sendable {
     public let rejected: [RejectedConfigDir]
 }
 
+/// One provider id `tb_set_disabled_providers` refused, and why. The only
+/// reason today is an id outside the known set; it is reported rather than
+/// ignored so a typo in a stored setting cannot look like a working toggle.
+public struct RejectedProvider: Decodable, Equatable, Sendable {
+    public let id: String
+    public let reason: String
+}
+
+/// Result of `tb_set_disabled_providers`.
+public struct DisabledProvidersResult: Decodable, Equatable, Sendable {
+    /// Providers that will not be fetched at all on the next publication.
+    public let disabledCount: Int
+    public let rejected: [RejectedProvider]
+}
+
 /// One client id `tb_set_keychain_consent` refused, and why: the core wires
 /// Keychain consent for a fixed set of clients, and a grant nothing reads
 /// would claim the user was asked about a dialog that still appears unasked.
@@ -387,6 +402,21 @@ public enum TBCore {
     /// user configured — not the scan subset the core accepted.
     public static func setClaudeConfigDirs(json: String) throws -> ClaudeConfigDirsResult {
         try unwrap(json.withCString { tb_set_claude_config_dirs($0) })
+    }
+
+    /// Replace the process-wide registry of quota providers the user switched
+    /// off. `json` is an array of provider ids (`codex`, `claude`,
+    /// `antigravity`, `copilot`, `grok`, `grok-bot`, `kiro`, `opencode-go`);
+    /// full-replace semantics — `[]`
+    /// re-enables everything.
+    ///
+    /// This is not a display filter. A disabled provider's future is never
+    /// created inside `agentUsage()`, which matters because that call returns
+    /// only when its slowest provider finishes: dropping the card afterwards
+    /// would still pay the wait. The registry is in-memory and starts empty
+    /// every launch, so the app re-applies it at startup and after every edit.
+    public static func setDisabledProviders(json: String) throws -> DisabledProvidersResult {
+        try unwrap(json.withCString { tb_set_disabled_providers($0) })
     }
 
     /// Replace the process-wide registry of macOS Keychain consent. `json` is

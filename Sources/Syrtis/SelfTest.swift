@@ -16698,6 +16698,49 @@ enum SelfTest {
             (m3qAccounts ?? []).count == 2,
             "M3-q the two accounts are scanned once each, not once per window")
 
+        // MARK: - Quota provider toggles (DP; append-only)
+        //
+        // Swift-only, like the Claude-extra-roots section above: the live
+        // process owns the real FFI registry, so these cover the value the app
+        // sends and the parsing that produces it, not the core's reaction.
+        expect(
+            DisabledProviders.payloadJSON([]) == "[]",
+            "DP-a an empty selection is an explicit [] — the setter is "
+                + "full-replace, so [] is how a provider gets re-enabled and an "
+                + "omitted call would leave it disabled forever")
+        expect(
+            DisabledProviders.payloadJSON(["antigravity"]) == "[\"antigravity\"]",
+            "DP-b one id is a one-element array")
+        expect(
+            DisabledProviders.parse(raw: "antigravity,grok") == ["antigravity", "grok"],
+            "DP-c a comma-separated value parses in order")
+        expect(
+            DisabledProviders.parse(raw: " antigravity , grok ") == ["antigravity", "grok"],
+            "DP-d surrounding whitespace is trimmed; Settings writes a sorted "
+                + "join but a hand-edited defaults value is still a value")
+        expect(
+            DisabledProviders.parse(raw: "antigravity,antigravity") == ["antigravity"],
+            "DP-e a repeat folds — this is a set, unlike the Claude config dirs "
+                + "where a repeat means two cards writing one series")
+        expect(
+            DisabledProviders.parse(raw: "antigravity,nope,,Claude") == ["antigravity"],
+            "DP-f an id this build does not know is dropped rather than passed "
+                + "through: a value written by a newer build must not disable "
+                + "something at random, and the match is case-sensitive")
+        expect(
+            Set(DisabledProviders.known)
+                == Set([
+                    "claude", "codex", "antigravity", "copilot", "grok", "grok-bot", "kiro",
+                    "opencode-go",
+                ]),
+            "DP-g the Settings list matches the eight providers run() fetches; a "
+                + "provider missing here gets no toggle and can never be "
+                + "switched off")
+        expect(
+            DisabledProviders.known.allSatisfy { DisabledProviders.label($0) != $0 },
+            "DP-h every known provider has a display name — falling back to the "
+                + "raw id would put \"antigravity\" in the Settings row")
+
         // SC-INV-EQUIV. The lens half of the inverted-range guard, on the one
         // fixture already proven above to produce equivalence rows — an empty
         // fixture would let the "publishes none" assertion pass while
