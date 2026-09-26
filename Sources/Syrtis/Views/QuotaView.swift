@@ -62,7 +62,7 @@ struct QuotaView: View {
             if cards.isEmpty {
                 Text("No quota cards are switched on. Turn some back on in Settings › Dashboard.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
