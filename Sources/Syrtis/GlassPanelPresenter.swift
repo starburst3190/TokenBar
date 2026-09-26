@@ -295,12 +295,6 @@ enum GlassPanelStyle {
     static func glassTintOpacity(_ amount: Double) -> Double {
         min(max(amount.isFinite ? amount : 0, 0), 1) * maxGlassTint
     }
-    /// Hover tooltips under the panel: .regular glass over a scrim that keeps
-    /// the text legible. 0.20 read too see-through; 0.35 is the second round.
-    /// The glass was .clear until #398: it barely blurs, so a tooltip over a
-    /// list showed the rows beneath it sharp through the scrim. The maintainer
-    /// compared both on the live panel and chose .regular. Both were seen to
-    /// follow the system glass setting (NSGlassTintAmount, no public API).
     /// The popover separators (under the lens row, above the footer). The
     /// system `Divider` is a solid hairline that reads as a hard edge across
     /// the glass; a user found it abrupt ("很突兀"), and the maintainer's
@@ -309,14 +303,6 @@ enum GlassPanelStyle {
     /// mode keeps the system divider, as v2.0.1 drew it, at the maintainer's
     /// call after comparing the rounds on the live panel.
     static let lightDivider = Color.black.opacity(0.14)
-    static let tooltipScrimDark = Color.black.opacity(0.35)
-    static let tooltipScrimLight = Color.white.opacity(0.35)
-    /// Gray tooltip text over see-through glass washed out; lifting the text
-    /// keeps the transparency, where a darker scrim would give it back.
-    static let tooltipSecondaryDark = Color.white.opacity(0.80)
-    static let tooltipTertiaryDark = Color.white.opacity(0.60)
-    static let tooltipSecondaryLight = Color.black.opacity(0.75)
-    static let tooltipTertiaryLight = Color.black.opacity(0.55)
     /// SegmentedPicker under the panel: capsule track plus a raised thumb in
     /// the macOS 26 segmented shape. Plain fills — glass nested inside the
     /// card's glass renders murky (see SegmentedPicker).
@@ -521,38 +507,13 @@ extension View {
     }
 }
 
-/// The chart hover tooltips' chrome. Outside the panel it is the original
-/// .regularMaterial with a quaternary border; under the panel it is glass,
-/// whose own rim replaces the border.
-private struct TooltipSurface: ViewModifier {
-    @Environment(\.inGlassPanel) private var inGlassPanel
-    @Environment(\.colorScheme) private var colorScheme
-
-    func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 8)
-        if inGlassPanel, #available(macOS 26.0, *) {
-            let dark = colorScheme == .dark
-            content
-                .foregroundStyle(
-                    Color.primary,
-                    dark ? GlassPanelStyle.tooltipSecondaryDark : GlassPanelStyle.tooltipSecondaryLight,
-                    dark ? GlassPanelStyle.tooltipTertiaryDark : GlassPanelStyle.tooltipTertiaryLight)
-                .background(
-                    dark ? GlassPanelStyle.tooltipScrimDark
-                                         : GlassPanelStyle.tooltipScrimLight,
-                    in: shape)
-                .glassEffect(.regular, in: .rect(cornerRadius: 8))
-        } else {
-            content
-                .background(.regularMaterial, in: shape)
-                .overlay(shape.strokeBorder(.quaternary))
-        }
-    }
-}
-
+/// The chart hover tooltips' chrome, the same inside and outside the panel:
+/// `PopoverTooltipSurface` (scrim + glass + shadow, in Cards.swift). The
+/// panel's own tooltip (glass over a 0.35 scrim) read too see-through over
+/// the cards.
 extension View {
     func tooltipSurface() -> some View {
-        modifier(TooltipSurface())
+        modifier(PopoverTooltipSurface())
     }
 }
 
