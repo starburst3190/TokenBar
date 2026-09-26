@@ -4460,7 +4460,7 @@ async fn refresh_claude_credentials_with<
 >(
     original: &ClaudeCredentials,
     refresh: &R,
-    reload: Reload,
+    mut reload: Reload,
     request: Request,
     preflight: Preflight,
     save: Save,
@@ -4475,7 +4475,7 @@ async fn refresh_claude_credentials_with<
 >
 where
     R: RefreshScopeTransaction + ?Sized,
-    Reload: FnOnce(&ClaudeCredentials) -> Result<ClaudeCredentials, String>,
+    Reload: FnMut(&ClaudeCredentials) -> Result<ClaudeCredentials, String>,
     Request: FnOnce(String, ProviderCacheBinding) -> RequestFuture,
     RequestFuture:
         std::future::Future<Output = Result<ClaudeRefreshResponse, ProviderFetchFailure>>,
@@ -4513,7 +4513,39 @@ where
         })?
         .to_string();
     let old_marker = refresh_token.as_bytes().to_vec();
-    let token_response = request(refresh_token, pre_binding).await?;
+    let token_response = match request(refresh_token, pre_binding.clone()).await {
+        Ok(response) => response,
+        Err(failure) => {
+            // A hard rejection says the refresh token was already dead when we
+            // sent it — nearly always because the Claude CLI rotated it in the
+            // window between our reload and our request. Read the store once
+            // more before blaming the user's login: a live credential sitting
+            // there now IS that rotation, and adopting it is the whole fix. A
+            // still-expired store means the login really is gone, and the
+            // original terminal failure stands.
+            if !matches!(failure, ProviderFetchFailure::Terminal { .. }) {
+                return Err(failure);
+            }
+            let Some(adopted) = reload(original)
+                .ok()
+                .filter(|candidate| !claude_credentials_expired(candidate))
+            else {
+                return Err(failure);
+            };
+            let Some(marker) = adopted.scope_marker() else {
+                return Err(failure);
+            };
+            let Ok(scope) = refresh.resolve_current(
+                adopted.scope_slot.semantic_source,
+                &adopted.scope_slot.canonical_location,
+                marker,
+            ) else {
+                return Err(failure);
+            };
+            let binding = ProviderCacheBinding::primary(scope.clone());
+            return Ok((adopted, scope, Some(binding)));
+        }
+    };
     checkpoint(RefreshCheckpoint::NetworkReturned)?;
     let access_token = token_response.access_token.trim();
     if access_token.is_empty() {
@@ -4678,7 +4710,30 @@ fn validate_claude_credentials_file(
     path: &Path,
 ) -> Result<(), RefreshTargetError> {
     let current_raw = read_claude_credentials_target(path)?;
-    claude_current_target_root(credentials, &current_raw).map(|_| ())
+    claude_target_is_writable(credentials, &current_raw)
+}
+
+/// The preflight verdict for a target that has already been read.
+///
+/// A changed target is normally terminal, but it must not be when the store
+/// still holds the refresh token this refresh already burnt: refusing here
+/// would strand that credential exactly as refusing at the save layer would.
+/// Both layers therefore ask the same question, and the save layer performs
+/// the rescue this one lets through.
+fn claude_target_is_writable(
+    credentials: &ClaudeCredentials,
+    current_raw: &str,
+) -> Result<(), RefreshTargetError> {
+    match claude_current_target_root(credentials, current_raw) {
+        Ok(_) => Ok(()),
+        Err(RefreshTargetError::TargetChanged) => {
+            match resolve_claude_write_back_conflict(credentials, current_raw)? {
+                ClaudeWriteBackPlan::KeepStored => Err(RefreshTargetError::TargetChanged),
+                ClaudeWriteBackPlan::Overwrite(_) => Ok(()),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn save_claude_credentials_to_file(
@@ -4697,7 +4752,19 @@ where
     Write: FnOnce(&Path, &str) -> Result<(), String>,
 {
     let current_raw = read_claude_credentials_target(path)?;
-    let data = merge_claude_credentials_json(credentials, &current_raw)?;
+    let data = match merge_claude_credentials_json(credentials, &current_raw) {
+        Ok(data) => data,
+        Err(RefreshTargetError::TargetChanged) => {
+            match resolve_claude_write_back_conflict(credentials, &current_raw)? {
+                // Nothing was persisted, so the refusal still stands as an
+                // error: the caller treats `TargetChanged` as terminal, and
+                // only the `Overwrite` rescue above avoids that.
+                ClaudeWriteBackPlan::KeepStored => return Err(RefreshTargetError::TargetChanged),
+                ClaudeWriteBackPlan::Overwrite(data) => data,
+            }
+        }
+        Err(error) => return Err(error),
+    };
     write(path, &data).map_err(|_| RefreshTargetError::Persistence)
 }
 
@@ -4844,6 +4911,55 @@ fn encode_refreshed_claude_root(
     serde_json::to_string(&current_root).map_err(|_| RefreshTargetError::Persistence)
 }
 
+/// How to finish a write-back whose guard refused because the store changed.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeWriteBackPlan {
+    /// The store holds a credential we never consumed; it is not ours to touch.
+    KeepStored,
+    /// The store still holds the refresh token our rotation invalidated.
+    Overwrite(String),
+}
+
+/// Decide what a refused write-back should actually do.
+///
+/// Walking away is only safe when the store holds a credential that still
+/// works. The refresh we just completed *consumed* one specific refresh token —
+/// the server invalidated it the instant it issued ours — so abandoning a store
+/// that still holds exactly that token strands the sole live credential in this
+/// process. Every later poll then reloads the dead one, re-presents it, and is
+/// told to re-authenticate, until the Claude CLI happens to rotate the store
+/// itself. That is a burnt credential, not a stale write.
+///
+/// The test is token identity, never expiry. `expiresAt` describes the *access*
+/// token, and a refresh token routinely outlives it, so "expired" would not have
+/// meant "unusable" — a restored backup or a forward clock jump could have
+/// presented a perfectly good foreign credential as garbage to overwrite. We
+/// overwrite one thing only: the token we personally killed.
+fn resolve_claude_write_back_conflict(
+    credentials: &ClaudeCredentials,
+    current_raw: &str,
+) -> Result<ClaudeWriteBackPlan, RefreshTargetError> {
+    // `raw_root` is the store as it looked when this refresh reloaded it, so it
+    // carries the refresh token we went on to present and invalidate.
+    let presented = credentials
+        .raw_root
+        .as_ref()
+        .and_then(|root| root.get("claudeAiOauth"))
+        .and_then(|oauth| oauth.get("refreshToken"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let stored = parse_claude_credentials_data(current_raw, credentials.source)
+        .map_err(|_| RefreshTargetError::TargetMalformed)?;
+    if presented.is_none() || stored.refresh_token.as_deref() != presented {
+        return Ok(ClaudeWriteBackPlan::KeepStored);
+    }
+    let current_root: Value =
+        serde_json::from_str(current_raw).map_err(|_| RefreshTargetError::TargetMalformed)?;
+    let data = encode_refreshed_claude_root(credentials, current_root)?;
+    Ok(ClaudeWriteBackPlan::Overwrite(data))
+}
+
 /// Merge rotated tokens into the current credentials JSON only when the
 /// `claudeAiOauth` object still matches the one captured at refresh reload.
 /// Top-level siblings come from `current_raw`, so unrelated concurrent writes
@@ -4911,16 +5027,82 @@ where
 fn validate_claude_keychain_target(
     credentials: &ClaudeCredentials,
 ) -> Result<(), RefreshTargetError> {
-    let service = claude_keychain_service_of(credentials);
-    claude_keychain_target_with(
+    validate_claude_keychain_target_with(
         credentials,
-        || Ok(claude_keychain_account(service)),
-        |captured_account| {
-            load_claude_credentials_from_keychain_item(service, Some(captured_account))
-                .map_err(|_| ())
-        },
+        claude_keychain_account,
+        |service, account| load_claude_credentials_from_keychain_item(service, Some(account)),
     )
-    .map(|_| ())
+}
+
+/// The exact Keychain item a refresh captured, as read for its write-back.
+struct ClaudeKeychainTarget<'a> {
+    /// The credential's own item service: the primary's, or an isolated config
+    /// directory's hashed one. Every later query and the write itself use it.
+    service: &'a str,
+    captured_account: &'a str,
+    current_raw: String,
+}
+
+/// Read the exact Keychain item this refresh captured, under the credential's
+/// own service. The service is resolved once, here, and handed back so the
+/// account query and the write cannot drift to a different item. Reading the
+/// item first keeps its disappearance `TargetMissing` even when the account
+/// query can no longer find any item, and hands both the guard and the rescue
+/// the same raw store.
+fn read_claude_keychain_target_with<'a, Item>(
+    credentials: &'a ClaudeCredentials,
+    item: Item,
+) -> Result<ClaudeKeychainTarget<'a>, RefreshTargetError>
+where
+    Item: FnOnce(&str, &str) -> Result<Option<String>, String>,
+{
+    let service = claude_keychain_service_of(credentials);
+    let captured_account = credentials
+        .keychain_account
+        .as_deref()
+        .ok_or(RefreshTargetError::TargetUnverified)?;
+    let current_raw = item(service, captured_account)
+        .map_err(|_| RefreshTargetError::TargetUnverified)?
+        .ok_or(RefreshTargetError::TargetMissing)?;
+    Ok(ClaudeKeychainTarget {
+        service,
+        captured_account,
+        current_raw,
+    })
+}
+
+/// The Keychain preflight, with the rescue: a moved item is terminal unless
+/// it still holds the refresh token this refresh sent and the item's account
+/// is still the captured one.
+fn validate_claude_keychain_target_with<Account, Item>(
+    credentials: &ClaudeCredentials,
+    account_of: Account,
+    item: Item,
+) -> Result<(), RefreshTargetError>
+where
+    Account: FnOnce(&str) -> Option<String>,
+    Item: FnOnce(&str, &str) -> Result<Option<String>, String>,
+{
+    let target = read_claude_keychain_target_with(credentials, item)?;
+    let current_account = account_of(target.service);
+    // The item and the account are read once, above, so the rescue below sees
+    // the exact store this guard rejected; the guard is handed those readings
+    // rather than querying the Keychain a second time.
+    match claude_keychain_target_with(
+        credentials,
+        || Ok(current_account.clone()),
+        |_| Ok(Some(target.current_raw.clone())),
+    ) {
+        Ok(_) => Ok(()),
+        // The account guard inside that call stays terminal; only the
+        // store-moved refusal can be a rescue, and only under our own account.
+        Err(RefreshTargetError::TargetChanged)
+            if current_account.as_deref() == Some(target.captured_account) =>
+        {
+            claude_target_is_writable(credentials, &target.current_raw)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn prepare_claude_keychain_write_with<'a, Account, Item>(
@@ -4938,18 +5120,69 @@ where
     Ok((captured_account, data))
 }
 
+/// One Keychain write-back: the item's service, the captured account it stays
+/// pinned to, and the JSON to store there.
+#[derive(Debug, PartialEq, Eq)]
+struct ClaudeKeychainWrite<'a> {
+    service: &'a str,
+    account: &'a str,
+    data: String,
+}
+
+/// Decide the Keychain write-back, with the rescue: a moved item is
+/// overwritten only when it still holds the refresh token this refresh sent
+/// and the item's account is still the captured one; the write then stays
+/// pinned to that account under the credential's own service.
+fn prepare_claude_keychain_save_with<'a, Account, Item>(
+    credentials: &'a ClaudeCredentials,
+    account_of: Account,
+    item: Item,
+) -> Result<ClaudeKeychainWrite<'a>, RefreshTargetError>
+where
+    Account: FnOnce(&str) -> Option<String>,
+    Item: FnOnce(&str, &str) -> Result<Option<String>, String>,
+{
+    let target = read_claude_keychain_target_with(credentials, item)?;
+    let current_account = account_of(target.service);
+    let write_target = prepare_claude_keychain_write_with(
+        credentials,
+        || Ok(current_account.clone()),
+        |_| Ok(Some(target.current_raw.clone())),
+    );
+    let (account, data) = match write_target {
+        Ok(pair) => pair,
+        // Only the store-moved refusal is recoverable. The account guard in
+        // that same function stays fatal: a different account is a different
+        // identity, never something to overwrite.
+        Err(RefreshTargetError::TargetChanged)
+            if current_account.as_deref() == Some(target.captured_account) =>
+        {
+            match resolve_claude_write_back_conflict(credentials, &target.current_raw)? {
+                ClaudeWriteBackPlan::KeepStored => return Err(RefreshTargetError::TargetChanged),
+                ClaudeWriteBackPlan::Overwrite(data) => (target.captured_account, data),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(ClaudeKeychainWrite {
+        service: target.service,
+        account,
+        data,
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn save_claude_credentials_to_keychain(
     credentials: &ClaudeCredentials,
 ) -> Result<(), RefreshTargetError> {
-    let service = claude_keychain_service_of(credentials);
-    let (account, data) = prepare_claude_keychain_write_with(
+    let ClaudeKeychainWrite {
+        service,
+        account,
+        data,
+    } = prepare_claude_keychain_save_with(
         credentials,
-        || Ok(claude_keychain_account(service)),
-        |captured_account| {
-            load_claude_credentials_from_keychain_item(service, Some(captured_account))
-                .map_err(|_| ())
-        },
+        claude_keychain_account,
+        |service, account| load_claude_credentials_from_keychain_item(service, Some(account)),
     )?;
 
     // NOTE: security(1) has no compare-and-swap operation. The exact-item read,
@@ -11468,6 +11701,29 @@ mod tests {
         .await
     }
 
+    fn claude_store_json(access: &str, refresh: &str, expires_at_millis: i64) -> String {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": refresh,
+                "expiresAt": expires_at_millis
+            }
+        })
+        .to_string()
+    }
+
+    /// A credential in the state a completed refresh leaves it: live tokens we
+    /// hold, whose `raw_root` still describes the store we read before rotating.
+    fn claude_rotated_credentials(refresh_token: &str) -> ClaudeCredentials {
+        let raw = claude_store_json("pre-rotation-access", "pre-rotation-refresh", 0);
+        let mut credentials =
+            parse_claude_credentials_data(&raw, ClaudeCredentialSource::File).unwrap();
+        credentials.access_token = "ours-access".to_string();
+        credentials.refresh_token = Some(refresh_token.to_string());
+        credentials.expires_at = Some(Utc::now() + chrono::Duration::seconds(3_600));
+        credentials
+    }
+
     fn stored_claude_refresh_token(path: &Path) -> Option<String> {
         parse_claude_credentials_data(
             &fs::read_to_string(path).unwrap(),
@@ -11491,11 +11747,15 @@ mod tests {
         PostMissing,
         PostMalformed,
         PostUnverified,
+        /// The store moved but still holds the refresh token this refresh
+        /// sent: the rescue overwrites it instead of stranding our token.
+        PreflightChangedSameRefresh,
+        PostChangedSameRefresh,
         Persistence,
         Success,
     }
 
-    const CLAUDE_TARGET_CASES: [ClaudeTargetCase; 12] = [
+    const CLAUDE_TARGET_CASES: [ClaudeTargetCase; 14] = [
         ClaudeTargetCase::PreflightChanged,
         ClaudeTargetCase::PreflightMissing,
         ClaudeTargetCase::PreflightLogout,
@@ -11506,6 +11766,8 @@ mod tests {
         ClaudeTargetCase::PostMissing,
         ClaudeTargetCase::PostMalformed,
         ClaudeTargetCase::PostUnverified,
+        ClaudeTargetCase::PreflightChangedSameRefresh,
+        ClaudeTargetCase::PostChangedSameRefresh,
         ClaudeTargetCase::Persistence,
         ClaudeTargetCase::Success,
     ];
@@ -11541,7 +11803,29 @@ mod tests {
         }
 
         fn continues(self) -> bool {
-            matches!(self, Self::Persistence | Self::Success)
+            matches!(self, Self::Persistence | Self::Success) || self.rescues_same_refresh()
+        }
+
+        fn rescues_same_refresh(self) -> bool {
+            matches!(
+                self,
+                Self::PreflightChangedSameRefresh | Self::PostChangedSameRefresh
+            )
+        }
+
+        /// Rows whose store mutation lands while the token request is in flight.
+        fn mutates_during_network_wait(self) -> bool {
+            self.preflight_terminal() || self == Self::PreflightChangedSameRefresh
+        }
+
+        /// Rows whose store mutation lands after the preflight passed.
+        fn mutates_after_preflight(self) -> bool {
+            self.post_terminal() || matches!(self, Self::PostChangedSameRefresh | Self::Success)
+        }
+
+        /// Rows whose write-back reaches the store and binds the cache.
+        fn persists(self) -> bool {
+            self == Self::Success || self.rescues_same_refresh()
         }
 
         fn expected_display(self) -> Option<&'static str> {
@@ -11562,7 +11846,10 @@ mod tests {
                 Self::PreflightUnverified | Self::PostUnverified => {
                     Some("Claude credential target could not be verified during refresh.")
                 }
-                Self::Persistence | Self::Success => None,
+                Self::PreflightChangedSameRefresh
+                | Self::PostChangedSameRefresh
+                | Self::Persistence
+                | Self::Success => None,
             }
         }
     }
@@ -11641,10 +11928,14 @@ mod tests {
         fn preflight(&self, credentials: &ClaudeCredentials) -> Result<(), RefreshTargetError> {
             match self {
                 Self::File(path) => validate_claude_credentials_file(credentials, path),
-                Self::Keychain { account, item } => {
-                    claude_keychain_target_with(credentials, || account.clone(), |_| item.clone())
-                        .map(|_| ())
-                }
+                Self::Keychain { account, item } => validate_claude_keychain_target_with(
+                    credentials,
+                    |_| account.clone().ok().flatten(),
+                    |_, _| {
+                        item.clone()
+                            .map_err(|_| "fixture item query failed".to_string())
+                    },
+                ),
             }
         }
 
@@ -11662,6 +11953,21 @@ mod tests {
                         })
                         .to_string(),
                     ),
+                // The writer rewrites the oauth object but keeps the refresh
+                // token this refresh already sent, which the server has just
+                // invalidated.
+                ClaudeTargetCase::PreflightChangedSameRefresh
+                | ClaudeTargetCase::PostChangedSameRefresh => self.write_raw(
+                    serde_json::json!({
+                        "claudeAiOauth": {
+                            "accessToken": "claude-cli-touched-access",
+                            "refreshToken": "claude-old-refresh",
+                            "expiresAt": 0
+                        },
+                        "sibling": {"writer": "claude-cli", "revision": 2}
+                    })
+                    .to_string(),
+                ),
                 ClaudeTargetCase::PreflightAccountChanged
                 | ClaudeTargetCase::PostAccountChanged => match self {
                     Self::Keychain { account, .. } => *account = Ok(Some("account-b".to_string())),
@@ -11735,12 +12041,16 @@ mod tests {
                     })
                 }
                 Self::Keychain { account, item } => {
-                    let current_account = account.clone();
+                    let current_account = account.clone().ok().flatten();
                     let current_item = item.clone();
-                    let (pinned, data) = prepare_claude_keychain_write_with(
+                    let ClaudeKeychainWrite {
+                        account: pinned,
+                        data,
+                        ..
+                    } = prepare_claude_keychain_save_with(
                         credentials,
-                        || current_account,
-                        |_| current_item,
+                        |_| current_account,
+                        |_, _| current_item.map_err(|_| "fixture item query failed".to_string()),
                     )?;
                     observation.writer.set(observation.writer.get() + 1);
                     observation.pin.set(pinned == "account-a");
@@ -11839,7 +12149,8 @@ mod tests {
         let expected = std::rc::Rc::new(std::cell::RefCell::new(initial.clone()));
         let observation = std::rc::Rc::new(ClaudeTargetObservation::default());
         let recording = RecordingRefreshScope::new(&scope);
-        let expected_usage_binding = (case == ClaudeTargetCase::Success)
+        let expected_usage_binding = case
+            .persists()
             .then(|| ProviderCacheBinding::primary(old_scope.clone()));
         let store_reload = std::rc::Rc::clone(&store);
         let store_request = std::rc::Rc::clone(&store);
@@ -11873,7 +12184,7 @@ mod tests {
                             refresh_token == "claude-old-refresh",
                             "REFRESH-TARGET-CHECKPOINT-SEQUENCE"
                         );
-                        if case.preflight_terminal() {
+                        if case.mutates_during_network_wait() {
                             let mut current = store_request.borrow_mut();
                             current.apply(case);
                             *expected_request.borrow_mut() = current.snapshot();
@@ -11889,9 +12200,7 @@ mod tests {
                             .preflight
                             .set(obs_preflight.preflight.get() + 1);
                         let result = store_preflight.borrow().preflight(credentials);
-                        if result.is_ok()
-                            && (case.post_terminal() || case == ClaudeTargetCase::Success)
-                        {
+                        if result.is_ok() && case.mutates_after_preflight() {
                             let mut current = store_preflight.borrow_mut();
                             current.apply(case);
                             *expected_preflight.borrow_mut() = current.snapshot();
@@ -11936,6 +12245,7 @@ mod tests {
             "REFRESH-TARGET-POST-PREFLIGHT-TERMINAL"
         };
         assert_eq!(route, "oauth", "REFRESH-TARGET-USAGE-BLOCKED");
+        let outcome_succeeded = matches!(outcome, ProviderFetchOutcome::Success { .. });
         if let Some(expected_display) = case.expected_display() {
             assert!(
                 matches!(
@@ -11979,7 +12289,7 @@ mod tests {
         );
         assert_eq!(
             recording.resolve_count(),
-            1 + usize::from(case == ClaudeTargetCase::Success),
+            1 + usize::from(case.persists()),
             "REFRESH-TARGET-CHECKPOINT-SEQUENCE"
         );
         assert_eq!(
@@ -12014,6 +12324,14 @@ mod tests {
                 assert!(observation.pin.get(), "REFRESH-TARGET-KEYCHAIN-PIN");
             }
         }
+        if case.rescues_same_refresh() {
+            assert!(
+                outcome_succeeded
+                    && observation.writer.get() == 1
+                    && store.borrow().success_preserved(),
+                "REFRESH-TARGET-SAME-REFRESH-RESCUE"
+            );
+        }
         assert!(
             (scope.metadata_bytes() == metadata_before) == case.preflight_terminal(),
             "{terminal_label}"
@@ -12043,6 +12361,214 @@ mod tests {
                 .is_ok_and(|resolved| resolved == old_scope),
             "{terminal_label}"
         );
+        scope.cleanup();
+    }
+
+    /// This pair is deliberately redundant: the two fixtures differ only in
+    /// `expiresAt`, and both must reach `KeepStored`. That is the point —
+    /// liveness is not an input to the decision, and these lock in that it
+    /// cannot become one again.
+    #[test]
+    fn claude_write_back_conflict_keeps_a_foreign_credential_that_is_live() {
+        let ours = claude_rotated_credentials("ours-refresh");
+        let live_store = claude_store_json(
+            "someone-else-access",
+            "someone-else-refresh",
+            4_102_444_800_000,
+        );
+
+        let plan = resolve_claude_write_back_conflict(&ours, &live_store).unwrap();
+
+        assert_eq!(plan, ClaudeWriteBackPlan::KeepStored);
+    }
+
+    /// A refresh token outlives the access token it sits beside, so a restored
+    /// backup — or a forward clock jump — can put a perfectly good foreign
+    /// credential in front of us wearing a past `expiresAt`. We never presented
+    /// its token, so it is not ours to destroy.
+    #[test]
+    fn claude_write_back_conflict_keeps_a_foreign_credential_that_looks_expired() {
+        let ours = claude_rotated_credentials("ours-refresh");
+        let foreign_but_recoverable = claude_store_json("stale-access", "stale-refresh", 0);
+
+        let plan = resolve_claude_write_back_conflict(&ours, &foreign_but_recoverable).unwrap();
+
+        assert_eq!(plan, ClaudeWriteBackPlan::KeepStored);
+    }
+
+    #[test]
+    fn claude_write_back_conflict_overwrites_the_token_our_rotation_killed() {
+        let ours = claude_rotated_credentials("ours-refresh");
+        // The store still carries the refresh token this refresh presented, so
+        // the server has already invalidated it. Only our copy still works.
+        let burnt_store = claude_store_json("cli-touched-access", "pre-rotation-refresh", 0);
+
+        let plan = resolve_claude_write_back_conflict(&ours, &burnt_store).unwrap();
+
+        let ClaudeWriteBackPlan::Overwrite(data) = plan else {
+            panic!("the token we invalidated must not be left in the store");
+        };
+        let written = parse_claude_credentials_data(&data, ClaudeCredentialSource::File).unwrap();
+        assert_eq!(written.refresh_token.as_deref(), Some("ours-refresh"));
+        assert_eq!(written.access_token, "ours-access");
+    }
+
+    /// The burn: a concurrent write lands while we refresh, and the store it
+    /// leaves behind is already expired. Refusing the write here would strand
+    /// the only live refresh token in this process and leave every later poll
+    /// re-presenting a token the server has already invalidated.
+    #[tokio::test]
+    async fn claude_file_refresh_rescues_a_dead_store_instead_of_burning_the_token() {
+        // The CLI rewrites the oauth object (tripping the guard) but leaves the
+        // refresh token this refresh already presented — so the store is holding
+        // a token the server killed the moment it issued ours.
+        const DEAD_CONCURRENT_WRITE: &str = r#"{
+            "claudeAiOauth": {
+                "accessToken": "claude-cli-touched-access",
+                "refreshToken": "claude-old-refresh",
+                "expiresAt": 0
+            },
+            "sibling": {"writer": "claude-cli", "revision": 2}
+        }"#;
+        let (scope, path, original, _, _, _) =
+            setup_claude_refresh("claude-file-dead-store-rescue");
+        let reload_path = path.clone();
+        let request_path = path.clone();
+        let preflight_path = path.clone();
+        let save_path = path.clone();
+
+        let (refreshed, _, cache_binding) = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            move |refresh_token, _attempt_binding| async move {
+                assert_eq!(refresh_token, "claude-old-refresh");
+                fs::write(&request_path, DEAD_CONCURRENT_WRITE).unwrap();
+                Ok(ClaudeRefreshResponse {
+                    access_token: "claude-new-access".to_string(),
+                    refresh_token: Some("claude-new-refresh".to_string()),
+                    expires_in: 3_600,
+                })
+            },
+            // The preflight sees the same moved store the save layer does; it
+            // must let a rescue through rather than turning it terminal.
+            move |credentials| validate_claude_credentials_file(credentials, &preflight_path),
+            move |credentials| save_claude_credentials_to_file(credentials, &save_path),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed.access_token, "claude-new-access");
+        // The live token reached the shared store, so the next poll reads a
+        // credential that still works rather than the invalidated one.
+        assert_eq!(
+            stored_claude_refresh_token(&path).as_deref(),
+            Some("claude-new-refresh")
+        );
+        assert!(
+            cache_binding.is_some(),
+            "a persisted rotation binds its cache"
+        );
+        // The concurrent writer's unrelated sibling still survives.
+        let root: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["sibling"]["writer"], "claude-cli");
+        scope.cleanup();
+    }
+
+    /// The race that produced the visible "Run `claude` to re-authenticate":
+    /// the CLI rotated the token between our reload and our request, so the
+    /// token endpoint rejected what we sent. The store is fine; adopt it.
+    #[tokio::test]
+    async fn claude_refresh_adopts_a_rotated_store_after_a_hard_rejection() {
+        let (scope, path, original, _, _, _) = setup_claude_refresh("claude-adopt-after-reject");
+        let reload_path = path.clone();
+        let request_path = path.clone();
+        let rotated = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "cli-rotated-access",
+                "refreshToken": "cli-rotated-refresh",
+                "expiresAt": 4_102_444_800_000i64
+            }
+        })
+        .to_string();
+
+        let (adopted, _, cache_binding) = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            move |_refresh_token, _attempt_binding| async move {
+                // The CLI's rotation lands while our request is in flight, and
+                // the server rejects the token we presented.
+                fs::write(&request_path, &rotated).unwrap();
+                Err(ProviderFetchFailure::terminal(
+                    "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
+                ))
+            },
+            |_| panic!("a rejected refresh must not preflight"),
+            |_| panic!("adoption must not write back"),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(adopted.access_token, "cli-rotated-access");
+        assert_eq!(
+            adopted.refresh_token.as_deref(),
+            Some("cli-rotated-refresh")
+        );
+        assert!(cache_binding.is_some());
+        scope.cleanup();
+    }
+
+    #[tokio::test]
+    async fn claude_refresh_keeps_the_terminal_failure_when_the_store_is_still_dead() {
+        let (scope, path, original, _, _, _) = setup_claude_refresh("claude-reject-still-dead");
+        let reload_path = path.clone();
+
+        let failure = refresh_claude_credentials_with(
+            &original,
+            &scope,
+            move |template| {
+                let raw = fs::read_to_string(&reload_path)
+                    .map_err(|error| format!("reload Claude test credentials: {error}"))?;
+                let mut credentials =
+                    parse_claude_credentials_data(&raw, ClaudeCredentialSource::File)?;
+                credentials.scope_slot = template.scope_slot.clone();
+                Ok(credentials)
+            },
+            move |_refresh_token, _attempt_binding| async move {
+                Err(ProviderFetchFailure::terminal(
+                    "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
+                ))
+            },
+            |_| panic!("a rejected refresh must not preflight"),
+            |_| panic!("a rejected refresh must not write back"),
+            checkpoint_at(None),
+        )
+        .await
+        .expect_err("a dead store leaves the login genuinely broken");
+
+        // Nothing rotated the store, so the user really does need to re-auth.
+        assert!(matches!(
+            failure,
+            ProviderFetchFailure::Terminal { ref display }
+                if display.contains("re-authenticate")
+        ));
         scope.cleanup();
     }
 
@@ -13773,6 +14299,569 @@ mod tests {
         );
         drop(stored);
         scope.cleanup();
+    }
+
+    /// A hermetic Keychain for the write-back rescue. Items are kept in lookup
+    /// order, so `account_of(service)` answers with the first matching item's
+    /// account the way `security find-generic-password -s` does, while
+    /// `item_of(service, account)` reads one exact item. Every write is recorded
+    /// as the `(service, account)` it targeted.
+    #[derive(Default)]
+    struct FakeClaudeKeychain {
+        items: std::cell::RefCell<Vec<(String, String, String)>>,
+        writes: std::cell::RefCell<Vec<(String, String)>>,
+    }
+
+    impl FakeClaudeKeychain {
+        fn with(items: &[(&str, &str, &str)]) -> Self {
+            let keychain = Self::default();
+            for (service, account, raw) in items {
+                keychain.put(service, account, raw);
+            }
+            keychain
+        }
+
+        fn account_of(&self, service: &str) -> Option<String> {
+            self.items
+                .borrow()
+                .iter()
+                .find(|(stored, _, _)| stored == service)
+                .map(|(_, account, _)| account.clone())
+        }
+
+        fn item_of(&self, service: &str, account: &str) -> Result<Option<String>, String> {
+            Ok(self.raw(service, account))
+        }
+
+        fn raw(&self, service: &str, account: &str) -> Option<String> {
+            self.items
+                .borrow()
+                .iter()
+                .find(|(stored_service, stored_account, _)| {
+                    stored_service == service && stored_account == account
+                })
+                .map(|(_, _, raw)| raw.clone())
+        }
+
+        /// Replace the exact `(service, account)` item in place, or append it.
+        fn put(&self, service: &str, account: &str, raw: &str) {
+            let mut items = self.items.borrow_mut();
+            match items
+                .iter_mut()
+                .find(|(stored_service, stored_account, _)| {
+                    stored_service == service && stored_account == account
+                }) {
+                Some(item) => item.2 = raw.to_string(),
+                None => items.push((service.to_string(), account.to_string(), raw.to_string())),
+            }
+        }
+
+        /// Add an item that the account query will find before any other item
+        /// under the same service.
+        fn put_first(&self, service: &str, account: &str, raw: &str) {
+            self.items.borrow_mut().insert(
+                0,
+                (service.to_string(), account.to_string(), raw.to_string()),
+            );
+        }
+
+        /// What `security add-generic-password -U -s <service> -a <account>`
+        /// does with a prepared write.
+        fn write(&self, write: ClaudeKeychainWrite<'_>) {
+            self.writes
+                .borrow_mut()
+                .push((write.service.to_string(), write.account.to_string()));
+            self.put(write.service, write.account, &write.data);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ClaudeKeychainRescuePhase {
+        /// The store moves while the token request is in flight, before the
+        /// preflight reads it.
+        NetworkWait,
+        /// The store moves after the preflight passed, before the save reads it.
+        PostPreflight,
+    }
+
+    const CLAUDE_KEYCHAIN_RESCUE_PHASES: [ClaudeKeychainRescuePhase; 2] = [
+        ClaudeKeychainRescuePhase::NetworkWait,
+        ClaudeKeychainRescuePhase::PostPreflight,
+    ];
+
+    const CLAUDE_FAR_FUTURE_MILLIS: i64 = 4_102_444_800_000;
+
+    fn claude_store_json_with_sibling(
+        access: &str,
+        refresh: &str,
+        expires_at_millis: i64,
+    ) -> String {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": refresh,
+                "expiresAt": expires_at_millis
+            },
+            "sibling": {"writer": "claude-cli", "revision": 2}
+        })
+        .to_string()
+    }
+
+    /// Run one hermetic Keychain refresh through the production reload,
+    /// preflight and save seams. `mutate` lands at `phase`; with `reject` the
+    /// token endpoint refuses the sent refresh token instead of rotating it.
+    async fn run_claude_keychain_rescue<M>(
+        original: &ClaudeCredentials,
+        keychain: &FakeClaudeKeychain,
+        tag: &str,
+        phase: ClaudeKeychainRescuePhase,
+        reject: bool,
+        mutate: M,
+    ) -> Result<
+        (
+            ClaudeCredentials,
+            AccountScope,
+            Option<ProviderCacheBinding>,
+        ),
+        ProviderFetchFailure,
+    >
+    where
+        M: FnOnce(&FakeClaudeKeychain),
+    {
+        let scope = TestRefreshScope::new("claude", &format!("{tag}-{phase:?}"));
+        let mutate = std::cell::RefCell::new(Some(mutate));
+        let sent = original.refresh_token.clone().unwrap();
+        let result = refresh_claude_credentials_with(
+            original,
+            &scope,
+            |template| {
+                reload_claude_keychain_credentials_with(
+                    template,
+                    |service| keychain.account_of(service),
+                    |service, account| keychain.item_of(service, account),
+                )
+            },
+            |refresh_token, _attempt_binding| {
+                if matches!(phase, ClaudeKeychainRescuePhase::NetworkWait) {
+                    if let Some(mutate) = mutate.borrow_mut().take() {
+                        mutate(keychain);
+                    }
+                }
+                async move {
+                    assert_eq!(refresh_token, sent);
+                    if reject {
+                        return Err(ProviderFetchFailure::terminal(
+                            "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
+                        ));
+                    }
+                    Ok(ClaudeRefreshResponse {
+                        access_token: "rescue-new-access".to_string(),
+                        refresh_token: Some("rescue-new-refresh".to_string()),
+                        expires_in: 3_600,
+                    })
+                }
+            },
+            |credentials| {
+                let result = validate_claude_keychain_target_with(
+                    credentials,
+                    |service| keychain.account_of(service),
+                    |service, account| keychain.item_of(service, account),
+                );
+                if result.is_ok() && matches!(phase, ClaudeKeychainRescuePhase::PostPreflight) {
+                    if let Some(mutate) = mutate.borrow_mut().take() {
+                        mutate(keychain);
+                    }
+                }
+                result
+            },
+            |credentials| {
+                let write = prepare_claude_keychain_save_with(
+                    credentials,
+                    |service| keychain.account_of(service),
+                    |service, account| keychain.item_of(service, account),
+                )?;
+                keychain.write(write);
+                Ok(())
+            },
+            checkpoint_at(None),
+        )
+        .await;
+        scope.cleanup();
+        result
+    }
+
+    fn claude_target_changed(
+        result: &Result<
+            (
+                ClaudeCredentials,
+                AccountScope,
+                Option<ProviderCacheBinding>,
+            ),
+            ProviderFetchFailure,
+        >,
+    ) -> bool {
+        matches!(
+            result,
+            Err(ProviderFetchFailure::Terminal { display })
+                if display == "Claude credential target changed during refresh."
+        )
+    }
+
+    /// Primary item, same sent refresh token, same account: the rescue
+    /// overwrites the burnt token, pinned to the captured account.
+    #[tokio::test]
+    async fn claude_keychain_rescue_overwrites_the_sent_token_pinned_to_its_account() {
+        for phase in CLAUDE_KEYCHAIN_RESCUE_PHASES {
+            let primary_raw = claude_store_json("primary-old-access", "primary-old-refresh", 0);
+            let touched =
+                claude_store_json_with_sibling("cli-touched-access", "primary-old-refresh", 0);
+            let keychain = FakeClaudeKeychain::with(&[(
+                CLAUDE_KEYCHAIN_SERVICE,
+                "primary-user",
+                &primary_raw,
+            )]);
+            let original =
+                parse_claude_credentials_data(&primary_raw, ClaudeCredentialSource::Keychain)
+                    .unwrap();
+
+            let (refreshed, _, cache_binding) = run_claude_keychain_rescue(
+                &original,
+                &keychain,
+                "claude-keychain-rescue-same-account",
+                phase,
+                false,
+                |keychain| keychain.put(CLAUDE_KEYCHAIN_SERVICE, "primary-user", &touched),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{phase:?}: the rescue must persist"));
+
+            assert_eq!(refreshed.access_token, "rescue-new-access", "{phase:?}");
+            assert!(cache_binding.is_some(), "{phase:?}");
+            assert_eq!(
+                *keychain.writes.borrow(),
+                vec![(
+                    CLAUDE_KEYCHAIN_SERVICE.to_string(),
+                    "primary-user".to_string()
+                )],
+                "{phase:?}"
+            );
+            let stored: Value = serde_json::from_str(
+                &keychain
+                    .raw(CLAUDE_KEYCHAIN_SERVICE, "primary-user")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                stored["claudeAiOauth"]["accessToken"], "rescue-new-access",
+                "{phase:?}"
+            );
+            assert_eq!(
+                stored["claudeAiOauth"]["refreshToken"], "rescue-new-refresh",
+                "{phase:?}"
+            );
+            assert_eq!(stored["sibling"]["writer"], "claude-cli", "{phase:?}");
+        }
+    }
+
+    /// Same sent refresh token, but the service's account is now a different
+    /// one: a different account is a different identity, so the refusal stays
+    /// terminal and nothing is written.
+    #[tokio::test]
+    async fn claude_keychain_rescue_is_terminal_when_the_account_changed() {
+        for phase in CLAUDE_KEYCHAIN_RESCUE_PHASES {
+            let primary_raw = claude_store_json("primary-old-access", "primary-old-refresh", 0);
+            let touched =
+                claude_store_json_with_sibling("cli-touched-access", "primary-old-refresh", 0);
+            let other_raw =
+                claude_store_json("other-access", "other-refresh", CLAUDE_FAR_FUTURE_MILLIS);
+            let keychain = FakeClaudeKeychain::with(&[(
+                CLAUDE_KEYCHAIN_SERVICE,
+                "primary-user",
+                &primary_raw,
+            )]);
+            let original =
+                parse_claude_credentials_data(&primary_raw, ClaudeCredentialSource::Keychain)
+                    .unwrap();
+
+            let result = run_claude_keychain_rescue(
+                &original,
+                &keychain,
+                "claude-keychain-rescue-account-changed",
+                phase,
+                false,
+                |keychain| {
+                    keychain.put(CLAUDE_KEYCHAIN_SERVICE, "primary-user", &touched);
+                    keychain.put_first(CLAUDE_KEYCHAIN_SERVICE, "other-user", &other_raw);
+                },
+            )
+            .await;
+
+            assert!(claude_target_changed(&result), "{phase:?}");
+            assert!(keychain.writes.borrow().is_empty(), "{phase:?}");
+            assert_eq!(
+                keychain
+                    .raw(CLAUDE_KEYCHAIN_SERVICE, "primary-user")
+                    .as_deref(),
+                Some(touched.as_str()),
+                "{phase:?}"
+            );
+            assert_eq!(
+                keychain
+                    .raw(CLAUDE_KEYCHAIN_SERVICE, "other-user")
+                    .as_deref(),
+                Some(other_raw.as_str()),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// The item now holds a refresh token this refresh never sent: it is not
+    /// ours to overwrite, so the store stays byte-identical.
+    #[tokio::test]
+    async fn claude_keychain_rescue_keeps_a_foreign_store_untouched() {
+        for phase in CLAUDE_KEYCHAIN_RESCUE_PHASES {
+            let primary_raw = claude_store_json("primary-old-access", "primary-old-refresh", 0);
+            let foreign = claude_store_json_with_sibling(
+                "foreign-access",
+                "foreign-refresh",
+                CLAUDE_FAR_FUTURE_MILLIS,
+            );
+            let keychain = FakeClaudeKeychain::with(&[(
+                CLAUDE_KEYCHAIN_SERVICE,
+                "primary-user",
+                &primary_raw,
+            )]);
+            let original =
+                parse_claude_credentials_data(&primary_raw, ClaudeCredentialSource::Keychain)
+                    .unwrap();
+
+            let result = run_claude_keychain_rescue(
+                &original,
+                &keychain,
+                "claude-keychain-rescue-foreign",
+                phase,
+                false,
+                |keychain| keychain.put(CLAUDE_KEYCHAIN_SERVICE, "primary-user", &foreign),
+            )
+            .await;
+
+            assert!(claude_target_changed(&result), "{phase:?}");
+            assert!(keychain.writes.borrow().is_empty(), "{phase:?}");
+            assert_eq!(
+                keychain
+                    .raw(CLAUDE_KEYCHAIN_SERVICE, "primary-user")
+                    .as_deref(),
+                Some(foreign.as_str()),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// The fixture for the extra config-directory rescue tests. Both items sit
+    /// under the same account name, as Claude Code stores them, so only the
+    /// service tells them apart.
+    fn claude_extra_rescue_fixture(
+        primary_raw: &str,
+    ) -> (String, String, FakeClaudeKeychain, ClaudeCredentials) {
+        let config_dir = "/Users/test/.claude-extra";
+        let extra_service = claude_keychain_service(Some(config_dir));
+        let extra_raw = claude_store_json("extra-old-access", "extra-old-refresh", 0);
+        let keychain = FakeClaudeKeychain::with(&[
+            (CLAUDE_KEYCHAIN_SERVICE, "shared-user", primary_raw),
+            (&extra_service, "shared-user", &extra_raw),
+        ]);
+        let original = load_claude_config_dir_credentials_with(config_dir, |dir| {
+            assert_eq!(dir, Some(config_dir));
+            Ok(Some(extra_raw.clone()))
+        })
+        .unwrap();
+        (extra_service, extra_raw, keychain, original)
+    }
+
+    /// (a) The extra item is rewritten but keeps the refresh token this refresh
+    /// sent: the rescue writes the new tokens to the extra item under its own
+    /// account, and the primary item is never touched.
+    #[tokio::test]
+    async fn claude_config_dir_rescue_rewrites_only_the_extra_item() {
+        for phase in CLAUDE_KEYCHAIN_RESCUE_PHASES {
+            let primary_raw = claude_store_json("primary-access", "primary-refresh", 0);
+            let (extra_service, _, keychain, original) = claude_extra_rescue_fixture(&primary_raw);
+            let touched =
+                claude_store_json_with_sibling("cli-touched-access", "extra-old-refresh", 0);
+            let touched_service = extra_service.clone();
+
+            let (refreshed, _, cache_binding) = run_claude_keychain_rescue(
+                &original,
+                &keychain,
+                "claude-config-dir-rescue-extra",
+                phase,
+                false,
+                move |keychain| keychain.put(&touched_service, "shared-user", &touched),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{phase:?}: the extra item's rescue must persist"));
+
+            assert_eq!(refreshed.access_token, "rescue-new-access", "{phase:?}");
+            assert_eq!(
+                claude_keychain_service_of(&refreshed),
+                extra_service,
+                "{phase:?}"
+            );
+            assert!(cache_binding.is_some(), "{phase:?}");
+            assert_eq!(
+                *keychain.writes.borrow(),
+                vec![(extra_service.clone(), "shared-user".to_string())],
+                "{phase:?}"
+            );
+            let stored: Value =
+                serde_json::from_str(&keychain.raw(&extra_service, "shared-user").unwrap())
+                    .unwrap();
+            assert_eq!(
+                stored["claudeAiOauth"]["accessToken"], "rescue-new-access",
+                "{phase:?}"
+            );
+            assert_eq!(
+                stored["claudeAiOauth"]["refreshToken"], "rescue-new-refresh",
+                "{phase:?}"
+            );
+            assert_eq!(stored["sibling"]["writer"], "claude-cli", "{phase:?}");
+            assert_eq!(
+                keychain
+                    .raw(CLAUDE_KEYCHAIN_SERVICE, "shared-user")
+                    .as_deref(),
+                Some(primary_raw.as_str()),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// (b) The primary item happens to hold the extra's sent refresh token
+    /// while the extra item now holds a foreign one. The decision must read the
+    /// extra item, keep it, and never write the primary item.
+    #[tokio::test]
+    async fn claude_config_dir_rescue_never_writes_the_primary_item() {
+        for phase in CLAUDE_KEYCHAIN_RESCUE_PHASES {
+            let primary_raw = claude_store_json("primary-access", "extra-old-refresh", 0);
+            let (extra_service, _, keychain, original) = claude_extra_rescue_fixture(&primary_raw);
+            let foreign = claude_store_json_with_sibling(
+                "foreign-access",
+                "foreign-refresh",
+                CLAUDE_FAR_FUTURE_MILLIS,
+            );
+            let foreign_service = extra_service.clone();
+            let foreign_written = foreign.clone();
+
+            let result = run_claude_keychain_rescue(
+                &original,
+                &keychain,
+                "claude-config-dir-rescue-primary-untouched",
+                phase,
+                false,
+                move |keychain| keychain.put(&foreign_service, "shared-user", &foreign_written),
+            )
+            .await;
+
+            assert!(claude_target_changed(&result), "{phase:?}");
+            assert!(keychain.writes.borrow().is_empty(), "{phase:?}");
+            assert_eq!(
+                keychain
+                    .raw(CLAUDE_KEYCHAIN_SERVICE, "shared-user")
+                    .as_deref(),
+                Some(primary_raw.as_str()),
+                "{phase:?}"
+            );
+            assert_eq!(
+                keychain.raw(&extra_service, "shared-user").as_deref(),
+                Some(foreign.as_str()),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// (c) A hard rejection adopts a live rotation only from the extra item
+    /// itself; a rotation of the primary item leaves the original failure.
+    #[tokio::test]
+    async fn claude_config_dir_refresh_adopts_only_the_extra_items_rotation() {
+        let phase = ClaudeKeychainRescuePhase::NetworkWait;
+        let primary_raw = claude_store_json("primary-access", "primary-refresh", 0);
+
+        let (extra_service, _, keychain, original) = claude_extra_rescue_fixture(&primary_raw);
+        let rotated = claude_store_json(
+            "extra-rotated-access",
+            "extra-rotated-refresh",
+            CLAUDE_FAR_FUTURE_MILLIS,
+        );
+        let rotated_service = extra_service.clone();
+        let (adopted, _, cache_binding) = run_claude_keychain_rescue(
+            &original,
+            &keychain,
+            "claude-config-dir-adopt-extra",
+            phase,
+            true,
+            move |keychain| keychain.put(&rotated_service, "shared-user", &rotated),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the extra item's own rotation must be adopted"));
+        assert_eq!(adopted.access_token, "extra-rotated-access");
+        assert_eq!(
+            adopted.refresh_token.as_deref(),
+            Some("extra-rotated-refresh")
+        );
+        assert_eq!(
+            adopted.scope_slot.semantic_source,
+            CLAUDE_CONFIG_DIR_KEYCHAIN_SOURCE
+        );
+        assert_eq!(claude_keychain_service_of(&adopted), extra_service);
+        assert!(cache_binding.is_some());
+        assert!(keychain.writes.borrow().is_empty());
+        assert_eq!(
+            keychain
+                .raw(CLAUDE_KEYCHAIN_SERVICE, "shared-user")
+                .as_deref(),
+            Some(primary_raw.as_str())
+        );
+
+        let (extra_service, extra_raw, keychain, original) =
+            claude_extra_rescue_fixture(&primary_raw);
+        let primary_rotated = claude_store_json(
+            "primary-rotated-access",
+            "primary-rotated-refresh",
+            CLAUDE_FAR_FUTURE_MILLIS,
+        );
+        let primary_rotated_written = primary_rotated.clone();
+        let failure = run_claude_keychain_rescue(
+            &original,
+            &keychain,
+            "claude-config-dir-adopt-primary-only",
+            phase,
+            true,
+            move |keychain| {
+                keychain.put(
+                    CLAUDE_KEYCHAIN_SERVICE,
+                    "shared-user",
+                    &primary_rotated_written,
+                )
+            },
+        )
+        .await
+        .err()
+        .expect("a rotation of another item must not rescue this login");
+        assert!(matches!(
+            failure,
+            ProviderFetchFailure::Terminal { ref display }
+                if display.contains("re-authenticate")
+        ));
+        assert!(keychain.writes.borrow().is_empty());
+        assert_eq!(
+            keychain.raw(&extra_service, "shared-user").as_deref(),
+            Some(extra_raw.as_str())
+        );
+        assert_eq!(
+            keychain
+                .raw(CLAUDE_KEYCHAIN_SERVICE, "shared-user")
+                .as_deref(),
+            Some(primary_rotated.as_str())
+        );
     }
 
     /// One recordable session window, so `enrich_snapshot_with` produces an
