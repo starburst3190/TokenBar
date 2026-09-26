@@ -15,6 +15,9 @@ final class StatusItemController: NSObject {
     let chrome = PopoverChrome()
     private var defaultsObserver: NSObjectProtocol?
     private var closeObserver: NSObjectProtocol?
+    /// Last scale factor pushed to the popover window, so the defaults
+    /// observer only re-sizes when the scale actually changed.
+    private var appliedScale = PopoverScale.current.factor
     private var host: NSHostingController<AnyView>?
     private var animationSurface: StatusItemAnimationSurface?
     private var hasPresentedIcon = false
@@ -51,7 +54,10 @@ final class StatusItemController: NSObject {
         // instead of chasing intrinsic-size updates. The real size is set per
         // open in showPopover() against the status item's actual screen.
         host.sizingOptions = []
-        popover.contentSize = NSSize(width: chrome.width, height: chrome.minHeight)
+        let scale = PopoverScale.current.factor
+        popover.contentSize = NSSize(
+            width: (chrome.width * scale).rounded(),
+            height: (chrome.minHeight * scale).rounded())
         if #available(macOS 27.0, *) {
             let presenter = GlassPanelPresenter(contentViewController: host)
             presenter.onHidden = { [weak self] in
@@ -91,17 +97,27 @@ final class StatusItemController: NSObject {
 
         // The chrome model drives the popover window from three inputs: the
         // bottom drag handle, the settings slider, and the screen-size resolve.
+        // The PopoverScale factor is baked in so the window stays in sync with
+        // the geometric scaleEffect SwiftUI applies to the content.
         chrome.onResize = { [weak self, weak popover] height, live in
             if let glassPanel = self?.glassPanel {
                 glassPanel.layout(height: height, animate: !live)
                 return
             }
             guard let popover else { return }
-            popover.animates = !live // 1:1 tracking mid-drag; animate otherwise
-            popover.contentSize = NSSize(width: PopoverChrome.width, height: height)
+            let s = PopoverScale.current.factor
+            popover.animates = !live
+            popover.contentSize = NSSize(
+                width: (PopoverChrome.width * s).rounded(),
+                height: (height * s).rounded())
         }
-        // The settings window's slider writes the height default from another
-        // window — mirror it onto a live popover.
+        // The settings window writes height and scale defaults from another
+        // window — mirror both onto a live popover. reloadFromDefaults()
+        // pushes through onResize itself when the height changed; the scale
+        // is compared here so the popover window only re-sizes on an actual
+        // scale change, not on every unrelated defaults write. (The async hop
+        // defers past the @AppStorage write that posted the notification —
+        // resizing the popover mid-write re-enters SwiftUI's update.)
         defaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -109,8 +125,16 @@ final class StatusItemController: NSObject {
             // SwiftUI is laying out a newly opened popover. Resizing in that
             // AttributeGraph transaction aborts the process, so apply the
             // value-gated reload on the next main-queue turn.
-            DispatchQueue.main.async { [weak self] in
-                MainActor.assumeIsolated { self?.chrome.reloadFromDefaults() }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.chrome.reloadFromDefaults()
+                    let scale = PopoverScale.current.factor
+                    if scale != self.appliedScale {
+                        self.appliedScale = scale
+                        self.chrome.onResize?(self.chrome.height, false)
+                    }
+                }
             }
         }
 
@@ -256,7 +280,9 @@ final class StatusItemController: NSObject {
         // Size against the screen the status item actually lives on (reliable,
         // unlike NSScreen.main at launch with no key window) every time we open.
         let visible = (button.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
-        chrome.resolve(visibleHeight: visible)
+        // In unscaled points: the window is `height * scale` tall, and the
+        // glass panel, unlike NSPopover, does not pull itself back on screen.
+        chrome.resolve(visibleHeight: visible / PopoverScale.current.factor)
         if let glassPanel {
             glassPanel.present(from: button, height: chrome.height)
             popoverAnchorIdentity = identity
@@ -279,7 +305,7 @@ final class StatusItemController: NSObject {
         // shorter display's visible frame and leave the popover clipped. Same
         // resolve the normal presentation path does.
         let visible = (button.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
-        chrome.resolve(visibleHeight: visible)
+        chrome.resolve(visibleHeight: visible / PopoverScale.current.factor)
         // NSPopover supports changing the relative anchor while shown. Keep the
         // live host and Dashboard tasks intact; only the native anchor moves.
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
