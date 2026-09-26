@@ -95,7 +95,7 @@ struct WindowUsageCard: View {
                      subtitle: "Quota unavailable") {
                 Text(reason)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -106,7 +106,7 @@ struct WindowUsageCard: View {
                 windowButtons(candidates: candidates, cardId: cardId)
                 Text("This window has no recorded quota history, so there is no line to draw.".localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -161,7 +161,7 @@ struct WindowUsageCard: View {
                         // place of numbers that would be another account's.
                         Text("Local usage can't be attributed to this account yet.".localized)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                     case .numbers:
                         if let usage {
                             equivalenceRow(
@@ -173,7 +173,7 @@ struct WindowUsageCard: View {
                         // this line has nothing to report.
                         Text("Local usage could not be read.".localized)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                     case .spinner:
                         LoadingLine(title: "Reading local usage…")
                     }
@@ -183,7 +183,7 @@ struct WindowUsageCard: View {
             } else {
                 Text(emptyText(quota))
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -207,7 +207,7 @@ struct WindowUsageCard: View {
         AccountPills.headerLabel(account).map { label in
             AnyView(Text(verbatim: label)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .lineLimit(1)
                 .help(account?.tooltip ?? ""))
         }
@@ -282,11 +282,11 @@ struct WindowUsageCard: View {
                     .font(.system(size: 22, weight: .semibold))
                 Text((asUsed ? "used" : "remaining").localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 Text("No quota reading in this window".localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -473,7 +473,7 @@ struct WindowUsageCard: View {
             key(.secondary.opacity(0.3), "No sample")
             Spacer()
             Text("%@ readings".localized(String(geo.samplePoints.count)))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
         }
         .font(.caption2)
     }
@@ -518,7 +518,7 @@ struct WindowUsageCard: View {
             Text("%@ scanned rows have no usable timestamp, so no window can count them"
                 .localized(String(usage.undatedCount)))
                 .font(.system(size: 9))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -530,7 +530,7 @@ struct WindowUsageCard: View {
                 .frame(width: line ? 12 : 8, height: line ? 2 : 8)
             Text(label.localized)
         }
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.secondaryAdaptive)
     }
 
     private func equivalenceRow(
@@ -551,7 +551,7 @@ struct WindowUsageCard: View {
         return Text(WindowEquivalence.text(
             row, tokens: Format.compactTokens, money: Format.usdOrBelowCent))
             .font(.caption2)
-            .foregroundStyle(plain ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            .foregroundStyle(plain ? AnyShapeStyle(.secondaryAdaptive) : AnyShapeStyle(.primary))
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -589,7 +589,7 @@ private struct WindowHoverTooltip: View {
                 .font(.caption.weight(.semibold))
             Text(subtitle)
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             // The quota row keeps the spike's three states; a zone with no
             // closing sample is the hatched stretch, and must say so rather
             // than show nothing.
@@ -599,7 +599,7 @@ private struct WindowHoverTooltip: View {
                     (metric == .used ? "used" : "remaining").localized)
             } ?? "No quota reading in this interval".localized)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             // What this interval actually cost, signed the way the card is
             // currently read: counting up it rises, counting down it falls.
             // Absent rather than zero when an end has no reading — an interval
@@ -608,7 +608,7 @@ private struct WindowHoverTooltip: View {
                 Text("%@%@%% this interval".localized(
                     delta > 0 ? "+" : "", String(format: "%g", delta)))
                     .font(.caption2.weight(.medium))
-                    .foregroundStyle(delta == 0 ? AnyShapeStyle(.tertiary)
+                    .foregroundStyle(delta == 0 ? AnyShapeStyle(.tertiaryAdaptive)
                                                 : AnyShapeStyle(.primary))
             }
             HStack {
@@ -627,7 +627,7 @@ private struct WindowHoverTooltip: View {
                     tokens: total, cost: messages.reduce(0) { $0 + $1.cost }))
             }
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
             ForEach(kinds, id: \.label) { kind in
                 HStack(spacing: 4) {
                     RoundedRectangle(cornerRadius: 1.5)
@@ -637,14 +637,14 @@ private struct WindowHoverTooltip: View {
                     Spacer()
                     Text("\(Format.compactTokens(kind.value)) · "
                          + "\(Int((Double(kind.value) / Double(max(1, total)) * 100).rounded()))%")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
                 .font(.caption2)
             }
             if kinds.isEmpty {
                 Text("No usage in this interval".localized)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
         }
         // Same chrome as the usage chart's tooltip, down to the radius and the
