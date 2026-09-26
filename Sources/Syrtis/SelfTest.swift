@@ -7746,16 +7746,73 @@ enum SelfTest {
 
         let chartPayload = activityPayload(end: "2026-07-05", days: [activityDay("vis", "2026-07-03"), activityDay("hid", "2026-07-05")])
         let chartColors = ModelColorMap(report: nil)
-        struct DayBarCase { let name: String; let payload: UsagePayload; let rangeEnd: String; let fallback: String; let last: String; let hasTokens: Bool }
-        for c in [
-            DayBarCase(name: "hidden later activity does not push selected usage out of the window", payload: chartPayload, rangeEnd: "2026-07-05", fallback: "2026-07-09", last: "2026-07-03", hasTokens: true),
-            DayBarCase(name: "a later message-only day does not shift the token/cost window", payload: messageTail, rangeEnd: "2026-07-31", fallback: "2026-07-31", last: "2026-07-01", hasTokens: true),
-            DayBarCase(name: "empty series uses endFallback when rangeEnd is empty", payload: activityPayload(end: "2026-07-09", days: []), rangeEnd: "", fallback: "2026-07-09", last: "2026-07-09", hasTokens: false),
-        ] {
-            let bars = DayBars.build(payload: c.payload, clientIds: ["vis"], stackBy: .agent, colors: chartColors, rangeEnd: c.rangeEnd, endFallback: c.fallback)
-            expect(bars.count == DayBars.window && bars.last?.date == c.last && ((bars.last?.totalTokens ?? 0) > 0) == c.hasTokens, c.name)
+        // DayBars spans the whole recorded range so the chart can scroll back
+        // to the first day, padding to a full viewport for short history. The
+        // window still anchors on the selected series' activity, so hidden or
+        // message-only later days cannot push visible usage out of view.
+        let longPayload = activityPayload(end: "2026-07-05", days: [
+            activityDay("vis", "2026-05-07"), activityDay("vis", "2026-07-05")])
+        let emptyPayload = activityPayload(end: "2026-07-09", days: [])
+        struct DayBarCase {
+            let name: String
+            let payload: UsagePayload
+            let rangeStart: String
+            let rangeEnd: String
+            let fallback: String
+            let count: Int?
+            let first: String?
+            let last: String
+            let hasTokens: Bool
         }
+        for c in [
+            DayBarCase(name: "hidden later activity does not push selected usage out of the window",
+                payload: chartPayload, rangeStart: "2026-07-05", rangeEnd: "2026-07-05",
+                fallback: "2026-07-09", count: DayBars.window, first: nil,
+                last: "2026-07-03", hasTokens: true),
+            DayBarCase(name: "a later message-only day does not shift the token/cost window",
+                payload: messageTail, rangeStart: "2026-07-01", rangeEnd: "2026-07-31",
+                fallback: "2026-07-31", count: nil, first: nil,
+                last: "2026-07-01", hasTokens: true),
+            DayBarCase(name: "long history yields a full-range series from rangeStart to rangeEnd",
+                payload: longPayload, rangeStart: "2026-05-07", rangeEnd: "2026-07-05",
+                fallback: "2026-07-09", count: 60, first: "2026-05-07",
+                last: "2026-07-05", hasTokens: true),
+            DayBarCase(name: "short history pads to exactly one window ending at rangeEnd",
+                payload: chartPayload, rangeStart: "2026-07-03", rangeEnd: "2026-07-03",
+                fallback: "2026-07-09", count: DayBars.window, first: "2026-06-04",
+                last: "2026-07-03", hasTokens: true),
+            DayBarCase(name: "empty rangeStart falls back to a trailing window",
+                payload: chartPayload, rangeStart: "", rangeEnd: "2026-07-03",
+                fallback: "2026-07-09", count: DayBars.window, first: "2026-06-04",
+                last: "2026-07-03", hasTokens: true),
+            DayBarCase(name: "unparseable rangeStart falls back to a trailing window",
+                payload: chartPayload, rangeStart: "not-a-date", rangeEnd: "2026-07-03",
+                fallback: "2026-07-09", count: DayBars.window, first: nil,
+                last: "2026-07-03", hasTokens: true),
+            DayBarCase(name: "empty series uses endFallback when rangeEnd is empty",
+                payload: emptyPayload, rangeStart: "", rangeEnd: "",
+                fallback: "2026-07-09", count: DayBars.window, first: nil,
+                last: "2026-07-09", hasTokens: false),
+        ] {
+            let bars = DayBars.build(
+                payload: c.payload, clientIds: ["vis"], stackBy: .agent, colors: chartColors,
+                rangeStart: c.rangeStart, rangeEnd: c.rangeEnd, endFallback: c.fallback)
+            expect(
+                (c.count.map { bars.count == $0 } ?? true)
+                    && (c.first.map { bars.first?.date == $0 } ?? true)
+                    && bars.last?.date == c.last
+                    && ((bars.last?.totalTokens ?? 0) > 0) == c.hasTokens,
+                c.name)
+        }
+        // The long series carries activity at both ends, not just the tail.
+        let longBars = DayBars.build(
+            payload: longPayload, clientIds: ["vis"], stackBy: .agent, colors: chartColors,
+            rangeStart: "2026-05-07", rangeEnd: "2026-07-05", endFallback: "2026-07-09")
+        expect((longBars.first?.totalTokens ?? 0) > 0 && (longBars.last?.totalTokens ?? 0) > 0,
+            "both endpoints of the long series carry their activity")
 
+        // `PopoverTooltipPlacement` still places the cards that have not moved
+        // to the shared TooltipHost layer (window/quota/models/trend panels).
         let viewport = CGRect(x: 100, y: 200, width: 400, height: 300)
         let chartFrame = CGRect(x: 120, y: 250, width: 360, height: 150)
         let tip = CGSize(width: 210, height: 120)
