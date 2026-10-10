@@ -488,7 +488,7 @@ struct ContributionGraph3D: View {
             .overlay(alignment: .top) {
                 HStack(spacing: 4) {
                     chip(Text("Pinch or ⌘ + scroll to zoom".localized))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .lineLimit(1)
                         .opacity(hintVisible ? 1 : 0)
                         .allowsHitTesting(false)

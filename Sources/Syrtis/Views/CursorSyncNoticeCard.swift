@@ -18,7 +18,7 @@ struct CursorSyncNoticeCardView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(CursorSync.Copy.privacy.localized)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 10) {
                         Spacer()
@@ -27,7 +27,7 @@ struct CursorSyncNoticeCardView: View {
                         }
                         .buttonStyle(.plain)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         Button(CursorSync.Copy.continue.localized) {
                             CursorSyncController.shared.answerNotice(continuing: true)
                         }

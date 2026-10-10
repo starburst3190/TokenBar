@@ -115,13 +115,13 @@ struct OnboardingSetupCards: View {
                 Text(OnboardingSetupCopy.headerTitle.localized).font(.headline)
                 Text(OnboardingSetupCopy.headerRemaining.localized(Int64(remaining)))
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             Spacer()
             Button(OnboardingSetupCopy.skipAll.localized) { OnboardingSetup.skipAll() }
                 .buttonStyle(.plain)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -135,11 +135,11 @@ struct OnboardingSetupCards: View {
         DashCard(OnboardingSetupCopy.agentsTitle) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(OnboardingSetupCopy.agentsBody.localized)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
                 if presentClients.isEmpty {
                     Text(OnboardingSetupCopy.agentsNone.localized)
-                        .font(.caption2).foregroundStyle(.tertiary)
+                        .font(.caption2).foregroundStyle(.tertiaryAdaptive)
                 } else {
                     Text(presentClients.map { ClientRegistry.style($0).displayName }
                         .joined(separator: " · "))
@@ -163,7 +163,7 @@ struct OnboardingSetupCards: View {
         DashCard(OnboardingSetupCopy.iconTitle) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(OnboardingSetupCopy.iconBody.localized)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
                 // Picking applies at once, so the live menu-bar icon can be
                 // tried; "Done" answers the card.
@@ -180,7 +180,7 @@ struct OnboardingSetupCards: View {
         DashCard(OnboardingSetupCopy.titleTitle) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(OnboardingSetupCopy.titleBody.localized)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.secondaryAdaptive)
                 choiceGrid(
                     options: TrayMode.allCases.map { ($0.rawValue, $0.label) },
                     selected: trayModeRaw
@@ -198,7 +198,7 @@ struct OnboardingSetupCards: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text((DiscordPresence.enabled()
                     ? OnboardingSetupCopy.discordAlreadyOn : OnboardingSetupCopy.discordBody).localized)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
                 // Two buttons of equal weight, neither filled nor the default:
                 // a prominent "set up" next to a plain "no" is a thumb on the
@@ -273,7 +273,7 @@ struct OnboardingSetupCards: View {
             Button(secondary.0.localized, action: secondary.1)
                 .buttonStyle(.plain)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             Button(primary.0.localized, action: primary.1)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
@@ -292,7 +292,7 @@ private struct LoginCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text((enabled == true ? OnboardingSetupCopy.loginAlreadyOn : OnboardingSetupCopy.loginBody)
                     .localized)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
                 if failed {
                     Text(OnboardingSetupCopy.loginFailed.localized)
@@ -309,7 +309,7 @@ private struct LoginCard: View {
                         Button(OnboardingSetupCopy.loginOff.localized) { OnboardingSetup.answer(.login) }
                             .buttonStyle(.plain)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                         Button(OnboardingSetupCopy.loginOn.localized) {
                             // Answered only when it took: a failed register
                             // (for example Syrtis switched off under Login

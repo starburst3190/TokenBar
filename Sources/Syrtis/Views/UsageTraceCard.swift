@@ -37,12 +37,12 @@ struct UsageTraceCard: View {
             Text("last %lldm · %@/m total".localized(
                 windowMin, Format.compactTokens(Int64(totalRate.rounded()))))
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
         }) {
             if top.isEmpty {
                 Text("No activity in this window")
                     .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 8)
             } else {
@@ -63,15 +63,15 @@ struct UsageTraceCard: View {
                     .font(.caption2.weight(.semibold))
                 Text(bucket.agent)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                 Text(bucket.model)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                     .lineLimit(1)
                 Spacer()
                 Text("\(Format.compactTokens(Int64(bucket.tokensPerMin.rounded())))/m")
                     .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {

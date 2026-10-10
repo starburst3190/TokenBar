@@ -106,7 +106,7 @@ struct OverviewView: View {
                 DashCard("Token Usage") {
                     Text("No local usage records in this range.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else {

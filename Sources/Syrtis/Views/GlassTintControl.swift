@@ -40,12 +40,12 @@ struct GlassTintSlider: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "rectangle.on.rectangle")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             Slider(value: $glassTint.value, in: 0...1)
                 .controlSize(.small)
                 .accessibilityLabel("Glass tint".localized)
             Image(systemName: "rectangle.fill.on.rectangle.fill")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
         }
     }
 
