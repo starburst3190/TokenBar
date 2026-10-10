@@ -10,8 +10,17 @@ import SwiftUI
 /// Place inside the horizontal ScrollView's content so `enclosingScrollView`
 /// resolves to that row's NSScrollView (the OverlayScroller pattern).
 struct HorizontalWheelScroll: NSViewRepresentable {
+    /// Scroll in whole steps of this width, landing on its multiples: the
+    /// usage chart passes its bar slot so a wheel moves it bar by bar, as its
+    /// scroll target behavior does for a trackpad. A programmatic scroll skips
+    /// that behavior, and the chart's tooltip anchoring assumes a slot-aligned
+    /// offset. Nil scrolls freely by the wheel's own distance.
+    var quantum: CGFloat? = nil
+
     func makeNSView(context: Context) -> WheelRedirectView { WheelRedirectView() }
-    func updateNSView(_ view: WheelRedirectView, context: Context) {}
+    func updateNSView(_ view: WheelRedirectView, context: Context) {
+        view.quantum = quantum.flatMap { $0 > 0 ? $0 : nil }
+    }
 
     /// The clamped horizontal origin after stepping by `step`, and whether it
     /// actually moved. Pure so tests can exercise the boundary case (already
@@ -28,9 +37,43 @@ struct HorizontalWheelScroll: NSViewRepresentable {
         return (newOriginX, newOriginX != originX)
     }
 
+    /// Whole steps for one wheel event in quantum mode, and the remainder to
+    /// carry. A line-based wheel moves one step per notch (more when the
+    /// system accelerates it); a smooth-scrolling mouse reports points, which
+    /// add up until they cover a step. A reversal drops the carried remainder,
+    /// so turning the wheel back moves back on the first full step.
+    static func quantumSteps(
+        pending: CGFloat, delta: CGFloat, precise: Bool, quantum: CGFloat
+    ) -> (steps: Int, pending: CGFloat) {
+        guard delta != 0, quantum > 0 else { return (0, pending) }
+        guard precise else {
+            return (Int(delta.rounded(.awayFromZero)), 0)
+        }
+        let carried = (pending == 0 || (pending > 0) == (delta > 0)) ? pending : 0
+        let total = carried + delta
+        let steps = Int((total / quantum).rounded(.towardZero))
+        return (steps, total - CGFloat(steps) * quantum)
+    }
+
+    /// The origin `steps` whole quanta from the current one, measured from the
+    /// nearest multiple so a slightly misaligned origin realigns, clamped to
+    /// the scrollable range. A positive step moves toward the leading edge,
+    /// matching `clampedScroll`'s sign.
+    static func quantizedScroll(
+        originX: CGFloat, steps: Int, quantum: CGFloat, maxX: CGFloat
+    ) -> (newOriginX: CGFloat, moved: Bool) {
+        let index = (originX / quantum).rounded()
+        let target = (index - CGFloat(steps)) * quantum
+        let newOriginX = min(max(0, target), maxX)
+        return (newOriginX, newOriginX != originX)
+    }
+
     @MainActor
     final class WheelRedirectView: NSView {
         private var monitor: Any?
+        var quantum: CGFloat?
+        /// Smooth-scroll distance not yet worth a whole quantum.
+        private var pending: CGFloat = 0
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -68,6 +111,31 @@ struct HorizontalWheelScroll: NSViewRepresentable {
             let clip = scroll.contentView
             let maxX = max(0, (scroll.documentView?.frame.width ?? 0) - clip.bounds.width)
             guard maxX > 0 else { return false }
+            if let quantum {
+                let originX = clip.bounds.origin.x
+                // Toward an edge the origin already sits on: let the event fall
+                // through to the parent (vertical) scroll view, as below.
+                if (dy > 0 && originX <= 0) || (dy < 0 && originX >= maxX) {
+                    pending = 0
+                    return false
+                }
+                let (steps, carry) = HorizontalWheelScroll.quantumSteps(
+                    pending: pending, delta: dy,
+                    precise: event.hasPreciseScrollingDeltas, quantum: quantum)
+                pending = carry
+                // Short of a whole step: consumed, so the page does not scroll
+                // vertically while the distance adds up.
+                guard steps != 0 else { return true }
+                let (newOriginX, moved) = HorizontalWheelScroll.quantizedScroll(
+                    originX: originX, steps: steps, quantum: quantum, maxX: maxX)
+                if moved {
+                    var origin = clip.bounds.origin
+                    origin.x = newOriginX
+                    clip.setBoundsOrigin(origin)
+                    scroll.reflectScrolledClipView(clip)
+                }
+                return true
+            }
             // Precise (smooth) deltas are already in points; coarse wheel deltas
             // are in lines and need scaling for a comfortable step.
             let step = event.hasPreciseScrollingDeltas ? dy : dy * 16
