@@ -56,6 +56,44 @@ final class GlassPanelPresenter {
 
     var hasSession: Bool { cancelSession != nil }
 
+    /// When a click in the menu bar last closed the panel, as the click's
+    /// `NSEvent.timestamp` (system uptime). See `consumeMenuBarReopen`.
+    private var menuBarCloseAt: TimeInterval?
+    nonisolated static let menuBarReopenWindow: TimeInterval = 1.0
+
+    /// Whether a session begin is the one the menu bar starts for the click
+    /// that just closed the panel. True at most once: the mark is cleared
+    /// either way. The owner cancels that session instead of reopening.
+    func consumeMenuBarReopen(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        defer { menuBarCloseAt = nil }
+        return Self.isSameClickReopen(closedAt: menuBarCloseAt, now: now)
+    }
+
+    nonisolated static func isSameClickReopen(closedAt: TimeInterval?, now: TimeInterval) -> Bool {
+        guard let closedAt else { return false }
+        return now - closedAt < menuBarReopenWindow
+    }
+
+    /// Whether a screen point lies in the menu bar of the screen holding it.
+    static func isMenuBarClick(at point: NSPoint) -> Bool {
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) })
+        else { return false }
+        return isMenuBarClick(
+            at: point, frame: screen.frame, visibleFrame: screen.visibleFrame,
+            menuBarThickness: NSStatusBar.system.thickness)
+    }
+
+    /// With the menu bar shown, `visibleFrame` stops below it; with the bar
+    /// auto-hidden the two tops match, so the bar's thickness marks the band.
+    nonisolated static func isMenuBarClick(
+        at point: NSPoint, frame: NSRect, visibleFrame: NSRect, menuBarThickness: CGFloat
+    ) -> Bool {
+        guard NSMouseInRect(point, frame, false) else { return false }
+        let floor = visibleFrame.maxY < frame.maxY
+            ? visibleFrame.maxY : frame.maxY - menuBarThickness
+        return point.y >= floor
+    }
+
     /// Records the session the menu bar opened for `owner`, so `close()` can
     /// end it.
     func adopt(_ owner: AnyObject, cancelSession: @escaping () -> Void) {
@@ -219,11 +257,26 @@ final class GlassPanelPresenter {
 
     /// The session API leaves clicks in other windows and Esc to the app.
     /// Menu-bar clicks on other extras end the session by themselves.
+    ///
+    /// A click on this panel's own status item does not: the menu bar only
+    /// drops the item's highlight and keeps the session open. That click
+    /// reaches the global monitor (the menu bar is another process), which
+    /// closes the panel; the menu bar then begins a new session for the same
+    /// click, so the monitor marks it and the owner cancels that begin
+    /// (`consumeMenuBarReopen`) instead of reopening the panel.
     private func installEventMonitors() {
         guard eventMonitors.isEmpty else { return }
         if let global = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown],
-            handler: { [weak self] _ in MainActor.assumeIsolated { self?.close() } })
+            handler: { [weak self] event in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if Self.isMenuBarClick(at: NSEvent.mouseLocation) {
+                        self.menuBarCloseAt = event.timestamp
+                    }
+                    self.close()
+                }
+            })
         {
             eventMonitors.append(global)
         }

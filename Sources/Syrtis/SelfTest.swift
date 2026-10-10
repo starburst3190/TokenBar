@@ -1302,6 +1302,32 @@ enum SelfTest {
                 visible: nil, width: 400, height: 500)
             expect(unclamped.minX == -190, "glass panel is not clamped without a screen")
         }
+        // Own-item toggle: a menu bar click closes the panel and the session
+        // the menu bar begins for that same click is cancelled, not reopened.
+        // Mutation: dropping the auto-hide branch fails the hidden-bar case;
+        // `<=` for the window fails the boundary case.
+        do {
+            let frame = NSRect(x: 0, y: 0, width: 1_000, height: 800)
+            let shownBar = NSRect(x: 0, y: 0, width: 1_000, height: 776)
+            func inBar(_ p: NSPoint, _ visible: NSRect) -> Bool {
+                GlassPanelPresenter.isMenuBarClick(
+                    at: p, frame: frame, visibleFrame: visible, menuBarThickness: 24)
+            }
+            expect(
+                inBar(NSPoint(x: 500, y: 790), shownBar)
+                    && !inBar(NSPoint(x: 500, y: 770), shownBar)
+                    && !inBar(NSPoint(x: 1_500, y: 790), shownBar),
+                "a click in the menu bar band counts; below it or on another screen does not")
+            expect(
+                inBar(NSPoint(x: 500, y: 780), frame) && !inBar(NSPoint(x: 500, y: 770), frame),
+                "with the menu bar auto-hidden its thickness marks the band")
+            let window = GlassPanelPresenter.menuBarReopenWindow
+            expect(
+                !GlassPanelPresenter.isSameClickReopen(closedAt: nil, now: 100)
+                    && GlassPanelPresenter.isSameClickReopen(closedAt: 100, now: 100.15)
+                    && !GlassPanelPresenter.isSameClickReopen(closedAt: 100, now: 100 + window),
+                "only a begin shortly after a menu bar close is that click's reopen")
+        }
         let glassCloseResult = MainActor.assumeIsolated { () -> ([Bool], Bool, Bool, Bool) in
             let panel = GlassPanel()
             var closeIntents: [Bool] = []

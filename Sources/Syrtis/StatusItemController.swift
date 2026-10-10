@@ -528,6 +528,10 @@ final class StatusItemController: NSObject {
 extension StatusItemController: @preconcurrency NSStatusItemExpandedInterfaceDelegate {
     func statusItem(_ item: NSStatusItem, didBegin session: NSStatusItemExpandedInterfaceSession) {
         guard let glassPanel else { return session.cancel() }
+        // The click on this item that just closed the panel: the menu bar
+        // begins a session for it once the closed one ended. Reopening here
+        // turned a second click into close-and-reopen instead of a toggle.
+        if glassPanel.consumeMenuBarReopen() { return session.cancel() }
         // Opened without a session (`--open-popover`): a click closes it.
         if glassPanel.isShown, !glassPanel.hasSession {
             session.cancel()
