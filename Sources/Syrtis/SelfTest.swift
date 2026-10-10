@@ -9552,6 +9552,34 @@ enum SelfTest {
             let r = HorizontalWheelScroll.clampedScroll(originX: c.originX, step: c.step, maxX: 500)
             expect(r.newOriginX == c.newX && r.moved == c.moved, "wheel edge: \(c.name)")
         }
+        // Usage chart: a mouse wheel scrolls it bar by bar (quantum = one slot)
+        // and always lands on a slot multiple, which its tooltip anchoring
+        // assumes. Mutation: dropping the realignment in `quantizedScroll`
+        // fails the misaligned case; carrying the remainder across a reversal
+        // fails the reversal case.
+        do {
+            let q: CGFloat = 10
+            let coarse = HorizontalWheelScroll.quantumSteps(pending: 0, delta: 1, precise: false, quantum: q)
+            let coarseFast = HorizontalWheelScroll.quantumSteps(pending: 0, delta: -2.4, precise: false, quantum: q)
+            expect(coarse.steps == 1 && coarse.pending == 0 && coarseFast.steps == -3,
+                   "chart wheel: a line wheel notch is one bar, an accelerated one several")
+            let small = HorizontalWheelScroll.quantumSteps(pending: 0, delta: 4, precise: true, quantum: q)
+            let more = HorizontalWheelScroll.quantumSteps(pending: small.pending, delta: 7, precise: true, quantum: q)
+            expect(small.steps == 0 && small.pending == 4 && more.steps == 1 && more.pending == 1,
+                   "chart wheel: smooth deltas add up to a whole bar and carry the rest")
+            let reversed = HorizontalWheelScroll.quantumSteps(pending: 8, delta: -10, precise: true, quantum: q)
+            expect(reversed.steps == -1 && reversed.pending == 0,
+                   "chart wheel: a reversal drops the carried remainder")
+            let aligned = HorizontalWheelScroll.quantizedScroll(originX: 50, steps: 1, quantum: q, maxX: 100)
+            let misaligned = HorizontalWheelScroll.quantizedScroll(originX: 52, steps: -2, quantum: q, maxX: 100)
+            let pastEnd = HorizontalWheelScroll.quantizedScroll(originX: 90, steps: -3, quantum: q, maxX: 100)
+            let atStart = HorizontalWheelScroll.quantizedScroll(originX: 0, steps: 1, quantum: q, maxX: 100)
+            expect(aligned.newOriginX == 40 && aligned.moved
+                   && misaligned.newOriginX == 70
+                   && pastEnd.newOriginX == 100 && pastEnd.moved
+                   && atStart.newOriginX == 0 && !atStart.moved,
+                   "chart wheel: lands on a slot multiple, clamped to the scrollable range")
+        }
         // C5 — layout/ring bounds. The hover ring reaches `hoverRingReach`
         // beyond its cell on every side; `gridLeading`/`gridTop`/
         // `contentWidth`/`contentHeight` reserve exactly that room, so a ring
