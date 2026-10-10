@@ -36,6 +36,8 @@ use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 /// Marker error for "none of the three routes has a credential to use". The
 /// local IDE route needs a running language server, the `agy` route needs the
@@ -409,6 +411,200 @@ fn should_try_agy_fallback(failure: &ProviderFetchFailure) -> bool {
     matches!(failure, ProviderFetchFailure::Terminal { .. })
 }
 
+/// Cached outcome of the Antigravity CLI fallback, with the moment it was taken.
+///
+/// `value` is `Err` with the failure's message when the fetch failed: the
+/// message is what `with_agy_fallback` reads to choose the card's error (and
+/// whether it stays the unconfigured marker). A failure is cached as deliberately
+/// as a success: the common failure here is "the CLI is not installed", which
+/// costs a PATH walk plus (when the GUI process inherited no usable PATH) a
+/// login-shell spawn to answer, and re-answering it every minute is the same
+/// waste as re-running a working one.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+struct AgyCacheEntry {
+    fetched_at: DateTime<Utc>,
+    /// agy's login marker read before the fetch that produced `value`. An
+    /// entry from another login is a miss: serving it would draw the previous
+    /// account's windows under the current login for up to a TTL.
+    marker: Option<String>,
+    value: Result<Fetched, String>,
+}
+
+/// The CLI fallback spawns the `agy` binary, which is ~170MB and was measured
+/// on a live machine at 2.6-4.6s per invocation. `fetch_antigravity` sits
+/// inside `agent_usage::run`'s `tokio::join!`, which returns only when its
+/// slowest provider finishes, so without a cache every publication — including
+/// every one that exists to move the Claude card — paid that.
+///
+/// Everything else expensive in this crate already has a TTL for the same
+/// reason (`CLAUDE_PROFILE_CACHE`, `CLAUDE_HARVEST_CACHE`); this was the one
+/// that did not. Five minutes against a 60s poll: `agy --print /usage` reports
+/// quota windows that reset on the order of hours, so nothing observable is
+/// lost, and the tray's own five-minute refresh lines up with it.
+#[cfg(target_os = "macos")]
+const AGY_CLI_TTL_SECS: i64 = 300;
+/// Shorter than the positive TTL. A missing CLI is a stable answer, but a CLI
+/// that failed because it was mid-update or the user was mid-login is not, and
+/// two minutes bounds how long that state is repeated back.
+#[cfg(target_os = "macos")]
+const AGY_CLI_NEGATIVE_TTL_SECS: i64 = 120;
+
+#[cfg(target_os = "macos")]
+static AGY_CLI_CACHE: Mutex<Option<AgyCacheEntry>> = Mutex::new(None);
+/// Set while a background refresh is out, so a stale entry hands out exactly
+/// one refresh rather than one per caller. Without it, three publications
+/// arriving during one 4s spawn would start three more.
+#[cfg(target_os = "macos")]
+static AGY_CLI_REFRESHING: AtomicBool = AtomicBool::new(false);
+
+/// What the cache says to do, computed under the lock and testable without
+/// spawning anything.
+///
+/// Not `PartialEq`: `Fetched` is not, and a decision is compared in tests by
+/// its variant plus the window data it carries, never by whole-value equality.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum AgyCacheDecision {
+    /// Fresh enough. Use this and issue no request.
+    Serve(Box<Result<Fetched, String>>),
+    /// Past its TTL, but an answer is better than a four-second wait: use this
+    /// now and refresh behind it. Handed out only to the caller that won the
+    /// in-flight guard.
+    ServeAndRefresh(Box<Result<Fetched, String>>),
+    /// Nothing cached at all. This caller has to wait — the cold start, paid
+    /// once per process.
+    Fetch,
+}
+
+#[cfg(target_os = "macos")]
+fn agy_cache_decide(now: DateTime<Utc>, marker: Option<&str>) -> AgyCacheDecision {
+    let entry = {
+        let guard = AGY_CLI_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clone()
+    };
+    let Some(entry) = entry else {
+        return AgyCacheDecision::Fetch;
+    };
+    // Another login, or one that cannot be read, has no cached answer. An
+    // unreadable marker is also the signed-out state, where the gated route
+    // returns without spawning, so a miss there costs nothing.
+    if marker.is_none() || entry.marker.as_deref() != marker {
+        return AgyCacheDecision::Fetch;
+    }
+    let ttl = if entry.value.is_ok() {
+        AGY_CLI_TTL_SECS
+    } else {
+        AGY_CLI_NEGATIVE_TTL_SECS
+    };
+    // A clock that ran backwards makes `age` negative, which is younger than
+    // any TTL and therefore serves — the same fail-toward-serving choice the
+    // rest of this file makes, and the safe one: the cost of serving a slightly
+    // stale window is a stale number, the cost of refusing is the wait.
+    let age = (now - entry.fetched_at).num_seconds();
+    if age < ttl {
+        return AgyCacheDecision::Serve(Box::new(entry.value));
+    }
+    // Stale. Exactly one caller gets to start the refresh; the rest are served
+    // the same stale value without one.
+    if AGY_CLI_REFRESHING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        AgyCacheDecision::ServeAndRefresh(Box::new(entry.value))
+    } else {
+        AgyCacheDecision::Serve(Box::new(entry.value))
+    }
+}
+
+/// Clears the in-flight flag however the refresh ends, panic included.
+#[cfg(target_os = "macos")]
+struct AgyRefreshGuard;
+
+#[cfg(target_os = "macos")]
+impl Drop for AgyRefreshGuard {
+    fn drop(&mut self) {
+        AGY_CLI_REFRESHING.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn agy_cache_store(
+    now: DateTime<Utc>,
+    marker: Option<String>,
+    outcome: &Result<Fetched, ProviderFetchFailure>,
+) {
+    let value = match outcome {
+        Ok(fetched) => Ok(fetched.clone()),
+        Err(ProviderFetchFailure::Terminal { display }) => Err(display.clone()),
+        // The route returns only Terminal failures today. A transient one says
+        // nothing about the next attempt, so it is not repeated for a TTL.
+        Err(ProviderFetchFailure::Transient { .. }) => return,
+    };
+    let mut guard = AGY_CLI_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(AgyCacheEntry {
+        fetched_at: now,
+        marker,
+        value,
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn agy_cache_result(value: Result<Fetched, String>) -> Result<Fetched, ProviderFetchFailure> {
+    // Rebuilt rather than cached: `ProviderFetchFailure` carries a binding and
+    // a diagnostic that describe one attempt, and replaying a stored one would
+    // attribute a fresh publication's state to an old request. The message is
+    // kept: `with_agy_fallback` keeps the unconfigured marker only for
+    // `AGY_NOT_FOUND` and `AGY_NOT_SIGNED_IN`, so a generic message here made
+    // an unset-up card read as configured while the failure was cached.
+    value.map_err(ProviderFetchFailure::terminal)
+}
+
+/// The marker a cache entry is keyed by. `present` is what the reader returns
+/// when the login item exists but its modification date cannot be parsed:
+/// every login then reads the same, so it cannot tell two accounts apart and
+/// is treated as unreadable (always a miss), as before the cache.
+#[cfg(target_os = "macos")]
+fn cache_marker(marker: Option<String>) -> Option<String> {
+    marker.filter(|m| m != "present")
+}
+
+#[cfg(target_os = "macos")]
+async fn fetch_agy_cli(now: DateTime<Utc>) -> Result<Fetched, ProviderFetchFailure> {
+    // Attributes only (`security`, milliseconds), against a spawn of seconds.
+    let marker = cache_marker(agy_login_marker().await);
+    match agy_cache_decide(now, marker.as_deref()) {
+        AgyCacheDecision::Serve(value) => agy_cache_result(*value),
+        AgyCacheDecision::ServeAndRefresh(value) => {
+            // Detached on the crate's process-lifetime runtime. The publication
+            // this caller belongs to must not wait for it — that wait is the
+            // whole thing being removed — so its result reaches the NEXT
+            // publication through the cache.
+            tokio::spawn(async move {
+                // Released on drop, so a panic inside the refresh clears the
+                // flag too. Storing it on the last line instead leaked it on
+                // any early exit, and a leaked flag is permanent: every later
+                // caller reads `Serve`, no refresh is ever started again, and
+                // the card serves one value for the life of the process.
+                let _release = AgyRefreshGuard;
+                let marker = cache_marker(agy_login_marker().await);
+                let refreshed = fetch_agy_cli_uncached(Utc::now()).await;
+                agy_cache_store(Utc::now(), marker, &refreshed);
+            });
+            agy_cache_result(*value)
+        }
+        AgyCacheDecision::Fetch => {
+            let fetched = fetch_agy_cli_uncached(now).await;
+            agy_cache_store(now, marker, &fetched);
+            fetched
+        }
+    }
+}
+
 /// The host whose DNS failure precedes the CLI's interactive escalation.
 ///
 /// `agy --print` is documented as non-interactive, and it is not: with an
@@ -653,8 +849,10 @@ async fn agy_login_marker() -> Option<String> {
     Some(marker.unwrap_or_else(|| "present".to_string()))
 }
 
+/// The uncached route: the DNS/login/latch gate in front of the CLI spawn.
+/// `fetch_agy_cli` puts the TTL cache in front of this.
 #[cfg(target_os = "macos")]
-async fn fetch_agy_cli(now: DateTime<Utc>) -> Result<Fetched, ProviderFetchFailure> {
+async fn fetch_agy_cli_uncached(now: DateTime<Utc>) -> Result<Fetched, ProviderFetchFailure> {
     let endpoint_resolves = oauth_endpoint_resolves().await;
     // The Keychain is not consulted when the gate has already closed.
     let marker = if endpoint_resolves {
@@ -4704,6 +4902,265 @@ mod tests {
             cache_binding: None,
             windows: Vec::new(),
         }
+    }
+
+    /// The cache and its in-flight flag are process-wide statics, so every test
+    /// that touches them serializes here.
+    #[cfg(target_os = "macos")]
+    static AGY_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The login marker every cache test stores and decides under, unless the
+    /// test is about a marker change.
+    #[cfg(target_os = "macos")]
+    const TEST_MARKER: &str = "0x00  \"20261010000000Z\\000\"";
+
+    #[cfg(target_os = "macos")]
+    fn decide_as_m1(now: DateTime<Utc>) -> AgyCacheDecision {
+        agy_cache_decide(now, Some(TEST_MARKER))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn store_as_m1(now: DateTime<Utc>, value: Option<Fetched>) {
+        let outcome = value.ok_or_else(|| ProviderFetchFailure::terminal(AGY_NOT_FOUND));
+        agy_cache_store(now, Some(TEST_MARKER.to_string()), &outcome)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_present_marker_cannot_key_the_cache() {
+        assert_eq!(cache_marker(Some("present".to_string())), None);
+        assert_eq!(cache_marker(None), None);
+        assert_eq!(
+            cache_marker(Some(TEST_MARKER.to_string())).as_deref(),
+            Some(TEST_MARKER),
+            "control: a parsed modification date still keys the cache"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_cached_agy_failure_keeps_the_unconfigured_marker() {
+        let _guard = AGY_CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_agy_cache();
+        let now = Utc::now();
+        store_as_m1(now, None);
+        let AgyCacheDecision::Serve(value) = decide_as_m1(now) else {
+            panic!("a fresh cached failure is served");
+        };
+        let failure = with_agy_fallback(
+            Err(ProviderFetchFailure::terminal(ANTIGRAVITY_UNCONFIGURED_ERROR)),
+            None,
+            unread_marker,
+            || async move { agy_cache_result(*value) },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                failure,
+                ProviderFetchFailure::Terminal { ref display }
+                    if display == ANTIGRAVITY_UNCONFIGURED_ERROR
+            ),
+            "a cached AGY_NOT_FOUND must leave the card unconfigured, exactly as \
+             the uncached call does, got {failure:?}"
+        );
+        // Control: a cached failure with another message does surface, so the
+        // assertion above is about the replayed message, not a dead arm.
+        let other = with_agy_fallback(
+            Err(ProviderFetchFailure::terminal(ANTIGRAVITY_UNCONFIGURED_ERROR)),
+            None,
+            unread_marker,
+            || async { agy_cache_result(Err("agy timed out".to_string())) },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(other, ProviderFetchFailure::Terminal { ref display } if display == "agy timed out"));
+        reset_agy_cache();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_entry_from_another_agy_login_is_not_served() {
+        let _guard = AGY_CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_agy_cache();
+        let now = Utc::now();
+        store_as_m1(now, Some(orchestration_fetched("agy")));
+        // Control: the same fresh entry IS served under its own login, so the
+        // misses below are the marker's doing, not the entry's age.
+        assert!(matches!(decide_as_m1(now), AgyCacheDecision::Serve(_)));
+        assert!(
+            matches!(
+                agy_cache_decide(now, Some("0x00  \"20261010000001Z\\000\"")),
+                AgyCacheDecision::Fetch
+            ),
+            "after agy signs into another account the cached windows belong to \
+             the previous one; serving them would draw that account under the \
+             new login"
+        );
+        assert!(
+            matches!(agy_cache_decide(now, None), AgyCacheDecision::Fetch),
+            "an unreadable marker cannot be matched to the entry's login"
+        );
+        assert!(
+            !AGY_CLI_REFRESHING.load(Ordering::SeqCst),
+            "a miss is a plain fetch, not a background refresh"
+        );
+        reset_agy_cache();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reset_agy_cache() {
+        *AGY_CLI_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        AGY_CLI_REFRESHING.store(false, Ordering::SeqCst);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn decision_windows(decision: &AgyCacheDecision) -> Option<usize> {
+        match decision {
+            AgyCacheDecision::Serve(value) | AgyCacheDecision::ServeAndRefresh(value) => {
+                value.as_ref().as_ref().ok().map(|f| f.windows.len())
+            }
+            AgyCacheDecision::Fetch => None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_empty_cache_makes_this_caller_pay_the_spawn() {
+        let _guard = AGY_CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_agy_cache();
+        assert!(
+            matches!(decide_as_m1(Utc::now()), AgyCacheDecision::Fetch),
+            "with nothing cached there is no answer to serve, so the cold start \
+             has to block — that is the one spawn per process this design keeps"
+        );
+        reset_agy_cache();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_fresh_entry_is_served_without_starting_a_refresh() {
+        let _guard = AGY_CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_agy_cache();
+        let now = Utc::now();
+        store_as_m1(now, Some(orchestration_fetched("agy")));
+
+        let decision = decide_as_m1(now + chrono::Duration::seconds(AGY_CLI_TTL_SECS - 1));
+        assert!(matches!(decision, AgyCacheDecision::Serve(_)));
+        assert!(
+            !AGY_CLI_REFRESHING.load(Ordering::SeqCst),
+            "a fresh hit must not arm the in-flight guard; if it did, the first \
+             genuinely stale caller would be refused its refresh"
+        );
+        reset_agy_cache();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stale_entry_serves_the_old_value_and_hands_out_exactly_one_refresh() {
+        let _guard = AGY_CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_agy_cache();
+        let now = Utc::now();
+        store_as_m1(now, Some(orchestration_fetched("agy")));
+        let stale = now + chrono::Duration::seconds(AGY_CLI_TTL_SECS + 1);
+
+        let first = decide_as_m1(stale);
+        assert!(
+            matches!(first, AgyCacheDecision::ServeAndRefresh(_)),
+            "past the TTL the caller still gets an answer immediately — waiting \
+             for the spawn is the delay this whole cache exists to remove"
+        );
+        assert_eq!(decision_windows(&first), Some(0), "and it is the cached value");
+
+        // Three more publications arrive while that refresh is still out.
+        for _ in 0..3 {
+            let next = decide_as_m1(stale);
+            assert!(
+                matches!(next, AgyCacheDecision::Serve(_)),
+                "a second refresh while one is in flight is the burst the guard \
+                 exists to stop: N publications during one 4s spawn would start \
+                 N more spawns"
+            );
+        }
+
+        // Once the refresh reports back, staleness can arm a new one.
+        store_as_m1(stale, Some(orchestration_fetched("agy")));
+        AGY_CLI_REFRESHING.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            decide_as_m1(stale + chrono::Duration::seconds(AGY_CLI_TTL_SECS + 1)),
+            AgyCacheDecision::ServeAndRefresh(_)
+        ));
+        reset_agy_cache();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failure_is_cached_and_expires_sooner_than_a_success() {
+        let _guard = AGY_CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_agy_cache();
+        let now = Utc::now();
+        // The two TTLs are asserted against the SAME instant, so a change that
+        // collapsed them into one value fails here rather than passing both
+        // halves against their own separately-chosen clock.
+        let probe = now + chrono::Duration::seconds(AGY_CLI_NEGATIVE_TTL_SECS + 1);
+        assert!(
+            probe < now + chrono::Duration::seconds(AGY_CLI_TTL_SECS),
+            "the negative TTL must be shorter than the positive one, or this \
+             test proves nothing about the two being different"
+        );
+
+        store_as_m1(now, None);
+        assert!(
+            matches!(decide_as_m1(probe), AgyCacheDecision::ServeAndRefresh(_)),
+            "a cached failure is retried sooner: 'the CLI is missing' is stable, \
+             but 'it failed mid-update' is not"
+        );
+
+        reset_agy_cache();
+        store_as_m1(now, Some(orchestration_fetched("agy")));
+        assert!(
+            matches!(decide_as_m1(probe), AgyCacheDecision::Serve(_)),
+            "a success at the same instant is still fresh"
+        );
+        reset_agy_cache();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_in_flight_flag_is_released_even_if_the_refresh_panics() {
+        let _guard = AGY_CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_agy_cache();
+
+        AGY_CLI_REFRESHING.store(true, Ordering::SeqCst);
+        let unwound = std::panic::catch_unwind(|| {
+            let _release = AgyRefreshGuard;
+            panic!("the refresh blew up");
+        });
+        assert!(unwound.is_err());
+        assert!(
+            !AGY_CLI_REFRESHING.load(Ordering::SeqCst),
+            "a leaked flag is permanent: every later caller reads Serve, no \
+             refresh is ever started again, and the card serves one value for \
+             the life of the process"
+        );
+
+        reset_agy_cache();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cached_failure_is_reported_as_a_failure_not_an_empty_card() {
+        let _guard = AGY_CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_agy_cache();
+        assert!(
+            agy_cache_result(Err(AGY_NOT_FOUND.to_string())).is_err(),
+            "serving a cached failure as an Ok with no windows would publish an \
+             Antigravity card claiming zero usage instead of an unavailable one"
+        );
+        assert!(agy_cache_result(Ok(orchestration_fetched("agy"))).is_ok());
+        reset_agy_cache();
     }
 
     /// A credential that exists but cannot be parsed belongs to a configured

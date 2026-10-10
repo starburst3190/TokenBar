@@ -1620,6 +1620,7 @@ fn apply_provider_outcome(
 /// `tokio::join!` this replaced.
 type ProviderFetch = Pin<Box<dyn Future<Output = Vec<AgentUsageSnapshot>>>>;
 
+#[derive(Clone, Copy)]
 pub(crate) struct QuotaProvider {
     /// The `client_id` this provider's snapshots carry. `run` passes it to
     /// `fetch`, which is expected to pass it on to `apply_provider_outcome`.
@@ -1711,7 +1712,22 @@ async fn fetch_table(providers: &[QuotaProvider]) -> Vec<AgentUsageSnapshot> {
 
 pub async fn run(publication_generation: u64) -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let agents = fetch_table(QUOTA_PROVIDERS).await;
+    // Read once, before any future is built. A provider the user switched off
+    // must not have its future CREATED, not merely have its card dropped
+    // afterwards: `fetch_in_order` returns when the slowest one finishes, so a
+    // post-hoc filter would still pay the full wait. The Antigravity CLI
+    // fallback is the case that made this matter — it spawns a ~170MB binary
+    // and takes seconds, and it was holding up the Claude card for users who
+    // do not use Antigravity at all. A disabled provider contributes no card,
+    // which is what makes it disappear from the UI — there is no separate
+    // hiding step.
+    let disabled = crate::disabled_providers::snapshot();
+    let enabled: Vec<QuotaProvider> = QUOTA_PROVIDERS
+        .iter()
+        .filter(|p| !disabled.contains(crate::disabled_providers::toggle_id(p.id)))
+        .copied()
+        .collect();
+    let agents = fetch_table(&enabled).await;
     AgentUsagePayload {
         generated_at,
         publication_generation,
@@ -6599,6 +6615,41 @@ mod tests {
         gate.clear();
         assert!(gate.blocked_until_for(&binding_a, now).is_none());
         scope.cleanup();
+    }
+
+    /// The whole point of the registry is that a disabled provider's future is
+    /// never built. With every provider switched off this runs to completion
+    /// touching no network at all — which is also why it is safe as a hermetic
+    /// test: any provider still being fetched would need credentials and a
+    /// socket, and would put a card in the payload.
+    #[tokio::test]
+    async fn every_disabled_provider_is_skipped_before_its_future_is_built() {
+        let _guard = crate::disabled_providers::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::disabled_providers::reset_for_test();
+        // Every known id, so a provider added to `run` without a toggle turns
+        // this red instead of slipping past a hand-written list.
+        crate::disabled_providers::set_from_json(
+            &serde_json::to_string(&crate::disabled_providers::KNOWN_PROVIDERS).unwrap(),
+        )
+        .unwrap();
+
+        let payload = run(1).await;
+
+        assert!(
+            payload.agents.is_empty(),
+            "a disabled provider must contribute no card; a card here means its \
+             future was created and awaited, which is the wait this exists to \
+             remove — got {:?}",
+            payload
+                .agents
+                .iter()
+                .map(|a| a.client_id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        crate::disabled_providers::reset_for_test();
     }
 
     #[tokio::test]
