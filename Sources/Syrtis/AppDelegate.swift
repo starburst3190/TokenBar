@@ -41,6 +41,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastExtraRootsRaw = UserDefaults.standard.string(forKey: ClaudeExtraRoots.storageKey) ?? ""
     private var lastPiExtraRootsRaw = UserDefaults.standard.string(forKey: ExtraScanRoots.Pi.storageKey) ?? ""
     private var lastDshExtraRootsRaw = UserDefaults.standard.string(forKey: ExtraScanRoots.Dsh.storageKey) ?? ""
+    private var lastDisabledProvidersRaw = UserDefaults.standard.string(
+        forKey: DisabledProviders.storageKey) ?? ""
     // The Discord presence client, or nil whenever this process may not connect
     // (switched off, or a demo/test run). Only makeDiscordClient creates it.
     private var discord: DiscordIPCClient?
@@ -121,6 +123,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The embedded agent starts once that registry is installed, so its
         // scan-input snapshot includes the extra roots.
         ExtraScanRoots.apply(then: { _ in RemoteAgentLaunch.launch() })
+
+        // Before the first poll, so a provider the user switched off is not
+        // fetched once more on the way to being disabled. Unlike the scan
+        // roots this touches no filesystem, so it cannot stall launch.
+        DisabledProviders.apply()
 
         // Same split for the same reason: the Keychain consent registry is
         // also an in-memory RwLock that starts empty, so Swift re-applies the
@@ -448,6 +455,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.lastPiExtraRootsRaw = piExtraRootsRaw
                 self.lastDshExtraRootsRaw = dshExtraRootsRaw
                 ExtraScanRoots.apply()
+            }
+
+            // Settings switched a quota provider on or off — push it to the
+            // registry now. `apply` drops the throttled payload and wakes the
+            // poll, so the card appears or disappears in this turn instead of
+            // after the 50s fetch floor.
+            let disabledProvidersRaw = UserDefaults.standard.string(
+                forKey: DisabledProviders.storageKey) ?? ""
+            if disabledProvidersRaw != self.lastDisabledProvidersRaw {
+                self.lastDisabledProvidersRaw = disabledProvidersRaw
+                DisabledProviders.apply()
             }
 
             // Hiding a client has to leave the published presence in the SAME

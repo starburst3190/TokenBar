@@ -352,6 +352,21 @@ char *tb_set_cursor_sync(const char *json);
 // macOS dialog), `keychain_missing`, `keychain_unavailable`,
 // `token_sealed_unreadable` and `token_sealed_unsupported`.
 char *tb_cursor_sync(int32_t user_initiated);
+// Replace the process-wide registry of quota providers the user switched off.
+// `json` is an array of provider ids, e.g. `["antigravity"]`; full-replace
+// semantics (`[]` re-enables everything). Known ids: codex, claude,
+// antigravity, copilot, grok, grok-bot, kiro, opencode-go. An id outside that
+// set is rejected rather than stored, so a typo cannot look like a working
+// toggle. Success data is
+// {"disabledCount":N,"rejected":[{"id","reason"}]}. Malformed JSON returns the
+// normal error envelope and leaves the registry untouched.
+//
+// A disabled provider's future is never created inside tb_agent_usage, which
+// is the point: that call returns only when its slowest provider finishes, so
+// dropping a card after the fact would still pay the wait. The registry is
+// in-memory and starts empty every launch; the caller re-applies it from its
+// own settings at startup and after every edit.
+char *tb_set_disabled_providers(const char *json);
 
 // The embedded remote-usage agent (syrtis-agent). macOS and Linux only; the
 // Windows port does not export these yet. `err` is a fixed class string
