@@ -61,7 +61,7 @@ struct ReorderableCardList: View {
                 .font(.caption)
                 .foregroundStyle(
                     dragId == item.id
-                        ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+                        ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiaryAdaptive))
                 .help("Drag to reorder")
                 .gesture(dragGesture(id: item.id))
 
@@ -71,7 +71,7 @@ struct ReorderableCardList: View {
             if !item.canHide {
                 Text("(always shown)")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
 
             Spacer()
