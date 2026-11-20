@@ -405,7 +405,7 @@ struct DeviceShortStatusView: View {
             }
         }
         .font(.caption2)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.secondaryAdaptive)
     }
 }
 
@@ -423,7 +423,7 @@ struct DeviceMenuTitle: View {
     var body: some View {
         Text(verbatim: title)
             .font(.caption.monospacedDigit())
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(maxWidth: Self.maxWidth)
@@ -492,7 +492,7 @@ struct DeviceSelectionMenu: View {
         return Button { infoShown.toggle() } label: {
             Image(systemName: "info.circle")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
         }
         .buttonStyle(.plain)
         .help(sentences.joined(separator: " "))
@@ -637,14 +637,14 @@ struct DeviceOverlayLens: View {
             ForEach(lines, id: \.self) { line in
                 Text(verbatim: line)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
             }
             content(page)
         } else if failed {
             Text(DeviceOverlayCopy.failedNoData.localized)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .frame(maxWidth: .infinity, minHeight: 80)
         } else {
             LoadingLine(title: DeviceOverlayCopy.loading)

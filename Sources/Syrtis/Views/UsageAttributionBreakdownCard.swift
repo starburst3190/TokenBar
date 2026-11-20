@@ -85,11 +85,11 @@ struct UsageAttributionBreakdownCard: View {
             case .unavailable:
                 Text(UsageAttributionBreakdown.Copy.unavailable.localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             case .empty:
                 Text(UsageAttributionBreakdown.Copy.noUsage.localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             case .rows:
                 if confirmed.isEmpty {
                     Button {
@@ -97,7 +97,7 @@ struct UsageAttributionBreakdownCard: View {
                     } label: {
                         Text(UsageAttributionBreakdown.Copy.hint.localized)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                             .underline()
                             .multilineTextAlignment(.leading)
                     }
@@ -137,7 +137,7 @@ struct UsageAttributionBreakdownCard: View {
         }
 
         var label: AnyShapeStyle {
-            self == .assigned ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.primary)
+            self == .assigned ? AnyShapeStyle(.secondaryAdaptive) : AnyShapeStyle(Color.primary)
         }
     }
 

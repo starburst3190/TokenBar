@@ -95,7 +95,7 @@ struct DevicesSettingsView: View {
             panel.row(DevicesCopy.service) {
                 Text((model.running ? DevicesCopy.serviceRunning : DevicesCopy.serviceStopped).localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             if model.showsRetry {
                 notice(model.startFailure ?? DevicesCopy.notRunning)
@@ -187,7 +187,7 @@ struct DevicesSettingsView: View {
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 Text(DevicesCopy.expiresIn.localized(Self.remaining(until: offer.expiresAt, now: context.date)))
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             .padding(.horizontal, 10)
             HStack {
@@ -196,7 +196,7 @@ struct DevicesSettingsView: View {
                 if model.copied {
                     Text(DevicesCopy.copiedLine.localized)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
             }
             .controlSize(.small)
@@ -305,7 +305,7 @@ struct DevicesSettingsView: View {
                 ForEach(items, id: \.self) { item in
                     Text(verbatim: item)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -340,7 +340,7 @@ struct DevicesSettingsView: View {
                 panel.row(Self.address(peer)) {
                     Text(DevicesCopy.state(peer.state).localized)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     Button(DevicesCopy.remove.localized) { removeTarget = peer }
                         .controlSize(.small)
                 }

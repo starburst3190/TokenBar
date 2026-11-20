@@ -402,7 +402,7 @@ struct SettingsPanel: View {
             } else if rows.isEmpty {
                 Text("No clients with quota yet.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 VStack(spacing: 1) {
                     ForEach(rows) { row in
@@ -443,7 +443,7 @@ struct SettingsPanel: View {
                 Spacer()
                 Text(row.valueText)
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .accessibilityLabel(row.accessibilityLabel)
                 Toggle("", isOn: Binding(
                     get: { row.isEnabled },
@@ -466,7 +466,7 @@ struct SettingsPanel: View {
                 HStack {
                     Text("Window")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     Spacer()
                     Picker("", selection: Binding(
                         get: { row.selection },
@@ -495,7 +495,9 @@ struct SettingsPanel: View {
             if let statusHint = row.statusHint {
                 Text(statusHint.localized)
                     .font(.caption2)
-                    .foregroundStyle(row.status == .errorExplicit ? .secondary : .tertiary)
+                    .foregroundStyle(
+                        row.status == .errorExplicit
+                            ? AnyShapeStyle(.secondaryAdaptive) : AnyShapeStyle(.tertiaryAdaptive))
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -661,12 +663,12 @@ struct SettingsPanel: View {
             if tabsUniverse.isEmpty {
                 Text("No clients found yet.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Drag to order tabs and quota cards. The switch hides a client's tab and its quota card.")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
 
                     VStack(spacing: 1) {
                         ForEach(tabsUniverse, id: \.self) { id in
@@ -680,7 +682,10 @@ struct SettingsPanel: View {
                                 // Drag handle - always shown for every provider
                                 Text("⠿")
                                     .font(.caption)
-                                    .foregroundStyle(tabsDragId == id ? .primary : .tertiary)
+                                    .foregroundStyle(
+                                        tabsDragId == id
+                                            ? AnyShapeStyle(.primary)
+                                            : AnyShapeStyle(.tertiaryAdaptive))
                                     .help("Drag to reorder")
                                     .gesture(dragGestureForTab(id: id, orderList: tabsUniverse))
 
@@ -691,7 +696,7 @@ struct SettingsPanel: View {
                                 if !canTab {
                                     Text("(quota card only)")
                                         .font(.caption2)
-                                        .foregroundStyle(.tertiary)
+                                        .foregroundStyle(.tertiaryAdaptive)
                                 }
 
                                 Spacer()
@@ -753,7 +758,7 @@ struct SettingsPanel: View {
                     Spacer()
                     Text("\(Int(popoverHeightBinding.wrappedValue.rounded())) pt")
                         .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     if popoverHeight > 0 {
                         Button("Auto") { popoverHeight = 0 }
                             .controlSize(.mini)
@@ -836,11 +841,11 @@ struct SettingsPanel: View {
             case .unavailable:
                 Text(UsageAttributionSettings.Copy.unavailable.localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             case .empty:
                 Text(UsageAttributionSettings.Copy.noRows.localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             case .rows:
                 VStack(spacing: 1) {
                     ForEach(rows) { row in
@@ -882,7 +887,7 @@ struct SettingsPanel: View {
                     Text(UsageAttributionSettings.Copy.observed.localized(
                         Format.compactTokens(row.tokens), Format.money(tokens: row.tokens, cost: row.cost)))
                         .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
                 // The label takes the slack instead of a Spacer so a long
                 // source name uses the full width before wrapping, and the
@@ -1172,7 +1177,7 @@ struct SettingsPanel: View {
                             commitClaudeExtraRoots()
                         } label: {
                             Image(systemName: "minus.circle")
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.secondaryAdaptive)
                         }
                         .buttonStyle(.plain)
                         .help(AccountsCopy.removeHelp.localized)
@@ -1233,7 +1238,7 @@ struct SettingsPanel: View {
                             commitPiExtraRoots()
                         } label: {
                             Image(systemName: "minus.circle")
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.secondaryAdaptive)
                         }
                         .buttonStyle(.plain)
                         .help(AccountsCopy.removeHelp.localized)
@@ -1288,7 +1293,7 @@ struct SettingsPanel: View {
                             commitDshExtraRoots()
                         } label: {
                             Image(systemName: "minus.circle")
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.secondaryAdaptive)
                         }
                         .buttonStyle(.plain)
                         .help(AccountsCopy.removeHelp.localized)
@@ -1370,7 +1375,7 @@ struct SettingsPanel: View {
                 {
                     Text(line)
                         .font(.caption2)
-                        .foregroundStyle(cursorSync.state == "ok" ? Color.secondary : Color.orange)
+                        .foregroundStyle(cursorSync.state == "ok" ? AnyShapeStyle(.secondaryAdaptive) : AnyShapeStyle(Color.orange))
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 // Cursor 3.27+ encrypted sign-in (plan CURSOR-SS-M, Design 8):
@@ -1459,7 +1464,7 @@ struct SettingsPanel: View {
                     cursorSync.removeProfile(id: profile.id)
                 } label: {
                     Image(systemName: "minus.circle")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
                 .buttonStyle(.plain)
                 .help(AccountsCopy.removeHelp.localized)
@@ -1489,7 +1494,7 @@ struct SettingsPanel: View {
                 && ["ok", "duplicate"].contains(cursorSync.profileStates[id]?.state ?? "")
             Text(line)
                 .font(.caption2)
-                .foregroundStyle(calm ? Color.secondary : Color.orange)
+                .foregroundStyle(calm ? AnyShapeStyle(.secondaryAdaptive) : AnyShapeStyle(Color.orange))
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 10)
         }
@@ -1534,7 +1539,7 @@ struct SettingsPanel: View {
                         Task { await antigravityAutoCapture.remove(account) }
                     } label: {
                         Image(systemName: "minus.circle")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                     }
                     .buttonStyle(.plain)
                     .disabled(busy)
@@ -1703,7 +1708,7 @@ struct SettingsPanel: View {
             row("Version") {
                 Text(AppInfo.version)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             }
             if UpdaterService.isAvailable {
                 row("Check for updates") {
@@ -1823,7 +1828,7 @@ struct SettingsPanel: View {
                 } else {
                     Text("—")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
             }
         }
@@ -1842,7 +1847,7 @@ struct SettingsPanel: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label.localized.uppercased())
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
             content()
         }
     }
@@ -1858,7 +1863,7 @@ struct SettingsPanel: View {
             HStack(spacing: 4) {
                 Text(label.localized.uppercased())
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                 SettingsInfoButton(section: label.localized, details: details())
             }
             hint(summary)
@@ -1954,7 +1959,7 @@ struct SettingsPanel: View {
     func hint(_ text: String) -> some View {
         Text(text.localized)
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
             .fixedSize(horizontal: false, vertical: true)
     }
 }
@@ -2132,7 +2137,7 @@ private struct SettingsInfoButton<Details: View>: View {
         } label: {
             Image(systemName: "info.circle")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(AccountsCopy.moreDetails.localized): \(section)")
@@ -2191,7 +2196,7 @@ private struct MenuBarTextColorControl: View {
         VStack(spacing: 3) {
             Text(level.label.localized)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             Button { editingLevel = editingLevel == level ? nil : level } label: {
                 Capsule()
                     .fill(Color(hex: MenuBarTextColor.normalizedHex(hex) ?? level.defaultHex))
@@ -2225,7 +2230,7 @@ private struct MenuBarTextColorPopover: View {
         VStack(alignment: .leading, spacing: 10) {
             Text(level.label.localized)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 8), spacing: 6) {
                 ForEach(MenuBarTextColor.presets, id: \.hex) { preset in
                     presetButton(name: preset.name, colorHex: preset.hex)

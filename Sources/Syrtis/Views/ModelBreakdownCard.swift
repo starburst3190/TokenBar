@@ -56,10 +56,10 @@ struct ModelBreakdownCard: View {
                 VStack(alignment: .trailing, spacing: 1) {
                     Text((modelCount == 1 ? "%lld model · %@" : "%lld models · %@")
                         .localized(modelCount, Format.usd(totalCost)))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                     if let updatedAt = report?.pricingUpdatedAt {
                         Text("Prices updated %@".localized(Format.relativeTime(updatedAt)))
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                             .help("LiteLLM pricing data; refreshes automatically about once an hour")
                     }
                 }
@@ -73,7 +73,7 @@ struct ModelBreakdownCard: View {
             } else if rows.isEmpty {
                 Text("No model usage in this range")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 legend
                 VStack(spacing: 8) {
@@ -94,7 +94,7 @@ struct ModelBreakdownCard: View {
                     }
                     .buttonStyle(.plain)
                     .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                 }
             }
         }
@@ -110,7 +110,7 @@ struct ModelBreakdownCard: View {
                     Text(kind.label.localized)
                 }
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
             }
         }
     }
@@ -139,7 +139,7 @@ struct ModelBreakdownCard: View {
                     if showProvider {
                         Text(entry.providerLabel.localized)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                             .lineLimit(1)
                             .layoutPriority(-1)
                     }
@@ -310,7 +310,7 @@ struct ModelUsageTooltip: View {
             }
             Text([context, provider].compactMap { $0 }.joined(separator: " · "))
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondaryAdaptive)
             if let clientParts {
                 ForEach(clientParts, id: \.client) { part in
                     HStack {
@@ -319,10 +319,10 @@ struct ModelUsageTooltip: View {
                             .truncationMode(.tail)
                         Spacer()
                         Text("\(Format.compactTokens(part.total)) · \(Int((Double(part.total) / Double(max(1, total)) * 100).rounded()))%")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                     }
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
                 }
             }
             HStack {
@@ -331,7 +331,7 @@ struct ModelUsageTooltip: View {
                 Text(Format.money(tokens: total, cost: cost))
             }
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
             if let costRatio {
                 // Named in multiples rather than "wrong": the app cannot know
                 // the client's real rate, only that this is far off any price
@@ -349,7 +349,7 @@ struct ModelUsageTooltip: View {
                     Text(kind.label.localized)
                     Spacer()
                     Text("\(Format.compactTokens(kind.value)) · \(Int((Double(kind.value) / Double(max(1, total)) * 100).rounded()))%")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
                 .font(.caption2)
             }

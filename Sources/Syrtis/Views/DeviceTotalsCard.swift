@@ -58,7 +58,7 @@ struct DevicesCombinedBadge: View {
     var body: some View {
         Text(DeviceOverlayCopy.combined.localized(count))
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
             .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }
@@ -91,7 +91,7 @@ struct DeviceTotalsCard: View {
                             // The short status below carries the time for another device.
                             Text(verbatim: Self.detail(row, now: now, showsUpdated: row.isLocal))
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.secondaryAdaptive)
                             // This Mac has no status; a listed device is a selected one.
                             if !row.isLocal {
                                 DeviceShortStatusView(status: DeviceOverlayCopy.shortStatus(
@@ -141,7 +141,7 @@ struct DeviceStatusLine: View {
                 ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
                     Text(verbatim: line)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }

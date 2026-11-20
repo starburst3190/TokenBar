@@ -95,6 +95,8 @@ struct AgentLimitsCard: View {
     @State private var overId: String?
     @State private var cardFrames: [String: CGRect] = [:]
 
+    @Environment(\.colorScheme) private var colorScheme
+
     private var paceMode: PaceMode { PaceMode(rawValue: paceModeRaw) ?? .historical }
     private var layout: LimitsLayout { LimitsLayout(rawValue: layoutRaw) ?? .full }
     private var classic: Bool { layout == .classic }
@@ -595,7 +597,7 @@ struct AgentLimitsCard: View {
                     Text("Checking agent limits…".localized)
                 }
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
             } else if visible.isEmpty {
@@ -606,7 +608,7 @@ struct AgentLimitsCard: View {
                         : "No supported agents yet".localized
                 )
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
             } else {
@@ -644,7 +646,7 @@ struct AgentLimitsCard: View {
                 .fixedSize(horizontal: false, vertical: true)
             Text("The pace line beside it compares you with your usual pattern instead.")
                 .font(.system(size: 9))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.tertiaryAdaptive)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(8)
@@ -655,13 +657,13 @@ struct AgentLimitsCard: View {
     private var noteLabel: some View {
         Text(note.localized)
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
     }
 
     private func integrationLine(_ text: String) -> some View {
         Text(text.localized)
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
     }
 
     // MARK: - Drag reorder
@@ -759,7 +761,9 @@ struct AgentLimitsCard: View {
                 if reorderable, row.isPrimary {
                     Text("⠿")
                         .font(.caption)
-                        .foregroundStyle(dragId == id ? .primary : .tertiary)
+                        .foregroundStyle(
+                            dragId == id
+                                ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiaryAdaptive))
                         .help("Drag to reorder")
                         .gesture(dragGesture(for: id, visible: primaryOrder))
                 }
@@ -769,7 +773,7 @@ struct AgentLimitsCard: View {
                 if let account = row.accountLabel {
                     Text(account)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(row.accountTooltip ?? account)
@@ -788,13 +792,15 @@ struct AgentLimitsCard: View {
                     ? "Sign in to Grok Bot on this Mac, then refresh to see its weekly limits."
                     : "Loading Grok Bot limits…").localized)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 if let detail = detailText(snapshot) {
                     Text(detail)
                         .font(.caption2)
-                        .foregroundStyle(snapshot?.error != nil ? .red : .secondary)
+                        .foregroundStyle(
+                            snapshot?.error != nil
+                                ? AnyShapeStyle(.red) : AnyShapeStyle(.secondaryAdaptive))
                         .lineLimit(2)
                         .help(detail)
                 }
@@ -855,7 +861,7 @@ struct AgentLimitsCard: View {
         case .providerMessage(let detail):
             Text(detail)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .fixedSize(horizontal: false, vertical: true)
         case .none:
             EmptyView()
@@ -866,7 +872,7 @@ struct AgentLimitsCard: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Using a Claude `setup-token`? Syrtis reads `CLAUDE_CODE_OAUTH_TOKEN` from your login shell. If your limits don't show, save the token to Keychain with this command:")
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondaryAdaptive)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top, spacing: 6) {
                 Text(Self.claudeSetupCommand)
@@ -909,12 +915,12 @@ struct AgentLimitsCard: View {
                 // "not reading your limits" line would imply they chose this.
                 Text("macOS blocked access to the Grok Bot login, so Syrtis stopped asking. Choose Allow to try again.")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
             } else if consentDeclined {
                 Text("Syrtis isn't reading your Grok Bot limits.")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 // Says what actually happens, including the network request.
@@ -937,7 +943,7 @@ struct AgentLimitsCard: View {
                 // even when it is probably true.
                 Text("To show your weekly Grok Bot limits, Syrtis reads Grok Bot's login from your Keychain after macOS asks you. The login is sent only to Grok Bot's usage service (api2.cursor.sh) and is never saved or logged.")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 8) {
@@ -1074,13 +1080,13 @@ struct AgentLimitsCard: View {
                     Spacer()
                     Text(resetText ?? leftLabel)
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
                 bar(fillPercent: fill, color: gauge, paceLeft: nil, paceIsDeficit: false)
                 if resetText != nil {
                     Text(leftLabel)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
             }
         } else {
@@ -1095,7 +1101,7 @@ struct AgentLimitsCard: View {
                     if let reset = resetText {
                         Text(reset)
                             .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.tertiaryAdaptive)
                     }
                 }
                 // The line replaces the bar only when the user asked for it AND
@@ -1257,7 +1263,7 @@ struct AgentLimitsCard: View {
             .font(.caption2)
             .foregroundStyle(
                 runsOutEarly ? AnyShapeStyle(.red)
-                    : direction == .flat ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.secondary))
+                    : direction == .flat ? AnyShapeStyle(.tertiaryAdaptive) : AnyShapeStyle(.secondaryAdaptive))
             .contentShape(Rectangle())
             .onContinuousHover(coordinateSpace: .named(PopoverViewport.space)) { phase in
                 switch phase {
@@ -1281,15 +1287,17 @@ struct AgentLimitsCard: View {
     private func paceLeftLabel(_ text: String) -> some View {
         Text(text)
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
     }
 
     private func paceTextLabel(_ text: String, pace: UsagePace?) -> some View {
         Text(text)
             .font(.caption2)
+            // Pace/ETA is tertiary text like every other former .tertiary
+            // label; a deficit pace flips it to orange as a warning.
             .foregroundStyle(
                 Self.PacePresentation.isDeficit(pace)
-                    ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
+                    ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiaryAdaptive))
     }
 
     /// What a row with no quota value should say.
@@ -1312,14 +1320,14 @@ struct AgentLimitsCard: View {
                 if classic {
                     Text(placeholderValueLabel)
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
             }
             bar(fillPercent: 0, color: Color(hex: brand), paceLeft: nil, paceIsDeficit: false)
             if !classic {
                 Text(placeholderValueLabel)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.tertiaryAdaptive)
             }
         }
     }
@@ -1400,8 +1408,16 @@ struct AgentLimitsCard: View {
                         width: geo.size.width * fillPercent / 100,
                         height: geo.size.height)
                 if let paceLeft {
+                    // Reserve marker: light mode keeps the original .secondary
+                    // tick (translucent black reads as a darker shade of the
+                    // green fill). Dark mode uses a soft, low-opacity white so
+                    // the tick stays light rather than dark, sitting gently over
+                    // the fill instead of starkly popping.
+                    let reserveMarker: Color = colorScheme == .dark
+                        ? Color.white.opacity(0.35)
+                        : Color.secondary
                     RoundedRectangle(cornerRadius: 0.75)
-                        .fill(paceIsDeficit ? Color.orange : Color.secondary)
+                        .fill(paceIsDeficit ? Color.orange : reserveMarker)
                         .frame(width: 1.5, height: geo.size.height + 4)
                         .offset(x: geo.size.width * paceLeft / 100 - 0.75)
                         .help("Expected \(Int((asUsed ? paceLeft : 100 - paceLeft).rounded()))% used by now")

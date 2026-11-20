@@ -92,7 +92,7 @@ struct OverviewView: View {
                     ForEach(merged.noteLines, id: \.self) { line in
                         Text(verbatim: line)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -136,7 +136,7 @@ struct OverviewView: View {
                     if merged != nil {
                         Text(DeviceOverlayCopy.quotaThisMacOnly.localized)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondaryAdaptive)
                             .frame(maxWidth: .infinity, alignment: .trailing)
                     }
                 QuotaSummaryLine(
@@ -187,7 +187,7 @@ struct OverviewView: View {
                 DashCard("Token Usage") {
                     Text("No local usage records in this range.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else {
@@ -236,7 +236,7 @@ struct OverviewView: View {
     private func thisMacNote(_ text: String) -> some View {
         Text(text.localized)
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
             .padding(Self.noteInset)
     }
 
@@ -261,7 +261,7 @@ struct OverviewView: View {
             if failed {
                 Text(DeviceOverlayCopy.failedNoData.localized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
             } else {
                 LoadingLine(title: DeviceOverlayCopy.loading)
             }

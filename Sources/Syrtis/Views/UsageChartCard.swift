@@ -199,12 +199,12 @@ struct UsageChartCard: View {
                         Text(item.label).lineLimit(1)
                     }
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondaryAdaptive)
                 }
                 if hidden > 0 {
                     Text("+\(hidden)")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.tertiaryAdaptive)
                 }
             }
         }
@@ -423,7 +423,7 @@ private struct ScrollingBarChart: View {
     private func axisLabel(_ date: String?) -> some View {
         Text(date.map(Format.monthDay) ?? "")
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.tertiaryAdaptive)
     }
 
     private func barTotal(_ bar: DayBar) -> Double {
@@ -450,7 +450,7 @@ private struct ScrollingBarChart: View {
                 Text(Format.money(tokens: bar.totalTokens, cost: bar.totalCost))
             }
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.secondaryAdaptive)
             ForEach(
                 bar.segments.sorted { $0.tokens > $1.tokens }.prefix(6), id: \.key
             ) { segment in
@@ -459,7 +459,7 @@ private struct ScrollingBarChart: View {
                     Text(segment.label).lineLimit(1)
                     Spacer()
                     Text("\(Format.compactTokens(segment.tokens)) · \(Format.money(tokens: segment.tokens, cost: segment.cost))")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondaryAdaptive)
                 }
                 .font(.caption2)
             }
