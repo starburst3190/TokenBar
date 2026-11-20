@@ -267,6 +267,10 @@ private struct ScrollingBarChart: View {
                         range: drawableRange())
                         .frame(width: contentWidth, height: Self.chartHeight)
                         .panelChartRegrow(regrowKey)
+                        // A mouse wheel only reports vertical deltas; this turns
+                        // them into bar-by-bar horizontal scrolling. Inside the
+                        // content so it resolves this chart's NSScrollView.
+                        .background(HorizontalWheelScroll(quantum: slot))
                         .onContinuousHover { phase in
                             switch phase {
                             case let .active(point):
